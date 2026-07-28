@@ -154,6 +154,58 @@ func TestDefaultDBPathWalksUp(t *testing.T) {
 	}
 }
 
+// strFlags is a repeatable string flag (e.g. --tag t1 --tag t2); Set appends
+// rather than overwrites so multiple occurrences accumulate.
+func TestStrFlagsSet(t *testing.T) {
+	var tags strFlags
+	if err := tags.Set("a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tags.Set("b"); err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 2 || tags[0] != "a" || tags[1] != "b" {
+		t.Fatalf("tags=%v, want [a b]", tags)
+	}
+}
+
+// withFrontmatter prepends a tags frontmatter block unless no tags were
+// given or content already starts with one.
+func TestWithFrontmatter(t *testing.T) {
+	got := withFrontmatter("body text", []string{"go", "cli"})
+	want := "---\ntags: [go, cli]\n---\nbody text"
+	if got != want {
+		t.Fatalf("with tags: got %q, want %q", got, want)
+	}
+
+	got = withFrontmatter("body text", nil)
+	if got != "body text" {
+		t.Fatalf("no tags: got %q, want passthrough", got)
+	}
+
+	existing := "---\ntags: [old]\n---\nbody text"
+	got = withFrontmatter(existing, []string{"go"})
+	if got != existing {
+		t.Fatalf("existing frontmatter: got %q, want passthrough", got)
+	}
+}
+
+// ragrep add must refuse to overwrite a file that already exists, and must
+// do so before reading stdin -- so this test can run to completion (exit 1)
+// without a model or stdin input.
+func TestCmdAddRefusesExisting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "existing.md")
+	if err := os.WriteFile(path, []byte("already here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(t.TempDir(), "index.db")
+
+	if code := run([]string{"add", "--db", db, path}); code != 1 {
+		t.Fatalf("add existing file: got exit %d, want 1", code)
+	}
+}
+
 // All path argument styles normalize to one canonical absolute slash key.
 func TestNormPath(t *testing.T) {
 	t.Chdir(t.TempDir())

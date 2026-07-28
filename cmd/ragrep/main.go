@@ -20,8 +20,9 @@ const usage = `ragrep - adaptive retrieval unit search CLI
 Usage:
   ragrep init                              create DB, download model assets
   ragrep index <path>...                   index text files (recursive)
-  ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json]
+  ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--tag t]...
   ragrep get <path> [--para N] [--context N] [--lines A-B]
+  ragrep add <path> [--tag t]... [--db PATH]   (reads content from stdin)
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/index.db)
@@ -67,6 +68,8 @@ func run(args []string) int {
 		return cmdSearch(rest)
 	case "get":
 		return cmdGet(rest)
+	case "add":
+		return cmdAdd(rest)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return 1
@@ -304,12 +307,25 @@ func cmdIndex(args []string) int {
 	return 0
 }
 
+// strFlags is a repeatable string flag: each --tag occurrence appends to the
+// slice instead of overwriting it, so `--tag a --tag b` yields ["a", "b"].
+type strFlags []string
+
+func (f *strFlags) String() string { return strings.Join(*f, ",") }
+
+func (f *strFlags) Set(v string) error {
+	*f = append(*f, v)
+	return nil
+}
+
 func cmdSearch(args []string) int {
 	fs := newFlagSet("search")
 	db := dbFlag(fs)
 	mode := fs.String("mode", "hybrid", "hybrid|vector|text")
 	k := fs.Int("k", 10, "max results")
 	asJSON := fs.Bool("json", false, "JSON output")
+	var tags strFlags
+	fs.Var(&tags, "tag", "filter to docs having this tag (repeatable, AND)")
 	if code, handled := parseArgs(fs, args); handled {
 		return code
 	}
@@ -327,7 +343,7 @@ func cmdSearch(args []string) int {
 	var hits []store.Hit
 	switch *mode {
 	case "text":
-		hits, err = s.SearchText(query, *k, nil)
+		hits, err = s.SearchText(query, *k, []string(tags))
 	case "vector", "hybrid":
 		dir, derr := embed.CacheDir()
 		if derr != nil {
@@ -343,9 +359,9 @@ func cmdSearch(args []string) int {
 			return fail(verr)
 		}
 		if *mode == "vector" {
-			hits, err = s.SearchVector(qv, *k, nil)
+			hits, err = s.SearchVector(qv, *k, []string(tags))
 		} else {
-			hits, err = s.SearchHybrid(query, qv, *k, nil)
+			hits, err = s.SearchHybrid(query, qv, *k, []string(tags))
 		}
 	default:
 		return fail(fmt.Errorf("unknown mode %q", *mode))
@@ -445,4 +461,81 @@ func getContent(s *store.Store, path, lines string, para, context int) (string, 
 	default:
 		return s.GetDoc(path)
 	}
+}
+
+// withFrontmatter prepends a tags frontmatter block unless content already
+// starts with one or no tags were given.
+func withFrontmatter(content string, tags []string) string {
+	if len(tags) == 0 || strings.HasPrefix(content, "---") {
+		return content
+	}
+	return "---\ntags: [" + strings.Join(tags, ", ") + "]\n---\n" + content
+}
+
+// cmdAdd creates a new file from stdin content, indexes it, and reports its
+// path. It refuses to overwrite an existing file. Order matters: the
+// existing-file check runs before stdin is read, so a bad invocation against
+// an existing file fails fast without blocking on stdin.
+func cmdAdd(args []string) int {
+	fs := newFlagSet("add")
+	db := dbFlag(fs)
+	var tags strFlags
+	fs.Var(&tags, "tag", "tag to add to the new file's frontmatter (repeatable)")
+	if code, handled := parseArgs(fs, args); handled {
+		return code
+	}
+	if fs.NArg() != 1 {
+		return fail(fmt.Errorf("usage: ragrep add <path> [--tag t]..."))
+	}
+	path := fs.Arg(0)
+
+	if _, err := os.Stat(path); err == nil {
+		return fail(fmt.Errorf("%s already exists; edit it and run `ragrep index` instead", path))
+	}
+
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fail(err)
+	}
+	if len(data) == 0 {
+		return fail(fmt.Errorf("no content on stdin"))
+	}
+
+	content := withFrontmatter(string(data), []string(tags))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fail(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return fail(err)
+	}
+
+	rel, err := normPath(path)
+	if err != nil {
+		return fail(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fail(err)
+	}
+
+	s, err := openStoreAt(*db)
+	if err != nil {
+		return fail(err)
+	}
+	defer s.Close()
+	dir, err := embed.CacheDir()
+	if err != nil {
+		return fail(err)
+	}
+	e, err := embed.New(dir)
+	if err != nil {
+		return fail(err)
+	}
+	defer e.Close()
+
+	if _, err := s.UpsertDoc(rel, content, info.ModTime().Unix(), e.Embed); err != nil {
+		return fail(err)
+	}
+	fmt.Println("indexed", rel)
+	return 0
 }
