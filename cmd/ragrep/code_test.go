@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -745,6 +746,178 @@ func TestCmdCodeExpandNoResults(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "not supported") {
 		t.Fatalf("stderr=%q, no-results must not read like a capability failure", buf.String())
+	}
+}
+
+// fakeLSPServerReferencesSrcTemplate answers textDocument/references with a
+// fixed JSON array of Locations, substituted in for
+// LOCATIONS_JSON_PLACEHOLDER -- for exercising `code expand --relation
+// references` against duplicate and unresolved locations without a real
+// language server (see TestCmdCodeExpandDedupsRelationsAndSkipsUnresolved).
+const fakeLSPServerReferencesSrcTemplate = `package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/textproto"
+	"os"
+	"strconv"
+)
+
+func main() {
+	tp := textproto.NewReader(bufio.NewReader(os.Stdin))
+	for {
+		hdr, err := tp.ReadMIMEHeader()
+		if err != nil {
+			return
+		}
+		n, err := strconv.Atoi(hdr.Get("Content-Length"))
+		if err != nil {
+			return
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(tp.R, body); err != nil {
+			return
+		}
+		var msg map[string]json.RawMessage
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return
+		}
+		idRaw, hasID := msg["id"]
+		if !hasID {
+			continue
+		}
+		var method string
+		if m, ok := msg["method"]; ok {
+			json.Unmarshal(m, &method)
+		}
+		result := "null"
+		switch method {
+		case "initialize":
+			result = ` + "`" + `{"capabilities":{"referencesProvider":true}}` + "`" + `
+		case "textDocument/references":
+			result = ` + "`" + `LOCATIONS_JSON_PLACEHOLDER` + "`" + `
+		}
+		resp := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}", string(idRaw), result)
+		fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(resp), resp)
+	}
+}
+`
+
+// lspLocationJSON renders one textDocument/references Location for path
+// (absolute) at the given zero-based line.
+func lspLocationJSON(path string, line int) string {
+	return fmt.Sprintf(`{"uri":%q,"range":{"start":{"line":%d,"character":0},"end":{"line":%d,"character":0}}}`,
+		fileURI(path), line, line)
+}
+
+// A symbol referenced twice from the same enclosing symbol (two locations
+// both resolving to the same caller) must not crash `code expand
+// --relation references` with symbol_edges' UNIQUE(from_key, to_key, kind,
+// source) constraint -- see codeindex.DedupResolvedRelations. A third,
+// unresolved location (outside the indexed store) must still show up in the
+// printed output but must never reach ReplaceRelations.
+func TestCmdCodeExpandDedupsRelationsAndSkipsUnresolved(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ragrepDir := filepath.Join(root, ".ragrep")
+	if err := os.MkdirAll(ragrepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mainGo := filepath.Join(root, "main.go")
+	if err := os.WriteFile(mainGo, []byte("package main\n\nfunc Callee() {}\n\nfunc Caller() {\n\tCallee()\n\tCallee()\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := filepath.Join(ragrepDir, "code.db")
+	s, err := codestore.Open(db, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := codeindex.Symbol{
+		Key: "target-key", Language: "go", Kind: "function",
+		Name: "Callee", QualifiedName: "Callee", Signature: "func Callee()",
+		Path: "main.go",
+		Range: codeindex.Range{
+			Start: codeindex.Position{Line: 2, Character: 0},
+			End:   codeindex.Position{Line: 2, Character: 16},
+		},
+		Body: "func Callee() {}",
+	}
+	target.EmbeddingText = codeindex.RenderEmbeddingText(target)
+	caller := codeindex.Symbol{
+		Key: "caller-key", Language: "go", Kind: "function",
+		Name: "Caller", QualifiedName: "Caller", Signature: "func Caller()",
+		Path: "main.go",
+		Range: codeindex.Range{
+			Start: codeindex.Position{Line: 4, Character: 0},
+			End:   codeindex.Position{Line: 7, Character: 1},
+		},
+		Body: "func Caller() {\n\tCallee()\n\tCallee()\n}",
+	}
+	caller.EmbeddingText = codeindex.RenderEmbeddingText(caller)
+	if _, err := s.UpsertSymbols("main.go", "hash1", []codeindex.Symbol{target, caller}, 0, fakeCodeEmbed); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Two locations at different lines, both inside Caller's range (4-7):
+	// both resolve to caller-key -- a duplicate resolved relation. A third
+	// location outside the workspace root's indexed symbols never resolves.
+	locationsJSON := "[" + strings.Join([]string{
+		lspLocationJSON(mainGo, 5),
+		lspLocationJSON(mainGo, 6),
+		lspLocationJSON(filepath.Join(root, "unindexed.go"), 0),
+	}, ",") + "]"
+	src := strings.ReplaceAll(fakeLSPServerReferencesSrcTemplate, "LOCATIONS_JSON_PLACEHOLDER", locationsJSON)
+	exePath := buildFakeLSPServerFromSrc(t, root, "fakelsp-dup-refs", src)
+	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(exePath)+`"}}`)
+
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	code := run([]string{"code", "expand", "--db", db, "--symbol", "target-key", "--relation", "references", "--json"})
+	w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 0 {
+		t.Fatalf("expand with duplicate+unresolved locations: exit=%d, want 0, output=%q", code, buf.String())
+	}
+
+	var targets []codeExpandTarget
+	if err := json.Unmarshal(buf.Bytes(), &targets); err != nil {
+		t.Fatalf("output not valid JSON: %v (%q)", err, buf.String())
+	}
+	if len(targets) != 3 {
+		t.Fatalf("targets = %#v, want 3 (two duplicate resolved + one unresolved)", targets)
+	}
+
+	// The persisted edge set must be deduped: exactly one references row
+	// from target-key to caller-key, not two.
+	s2, err := codestore.Open(db, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	rels, err := s2.RelationsFrom("target-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, r := range rels {
+		if r.ToKey == "caller-key" && r.Kind == "references" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("persisted references edges from target-key to caller-key = %d, want 1 (deduped)", count)
 	}
 }
 

@@ -908,7 +908,14 @@ func cmdCodeExpand(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	if err := s.ReplaceRelations(runID, sym.Key, codeExpandReplaceGroup[*relation], relations); err != nil {
+	// Only resolved, deduped relations are persisted -- an unresolved
+	// location (ToKey=="") has no symbol_edges columns to hold it, and an
+	// LSP query naturally returns one location per reference/call site, so a
+	// symbol referenced or called twice from the same enclosing symbol would
+	// otherwise collide on symbol_edges' UNIQUE(from_key, to_key, kind,
+	// source) constraint. See codeindex.DedupResolvedRelations.
+	toPersist := codeindex.DedupResolvedRelations(relations)
+	if err := s.ReplaceRelations(runID, sym.Key, codeExpandReplaceGroup[*relation], toPersist); err != nil {
 		return fail(err)
 	}
 
