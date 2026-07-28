@@ -84,8 +84,10 @@ func dbFlag(fs *flag.FlagSet) *string {
 // defaultDBPath resolves the --db default: $RAGREP_DB if set, else the
 // nearest existing .ragrep/index.db walking up from cwd (so running from a
 // subdirectory of an indexed repo finds the root index), else
-// .ragrep/index.db in cwd. DB keys are absolute (see normPath), so any
-// command works from any subdirectory once the DB is found.
+// .ragrep/index.db in cwd. DB keys are workspace-root-relative (see
+// normPath), not absolute -- any-subdirectory operation comes from this
+// walk-up discovery plus resolving paths relative to the discovered root,
+// not from the keys themselves.
 func defaultDBPath() string {
 	if p := os.Getenv("RAGREP_DB"); p != "" {
 		return p
@@ -257,6 +259,20 @@ func cmdIndex(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	// Validate every root arg is inside the workspace UP FRONT, before
+	// opening the store or loading the (slow) embedding model. Deferring this
+	// to normPath inside the walk only fires it when the walk reaches an
+	// indexable file -- an outside-root arg that's empty or binary-only would
+	// walk to "0 indexed" and exit 0, and a mix of good/bad args would
+	// partially index before failing on the bad one.
+	normRoots := make([]string, fset.NArg())
+	for i, r := range fset.Args() {
+		nr, err := normPath(r, wsRoot)
+		if err != nil {
+			return fail(err)
+		}
+		normRoots[i] = nr
+	}
 	s, err := openStoreAt(*db)
 	if err != nil {
 		return fail(err)
@@ -314,14 +330,7 @@ func cmdIndex(args []string) int {
 	}
 	pruned := 0
 	if *prune {
-		roots := make([]string, len(fset.Args()))
-		for i, r := range fset.Args() {
-			root, err := normPath(r, wsRoot)
-			if err != nil {
-				return fail(err)
-			}
-			roots[i] = root
-		}
+		roots := normRoots
 		paths, err := s.ListPaths()
 		if err != nil {
 			return fail(err)
@@ -440,8 +449,13 @@ func cmdSearch(args []string) int {
 // keys stay valid if the whole workspace is moved, renamed, or copied
 // elsewhere -- only position relative to root matters. p outside root
 // (including a Rel failure, e.g. a different drive on Windows) is an error.
-// ponytail: no case-folding or symlink resolution; on Windows "D:" vs "d:"
-// still mismatch — add EqualFold/EvalSymlinks here if that ever bites.
+// ponytail: no case-folding or symlink resolution. filepath.Rel already
+// case-folds the comparison on Windows, so drive-letter case isn't the
+// ceiling; the real one is that the key's case comes verbatim from the arg as
+// typed -- `ragrep index DOCS` vs `ragrep index docs` produces two distinct
+// keys for the same file on a case-insensitive filesystem, and --prune's
+// prefix match (strings.HasPrefix, case-sensitive) won't catch the stale
+// duplicate. Fold keys to one case on Windows/mac if this ever bites.
 func normPath(p, root string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {

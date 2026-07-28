@@ -453,6 +453,38 @@ func TestGetFallbackOutsideRootStaysNotFound(t *testing.T) {
 	}
 }
 
+// cmdIndex must validate every root argument is inside the workspace root UP
+// FRONT, before walking any of them -- not only when the walk happens to
+// reach an indexable file. Previously an outside-root arg that was empty (or
+// contained only skipped files) walked to "0 indexed" and exited 0 instead of
+// failing; a companion empty dir INSIDE the root proves the check is about
+// root membership, not mere emptiness.
+func TestCmdIndexRejectsOutsideRootEvenWhenEmpty(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(root, ".ragrep", "index.db")
+
+	outside := filepath.Join(filepath.Dir(root), "ragrep-index-outside-empty-test")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(outside) })
+
+	if code := run([]string{"index", "--db", db, outside}); code != 1 {
+		t.Fatalf("index outside-root empty dir: exit=%d, want 1 (bug: was 0)", code)
+	}
+
+	inside := filepath.Join(root, "empty")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"index", "--db", db, inside}); code != 0 {
+		t.Fatalf("index inside-root empty dir: exit=%d, want 0", code)
+	}
+}
+
 // --prune's existence check must be resolved against the workspace root, not
 // the process's cwd: running from a sibling directory of "docs" must still
 // prune the doc that's actually gone and keep the one that's actually there.
