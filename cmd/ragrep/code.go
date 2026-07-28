@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -107,11 +109,53 @@ func openCodeStoreAt(dbPath string) (*codestore.Store, error) {
 	return codestore.Open(dbPath, codeModelID, codeEmbedDim)
 }
 
+// codeIndexSkipDirs are directory names never descended into: dependency
+// trees (vendor, node_modules) and the common build-output/artifact
+// directory names across ecosystems (dist, build, bin, out, target, obj) --
+// the binding constraint excludes "vendor/生成物/依存パッケージ/ビルド成果物" by
+// default. Directories starting with "." are skipped separately (see
+// discoverCodeFiles), not listed here.
+var codeIndexSkipDirs = map[string]bool{
+	"vendor": true, "node_modules": true,
+	"dist": true, "build": true, "bin": true, "out": true, "target": true, "obj": true,
+}
+
+// generatedCodeRE matches the standard Go generated-code marker line
+// (https://go.dev/s/generatedcode): a comment exactly "// Code generated
+// ... DO NOT EDIT." appearing before the package clause.
+var generatedCodeRE = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
+
+// isGeneratedGoFile reports whether path's header marks it as generated Go
+// code. Only the first 5 lines are checked, stopping early at the first
+// non-comment line -- the marker is always right at the top of the file in
+// practice (before the package clause), so scanning further would only cost
+// time on every ordinary file.
+func isGeneratedGoFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for i := 0; i < 5 && sc.Scan(); i++ {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "//") {
+			return false
+		}
+		if generatedCodeRE.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
 // discoverCodeFiles enumerates every file under root whose extension is ext,
-// deterministically: directories named "vendor" or "node_modules", and any
-// directory (other than root itself) starting with ".", are skipped, and the
-// result is sorted. Test files (e.g. _test.go) and testdata/ are included --
-// both are needed for later relation extraction (tests-relation).
+// deterministically: directories in codeIndexSkipDirs, and any directory
+// (other than root itself) starting with ".", are skipped; for Go, a file
+// whose header marks it as generated (see isGeneratedGoFile) is also
+// skipped. The result is sorted. Test files (e.g. _test.go) and testdata/
+// are included -- both are needed for later relation extraction
+// (tests-relation).
 func discoverCodeFiles(root, ext string) ([]string, error) {
 	var files []string
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -120,14 +164,18 @@ func discoverCodeFiles(root, ext string) ([]string, error) {
 		}
 		name := d.Name()
 		if d.IsDir() {
-			if p != root && (strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules") {
+			if p != root && (strings.HasPrefix(name, ".") || codeIndexSkipDirs[name]) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if filepath.Ext(name) == ext {
-			files = append(files, p)
+		if filepath.Ext(name) != ext {
+			return nil
 		}
+		if ext == ".go" && isGeneratedGoFile(p) {
+			return nil
+		}
+		files = append(files, p)
 		return nil
 	})
 	if err != nil {
@@ -264,6 +312,20 @@ func cmdCodeIndex(args []string) int {
 		return 0
 	}
 
+	// Start the server and gate on its advertised capabilities BEFORE paying
+	// for the codestore/embedding-model setup below: a server that can't do
+	// textDocument/documentSymbol (or isn't the executable we expect) should
+	// fail fast, the same "cheap/critical checks before expensive ones"
+	// rationale as the workspace-root validation above.
+	client, initResult, err := startLanguageServer(serverCmd, wsRoot)
+	if err != nil {
+		return fail(err)
+	}
+	defer client.Close()
+	if !client.Supports(lsp.FeatureDocumentSymbol) {
+		return fail(fmt.Errorf("language server %q does not support textDocument/documentSymbol (required relation: document symbols for indexing)", serverCmd))
+	}
+
 	s, err := openCodeStoreAt(*db)
 	if err != nil {
 		return fail(err)
@@ -279,15 +341,6 @@ func cmdCodeIndex(args []string) int {
 		return fail(err)
 	}
 	defer e.Close()
-
-	client, initResult, err := startLanguageServer(serverCmd, wsRoot)
-	if err != nil {
-		return fail(err)
-	}
-	defer client.Close()
-	if !client.Supports(lsp.FeatureDocumentSymbol) {
-		return fail(fmt.Errorf("language server %q does not support textDocument/documentSymbol", serverCmd))
-	}
 
 	indexed := 0
 	ctx := context.Background()
