@@ -1,6 +1,8 @@
 package codeindex
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"reflect"
 	"strings"
@@ -111,10 +113,11 @@ func loadSample(t *testing.T) []byte {
 // for testdata/go/sample.go: a Store struct containing its Name field and
 // its Save/Load methods as children (gopls nests Go methods under their
 // receiver type in hierarchical document symbols). Ranges are hand-derived
-// from the fixture file's fixed line layout (see sample.go); every range
-// used here starts at character 0 of its first line and, where the line
-// content is just "}", ends at character 1 of that line — so no UTF-16
-// arithmetic is needed to keep these in sync with the file.
+// from the fixture file's fixed line layout (see sample.go); LSP lines are
+// 0-indexed, i.e. one less than the Read-tool/editor line numbers in
+// sample.go. Every range used here starts at character 0 of its first line
+// and, where the line content is just "}", ends at character 1 of that line
+// — so no UTF-16 arithmetic is needed to keep these in sync with the file.
 func sampleSymbols() []lsp.DocumentSymbol {
 	return []lsp.DocumentSymbol{
 		{
@@ -138,7 +141,7 @@ func sampleSymbols() []lsp.DocumentSymbol {
 					Kind: 6, // method
 					Range: lsp.Range{
 						Start: lsp.Position{Line: 13, Character: 0}, // func (s *Store) Save(...) {
-						End:   lsp.Position{Line: 16, Character: 1}, // closing "}"
+						End:   lsp.Position{Line: 15, Character: 1}, // closing "}" (0-indexed line 15 == source line 16)
 					},
 				},
 				{
@@ -146,7 +149,7 @@ func sampleSymbols() []lsp.DocumentSymbol {
 					Kind: 6, // method
 					Range: lsp.Range{
 						Start: lsp.Position{Line: 18, Character: 0}, // func (s *Store) Load(...) {
-						End:   lsp.Position{Line: 21, Character: 1}, // closing "}"
+						End:   lsp.Position{Line: 20, Character: 1}, // closing "}" (0-indexed line 20 == source line 21)
 					},
 				},
 			},
@@ -244,6 +247,76 @@ func TestExtract_StructAndMethodsAreSeparateRecords(t *testing.T) {
 		t.Errorf("expected distinct keys for distinct records, got Store=%q Save=%q Load=%q",
 			store.Key, save.Key, load.Key)
 	}
+
+	// Body must end exactly at the closing brace, with no trailing newline
+	// pulled in from the line after the range (regression: Save/Load's
+	// Range.End used to be one line too low, off by one from the actual
+	// closing "}").
+	for _, s := range []Symbol{store, save, load} {
+		if !strings.HasSuffix(s.Body, "}") {
+			t.Errorf("%s.Body = %q, want it to end with %q", s.Name, s.Body, "}")
+		}
+		if strings.HasSuffix(s.Body, "\n") {
+			t.Errorf("%s.Body = %q, want no trailing newline past the closing brace", s.Name, s.Body)
+		}
+	}
+}
+
+// TestExtract_StoreKeyExactValue pins Symbol.Key to a value computed from
+// the stable-key recipe spelled out independently here (not by calling
+// stableKey), so a wrong field order or separator in the real
+// implementation would fail this test even though it wouldn't fail a
+// determinism-only or inequality-only check.
+func TestExtract_StoreKeyExactValue(t *testing.T) {
+	content := loadSample(t)
+	symbols, err := Extract("go", "sample.go", content, sampleSymbols())
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	var store Symbol
+	found := false
+	for _, s := range symbols {
+		if s.Name == "Store" {
+			store = s
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing Store symbol")
+	}
+
+	// language + NUL + relative_path + NUL + kind + NUL + qualified_name + NUL + signature
+	recipe := "go" + "\x00" + "sample.go" + "\x00" + "struct" + "\x00" + "Store" + "\x00" + "type Store struct"
+	sum := sha256.Sum256([]byte(recipe))
+	want := hex.EncodeToString(sum[:])
+
+	if store.Key != want {
+		t.Errorf("Store.Key = %q, want %q (sha256 of recipe %q)", store.Key, want, recipe)
+	}
+}
+
+// TestExtract_SaveSignatureExactValue pins Signature to an exact string
+// extracted from Save's multi-line Body (declaration line through "error",
+// the "{" and body dropped), catching regressions in declSignature's
+// brace-truncation/whitespace-collapse logic that an equality-only or
+// non-empty-only check would miss.
+func TestExtract_SaveSignatureExactValue(t *testing.T) {
+	content := loadSample(t)
+	symbols, err := Extract("go", "sample.go", content, sampleSymbols())
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	for _, s := range symbols {
+		if s.Name != "Save" {
+			continue
+		}
+		want := "func (s *Store) Save(ctx context.Context, item string) error"
+		if s.Signature != want {
+			t.Errorf("Save.Signature = %q, want %q", s.Signature, want)
+		}
+		return
+	}
+	t.Fatal("missing Save symbol")
 }
 
 func TestExtract_JapaneseDocComment(t *testing.T) {

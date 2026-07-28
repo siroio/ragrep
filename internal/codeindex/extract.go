@@ -264,6 +264,10 @@ func trimLineTerminator(line []byte) []byte {
 // declLine (no blank line in between), in source order, "// " prefixes
 // stripped — Go's usual doc-comment convention. Returns "" if declLine has
 // no such block immediately above it.
+//
+// This is Go-specific (only "//" line comments; no "/* */" block comments).
+// A second language's extractor will need its own comment-style handling
+// here, or this renamed/parameterized per language.
 func (li *lineIndex) docComment(declLine int) string {
 	var lines []string
 	for n := declLine - 1; n >= 0; n-- {
