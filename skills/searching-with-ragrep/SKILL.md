@@ -28,6 +28,8 @@ ragrep index --prune docs/   # also drop deleted files from the index
 | Hybrid search (default, best) | `ragrep search --json "auth error"` |
 | Full-text only (fast, no model) | `ragrep search --mode text -k 5 "ERR_AUTH"` |
 | Vector only | `ragrep search --mode vector "concept"` |
+| Filter by tag (repeat = AND) | `ragrep search --tag design --json "q"` |
+| Add a new tagged document | `echo "..." | ragrep add notes/foo.md --tag design` |
 | Get paragraph N | `ragrep get --para 4 docs/auth.md` |
 | Paragraph ± N context | `ragrep get --para 4 --context 2 docs/auth.md` |
 | Line range | `ragrep get --lines 12-18 docs/auth.md` |
@@ -59,6 +61,9 @@ array of `{doc, para, lines, score, snippet}`. `--json` exists only on
   `--mode text` for exact identifiers, or check the path form.
 - `hybrid`/`vector` load the embedding model (slow startup); use
   `--mode text` for exact strings like error codes.
+- Tagged DBs use a v2 hash format for migration purposes: a DB indexed
+  before tag support must go through one `ragrep index` re-run, which
+  reindexes every document once, before `--tag` filtering works.
 
 ## Common Mistakes
 

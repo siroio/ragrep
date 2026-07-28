@@ -37,6 +37,8 @@ ragrep index docs/                            # テキストファイルをイ�
 ragrep index --prune docs/                    # 削除済みファイルもインデックスから除去
 ragrep search --json "認証エラー"              # ハイブリッド検索（段落単位でヒット）
 ragrep search --mode text -k 5 "ERR_AUTH"     # 全文検索のみ（モデル不要で速い）
+ragrep search --tag design "認証エラー"        # tagで絞り込み（複数指定でAND、全モード対応）
+echo "本文" | ragrep add notes/foo.md --tag design --tag api  # 新規文書をstdinから追加＋即索引
 ragrep get docs/auth.md                       # Document全体
 ragrep get --para 4 --context 2 docs/auth.md  # 段落4±2（Adaptive Expansion）
 ragrep get --lines 12-18 docs/auth.md         # 行範囲
@@ -49,6 +51,10 @@ ragrep get --lines 12-18 docs/auth.md         # 行範囲
 - ドキュメントキーは絶対パスに正規化されるため、相対・`./x`・絶対のどの形で渡しても
   同じキーに解決され、サブディレクトリからの実行でも動く。
   旧形式（入力パスそのまま）でインデックスしたDBは `ragrep index` の再実行が必要。
+- frontmatterに `---` / `tags: [a, b]`（またはブロックリスト） / `---` を書くとタグが付き、
+  小文字化されて索引される。`ragrep add` は `--tag` 指定時、frontmatterが無い本文にのみ
+  このブロックを自動付与する（既存ファイルへの上書きは拒否、更新はファイル編集＋
+  `ragrep index <path>` の再実行で行う）。
 
 ## Agent Skills
 
@@ -60,6 +66,7 @@ ragrepを使うための手順書で、スキルディレクトリへコピー�
 |---|---|
 | `skills/searching-with-ragrep/` | 検索→取得→コンテキスト拡張のワークフロー |
 | `skills/setting-up-ragrep/` | ビルド・init・インデックス運用・トラブルシュート |
+| `skills/adding-documents-with-ragrep/` | `ragrep add`によるtag付き新規文書の追加・更新 |
 
 コピー先:
 
