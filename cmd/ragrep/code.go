@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/siroio/ragrep/internal/codeindex"
+	"github.com/siroio/ragrep/internal/coderetrieval"
 	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/config"
 	"github.com/siroio/ragrep/internal/embed"
@@ -33,6 +35,13 @@ Usage:
   ragrep code expand --symbol <key> --relation definition|references|callers|callees|tests [--json]
                                                      live-query the language server for one symbol's
                                                      relations (1 hop), save them, print resolved targets
+  ragrep code pack --query <q> [--select KEY]... [--budget N] [--json]
+                                                     hybrid-search top-k candidates, optionally stage 1-3
+                                                     symbols' full bodies, assemble a budgeted context pack
+                                                     plus a stale-detectable manifest
+  ragrep code verify --manifest FILE [--json]       check a code-pack manifest against the workspace and
+                                                     the store: staleness (files changed) + re-resolution
+                                                     (stable keys still valid)
 
 Flags common to code subcommands:
   --db PATH    code database (default .ragrep/config.json code_db, else .ragrep/code.db)
@@ -69,6 +78,10 @@ func cmdCode(args []string) int {
 		return cmdCodeGet(rest)
 	case "expand":
 		return cmdCodeExpand(rest)
+	case "pack":
+		return cmdCodePack(rest)
+	case "verify":
+		return cmdCodeVerify(rest)
 	case "-h", "--help":
 		fmt.Fprint(os.Stderr, codeUsage)
 		return 0
@@ -920,6 +933,293 @@ func cmdCodeExpand(args []string) int {
 	}
 	if err := formatCodeExpandTargets(os.Stdout, targets, *asJSON); err != nil {
 		return fail(err)
+	}
+	return 0
+}
+
+// codePackDefaultBudget is `code pack`'s default --budget: the max total
+// JSON-encoded size, in characters, of everything staged into the pack
+// (candidates + selected symbol bodies + their relations -- see
+// coderetrieval.AssembleOptions.Budget). Large enough for several full
+// symbol bodies plus their candidate metadata without unboundedly growing
+// an LLM caller's context by default.
+const codePackDefaultBudget = 20000
+
+// codePackOutput is `code pack`'s JSON shape: the assembled context pack
+// plus a stale-detectable manifest describing what it drew on, ready to
+// write straight to a file for a later `code verify --manifest`.
+type codePackOutput struct {
+	Pack     coderetrieval.ContextPack `json:"pack"`
+	Manifest coderetrieval.Manifest    `json:"manifest"`
+}
+
+// buildManifest assembles a coderetrieval.Manifest from pack's actually
+// included symbol bodies: index identity (revision/server/model) from the
+// most recently recorded index_runs row, plus one SymbolRef per included
+// symbol using its store-recorded file_hash (see
+// (*codestore.Store).SymbolFileHash's doc comment for why that's preferred
+// over re-hashing the file from disk here). A store with no recorded index
+// run yet (LatestIndexRun -> ErrNotFound) still produces a manifest, just
+// with empty identity fields -- that's provenance, not a hard requirement
+// (mirrors gitRevision's "unknown" fallback for the document/code indexes).
+func buildManifest(s *codestore.Store, pack coderetrieval.ContextPack) (coderetrieval.Manifest, error) {
+	run, err := s.LatestIndexRun()
+	if err != nil && !errors.Is(err, codestore.ErrNotFound) {
+		return coderetrieval.Manifest{}, err
+	}
+
+	m := coderetrieval.Manifest{
+		IndexRevision: run.Revision,
+		ServerName:    run.ServerName,
+		ServerVersion: run.ServerVersion,
+		ModelID:       run.ModelID,
+	}
+	for _, sym := range pack.Symbols {
+		hash, err := s.SymbolFileHash(sym.Key)
+		if err != nil {
+			return coderetrieval.Manifest{}, fmt.Errorf("manifest: file hash for %q: %w", sym.Key, err)
+		}
+		m.Symbols = append(m.Symbols, coderetrieval.SymbolRef{
+			Key: sym.Key, QualifiedName: sym.QualifiedName, Path: sym.Path,
+			StartLine: sym.Range.Start.Line, EndLine: sym.Range.End.Line, FileHash: hash,
+		})
+	}
+	return m, nil
+}
+
+// runCodePack is `code pack`'s core logic: hybrid search, then
+// coderetrieval.BuildContextPack, then buildManifest. Split out from
+// cmdCodePack (which resolves qv via the real embedding model) so tests can
+// drive it with a fake query vector, the same way TestFormatCodeSearchHits
+// drives formatCodeSearchHits directly without ever touching ONNX.
+func runCodePack(s *codestore.Store, query string, qv []float32, k, budget int, selectedKeys []string) (codePackOutput, error) {
+	hits, err := s.SearchSymbolsHybrid(query, qv, k)
+	if err != nil {
+		return codePackOutput{}, err
+	}
+
+	pack, err := coderetrieval.BuildContextPack(hits, coderetrieval.AssembleOptions{
+		Budget:       budget,
+		SelectedKeys: selectedKeys,
+		GetSymbol:    s.GetSymbol,
+		GetRelations: s.RelationsFrom,
+	})
+	if err != nil {
+		return codePackOutput{}, err
+	}
+
+	manifest, err := buildManifest(s, pack)
+	if err != nil {
+		return codePackOutput{}, err
+	}
+
+	return codePackOutput{Pack: pack, Manifest: manifest}, nil
+}
+
+// formatCodePackOutput writes out as JSON, or (text mode) a compact summary
+// -- candidate/symbol/relation counts, budget usage, and the manifest's
+// identity fields. Text mode never includes candidate metadata or symbol
+// bodies; `--json` is the primary way to consume a pack (see codeUsage).
+func formatCodePackOutput(w io.Writer, out codePackOutput, asJSON bool) error {
+	if asJSON {
+		return json.NewEncoder(w).Encode(out)
+	}
+	p := out.Pack
+	fmt.Fprintf(w, "candidates=%d symbols=%d relations=%d used_chars=%d/%d truncated=%v\n",
+		len(p.Candidates), len(p.Symbols), len(p.Relations), p.UsedChars, p.Budget, p.Truncated)
+	if p.Truncated {
+		fmt.Fprintf(w, "skipped: %s\n", strings.Join(p.Skipped, ", "))
+	}
+	m := out.Manifest
+	fmt.Fprintf(w, "manifest: revision=%s server=%s/%s model=%s symbols=%d\n",
+		m.IndexRevision, m.ServerName, m.ServerVersion, m.ModelID, len(m.Symbols))
+	return nil
+}
+
+func cmdCodePack(args []string) int {
+	fs := newFlagSet("code pack")
+	db := codeDBFlag(fs)
+	query := fs.String("query", "", "search query for top-k candidates")
+	k := fs.Int("k", 10, "max candidates")
+	budget := fs.Int("budget", codePackDefaultBudget, "max JSON-encoded size (chars) of the assembled pack")
+	asJSON := fs.Bool("json", false, "JSON output")
+	var selected strFlags
+	fs.Var(&selected, "select", "symbol key to include the full body for (repeatable, 1-3)")
+	if code, handled := parseArgs(fs, args); handled {
+		return code
+	}
+	if *query == "" {
+		return fail(fmt.Errorf("usage: ragrep code pack --query <q> [--select KEY]... [--budget N] [--json]"))
+	}
+	if len(selected) > 3 {
+		return fail(fmt.Errorf("--select accepts at most 3 keys, got %d", len(selected)))
+	}
+
+	s, err := openCodeStoreAt(*db)
+	if err != nil {
+		return fail(err)
+	}
+	defer s.Close()
+
+	dir, err := embed.CacheDir()
+	if err != nil {
+		return fail(err)
+	}
+	e, err := embed.New(dir)
+	if err != nil {
+		return fail(err)
+	}
+	defer e.Close()
+
+	qv, err := e.Embed(*query)
+	if err != nil {
+		return fail(err)
+	}
+
+	out, err := runCodePack(s, *query, qv, *k, *budget, []string(selected))
+	if err != nil {
+		return fail(err)
+	}
+	if err := formatCodePackOutput(os.Stdout, out, *asJSON); err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+// codeVerifyEntry is one manifest symbol's `code verify` outcome: staleness
+// (from coderetrieval.CheckStale) and re-resolution (from
+// coderetrieval.ResolveRef) are reported independently -- a symbol can be
+// stale but still resolve (the file changed but the symbol's own key is
+// still valid), or resolve to a new key entirely, or fail to resolve at all
+// (ErrAmbiguousResolution -- Error is set, ResolvedKey is not).
+type codeVerifyEntry struct {
+	Key         string `json:"key"`
+	Path        string `json:"path"`
+	Stale       bool   `json:"stale"`
+	Resolved    bool   `json:"resolved"`
+	ResolvedKey string `json:"resolved_key,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// codeVerifyOutput is `code verify`'s result: per-entry status, plus Clean
+// true only when every entry is both fresh and resolved -- the condition
+// cmdCodeVerify's exit code (0 vs. 2) is based on.
+type codeVerifyOutput struct {
+	Entries []codeVerifyEntry `json:"entries"`
+	Clean   bool              `json:"clean"`
+}
+
+// runCodeVerify checks m's staleness against wsRoot's on-disk files (see
+// coderetrieval.CheckStale) and re-resolves every entry against s (see
+// coderetrieval.ResolveRef), producing one codeVerifyEntry per manifest
+// symbol. Only a genuine store error aborts with a non-nil error --
+// ErrAmbiguousResolution is a normal per-entry outcome (see ResolveRef's
+// doc comment on why the caller must halt on it rather than guess), folded
+// into that entry's Error field, not propagated.
+func runCodeVerify(s *codestore.Store, m coderetrieval.Manifest, wsRoot string) (codeVerifyOutput, error) {
+	staleReport := coderetrieval.CheckStale(m, func(path string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(wsRoot, filepath.FromSlash(path)))
+	})
+	staleByKey := make(map[string]bool, len(staleReport.Entries))
+	for _, e := range staleReport.Entries {
+		staleByKey[e.Key] = e.Stale
+	}
+
+	out := codeVerifyOutput{Clean: true}
+	for _, ref := range m.Symbols {
+		entry := codeVerifyEntry{Key: ref.Key, Path: ref.Path, Stale: staleByKey[ref.Key]}
+		if entry.Stale {
+			out.Clean = false
+		}
+
+		resolved, err := coderetrieval.ResolveRef(ref, s.GetSymbol, s.FindByQualifiedName)
+		switch {
+		case err == nil:
+			entry.Resolved = true
+			entry.ResolvedKey = resolved.Key
+		case errors.Is(err, coderetrieval.ErrAmbiguousResolution):
+			entry.Error = err.Error()
+			out.Clean = false
+		default:
+			return codeVerifyOutput{}, err
+		}
+
+		out.Entries = append(out.Entries, entry)
+	}
+	return out, nil
+}
+
+// formatCodeVerifyOutput writes out as JSON, or (text mode) one tab-separated
+// line per entry (key, path, status -- "ok"/"stale"/"unresolved"/
+// "stale,unresolved" -- and any resolution error) followed by a final
+// clean=true/false summary line.
+func formatCodeVerifyOutput(w io.Writer, out codeVerifyOutput, asJSON bool) error {
+	if asJSON {
+		return json.NewEncoder(w).Encode(out)
+	}
+	for _, e := range out.Entries {
+		status := "ok"
+		if e.Stale {
+			status = "stale"
+		}
+		if !e.Resolved {
+			if status == "ok" {
+				status = "unresolved"
+			} else {
+				status += ",unresolved"
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s", e.Key, e.Path, status)
+		if e.Error != "" {
+			fmt.Fprintf(w, "\t%s", e.Error)
+		}
+		fmt.Fprintln(w)
+	}
+	fmt.Fprintf(w, "clean=%v\n", out.Clean)
+	return nil
+}
+
+func cmdCodeVerify(args []string) int {
+	fs := newFlagSet("code verify")
+	db := codeDBFlag(fs)
+	manifestPath := fs.String("manifest", "", "manifest JSON file (from `code pack`)")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if code, handled := parseArgs(fs, args); handled {
+		return code
+	}
+	if *manifestPath == "" {
+		return fail(fmt.Errorf("usage: ragrep code verify --manifest <file> [--json]"))
+	}
+
+	data, err := os.ReadFile(*manifestPath)
+	if err != nil {
+		return fail(err)
+	}
+	var m coderetrieval.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fail(fmt.Errorf("parsing manifest %s: %w", *manifestPath, err))
+	}
+
+	wsRoot, err := workspaceRoot(*db)
+	if err != nil {
+		return fail(err)
+	}
+
+	s, err := openCodeStoreAt(*db)
+	if err != nil {
+		return fail(err)
+	}
+	defer s.Close()
+
+	out, err := runCodeVerify(s, m, wsRoot)
+	if err != nil {
+		return fail(err)
+	}
+	if err := formatCodeVerifyOutput(os.Stdout, out, *asJSON); err != nil {
+		return fail(err)
+	}
+	if !out.Clean {
+		return 2
 	}
 	return 0
 }

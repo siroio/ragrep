@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/siroio/ragrep/internal/codeindex"
+	"github.com/siroio/ragrep/internal/coderetrieval"
 	"github.com/siroio/ragrep/internal/codestore"
 )
 
@@ -768,5 +770,324 @@ func TestCmdIndexIncludeCodeFlag(t *testing.T) {
 	defer s.Close()
 	if _, err := s.GetDoc("main.go"); err != nil {
 		t.Fatalf("main.go should be indexed with --include-code: %v", err)
+	}
+}
+
+// --- code pack / code verify ---
+
+// codePackTestSymbol builds a symbol with a body long enough to matter for
+// budget-truncation tests, at the given key/path/qualifiedName.
+func codePackTestSymbol(key, path, qualifiedName string) codeindex.Symbol {
+	sym := codeindex.Symbol{
+		Key: key, Language: "go", Kind: "function",
+		Name: qualifiedName, QualifiedName: qualifiedName, Signature: "func " + qualifiedName + "()",
+		Path: path,
+		Range: codeindex.Range{
+			Start: codeindex.Position{Line: 1, Character: 0},
+			End:   codeindex.Position{Line: 3, Character: 1},
+		},
+		Body:     "func " + qualifiedName + "() {\n\t// a reasonably long body so JSON-encoded size is non-trivial\n\treturn\n}\n",
+		BodyHash: "bodyhash-" + key,
+	}
+	sym.EmbeddingText = codeindex.RenderEmbeddingText(sym)
+	return sym
+}
+
+func TestCmdCodePackUsageErrors(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "code.db")
+	if code := run([]string{"code", "pack", "--db", db}); code != 1 {
+		t.Fatalf("pack with no --query: exit=%d, want 1", code)
+	}
+	if code := run([]string{"code", "pack", "--db", db, "--query", "q",
+		"--select", "a", "--select", "b", "--select", "c", "--select", "d"}); code != 1 {
+		t.Fatalf("pack with 4 --select keys: exit=%d, want 1", code)
+	}
+}
+
+// runCodePack is `code pack`'s core logic minus the ONNX embedding call --
+// tests drive it with a fake query vector, the same way TestFormatCodeSearchHits
+// drives formatCodeSearchHits directly instead of going through the real CLI
+// (which would require the cached embedding model).
+func TestRunCodePackBudgetRespectedAndTruncationSurfaces(t *testing.T) {
+	s := newTestCodeStore(t)
+	a := codePackTestSymbol("a", "x.go", "A")
+	b := codePackTestSymbol("b", "y.go", "B")
+	if _, err := s.UpsertSymbols(a.Path, "filehash-a", []codeindex.Symbol{a}, 0, fakeCodeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertSymbols(b.Path, "filehash-b", []codeindex.Symbol{b}, 0, fakeCodeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	when := time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
+	if _, err := s.RecordIndexRun("root", "rev123", "go", "gopls", "v1.2.3", codeModelID, when); err != nil {
+		t.Fatal(err)
+	}
+
+	qv, err := fakeCodeEmbed("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First, measure the metadata-only cost (large budget, no --select) so
+	// the truncation budget below is derived rather than guessed.
+	metaOnly, err := runCodePack(s, "A", qv, 10, 100_000, nil)
+	if err != nil {
+		t.Fatalf("runCodePack (measure): %v", err)
+	}
+	if metaOnly.Pack.Truncated {
+		t.Fatalf("measurement pack unexpectedly truncated: %+v", metaOnly.Pack)
+	}
+	budget := metaOnly.Pack.UsedChars + 50 // room for candidates + a sliver, not both bodies
+
+	out, err := runCodePack(s, "A", qv, 10, budget, []string{"a", "b"})
+	if err != nil {
+		t.Fatalf("runCodePack: %v", err)
+	}
+	if !out.Pack.Truncated {
+		t.Fatalf("pack.Truncated = false, want true: usedChars=%d budget=%d", out.Pack.UsedChars, budget)
+	}
+	if len(out.Pack.Skipped) == 0 {
+		t.Fatal("pack.Skipped is empty, want at least one skipped item")
+	}
+	if out.Pack.UsedChars > out.Pack.Budget {
+		t.Fatalf("pack.UsedChars = %d exceeds budget %d", out.Pack.UsedChars, out.Pack.Budget)
+	}
+
+	if out.Manifest.IndexRevision != "rev123" || out.Manifest.ServerName != "gopls" ||
+		out.Manifest.ServerVersion != "v1.2.3" || out.Manifest.ModelID != codeModelID {
+		t.Fatalf("manifest identity = %+v, want revision=rev123 server=gopls/v1.2.3 model=%s", out.Manifest, codeModelID)
+	}
+	// Only symbols that actually made it into the pack (not skipped) may
+	// appear as manifest refs -- SymbolFileHash would error on any key that
+	// isn't packed's own Symbols.
+	if len(out.Manifest.Symbols) != len(out.Pack.Symbols) {
+		t.Fatalf("len(manifest.Symbols) = %d, want %d (== len(pack.Symbols))", len(out.Manifest.Symbols), len(out.Pack.Symbols))
+	}
+}
+
+func TestFormatCodePackOutputTextAndJSON(t *testing.T) {
+	s := newTestCodeStore(t)
+	a := codePackTestSymbol("a", "x.go", "A")
+	if _, err := s.UpsertSymbols(a.Path, "filehash-a", []codeindex.Symbol{a}, 0, fakeCodeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	qv, err := fakeCodeEmbed("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCodePack(s, "A", qv, 10, 100_000, []string{"a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var text bytes.Buffer
+	if err := formatCodePackOutput(&text, out, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "candidates=1") || !strings.Contains(text.String(), "symbols=1") {
+		t.Fatalf("text output %q missing expected counts", text.String())
+	}
+
+	var js bytes.Buffer
+	if err := formatCodePackOutput(&js, out, true); err != nil {
+		t.Fatal(err)
+	}
+	var decoded codePackOutput
+	if err := json.Unmarshal(js.Bytes(), &decoded); err != nil {
+		t.Fatalf("JSON output invalid: %v (%q)", err, js.String())
+	}
+	if len(decoded.Pack.Symbols) != 1 || decoded.Pack.Symbols[0].Key != "a" {
+		t.Fatalf("decoded pack = %+v, want one symbol key=a", decoded.Pack)
+	}
+	if decoded.Manifest.Symbols[0].Key != "a" {
+		t.Fatalf("decoded manifest = %+v, want one symbol key=a", decoded.Manifest)
+	}
+}
+
+func TestCmdCodeVerifyUsageErrors(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "code.db")
+	if code := run([]string{"code", "verify", "--db", db}); code != 1 {
+		t.Fatalf("verify with no --manifest: exit=%d, want 1", code)
+	}
+}
+
+func TestCmdCodeVerifyMissingManifestFile(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "code.db")
+	if code := run([]string{"code", "verify", "--db", db, "--manifest", filepath.Join(t.TempDir(), "nope.json")}); code != 1 {
+		t.Fatalf("verify with missing manifest file: exit=%d, want 1", code)
+	}
+}
+
+// codeVerifyWorkspace builds a root/.ragrep/code.db workspace with one
+// indexed symbol at root/pkg/foo.go, using fileHash = codeindex.FileHash of
+// the actual on-disk content -- so a `code verify` run right afterward finds
+// the file unmodified (clean) unless the test itself edits it. Returns the
+// root, db path, and the manifest built from packing that single symbol.
+func codeVerifyWorkspace(t *testing.T) (root, db string, manifest coderetrieval.Manifest) {
+	t.Helper()
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("package pkg\n\nfunc A() {}\n")
+	if err := os.WriteFile(filepath.Join(root, "pkg", "foo.go"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db = filepath.Join(root, ".ragrep", "code.db")
+	s, err := openCodeStoreAt(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sym := codePackTestSymbol("a", "pkg/foo.go", "A")
+	fileHash := codeindex.FileHash(content)
+	if _, err := s.UpsertSymbols(sym.Path, fileHash, []codeindex.Symbol{sym}, 0, fakeCodeEmbed); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if _, err := s.RecordIndexRun("root", "rev1", "go", "gopls", "v1", codeModelID, time.Now()); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+
+	qv, err := fakeCodeEmbed("A")
+	if err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	out, err := runCodePack(s, "A", qv, 10, 100_000, []string{"a"})
+	s.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Manifest.Symbols) != 1 {
+		t.Fatalf("codeVerifyWorkspace: manifest has %d symbols, want 1", len(out.Manifest.Symbols))
+	}
+	return root, db, out.Manifest
+}
+
+func writeManifestFile(t *testing.T, m coderetrieval.Manifest) string {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestCmdCodeVerifyManifestRoundTripClean(t *testing.T) {
+	_, db, manifest := codeVerifyWorkspace(t)
+	manifestPath := writeManifestFile(t, manifest)
+
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	code := run([]string{"code", "verify", "--db", db, "--manifest", manifestPath, "--json"})
+	w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 0 {
+		t.Fatalf("verify clean manifest: exit=%d, want 0, stdout=%q", code, buf.String())
+	}
+	var decoded codeVerifyOutput
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("stdout not valid JSON: %v (%q)", err, buf.String())
+	}
+	if !decoded.Clean {
+		t.Fatalf("decoded.Clean = false, want true: %+v", decoded)
+	}
+	if len(decoded.Entries) != 1 || decoded.Entries[0].Stale || !decoded.Entries[0].Resolved {
+		t.Fatalf("decoded.Entries = %+v, want one clean, resolved entry", decoded.Entries)
+	}
+}
+
+func TestCmdCodeVerifyDetectsStaleFile(t *testing.T) {
+	root, db, manifest := codeVerifyWorkspace(t)
+	manifestPath := writeManifestFile(t, manifest)
+
+	// Edit the file the manifest's only entry points at, after the manifest
+	// was built: its file_hash no longer matches.
+	if err := os.WriteFile(filepath.Join(root, "pkg", "foo.go"), []byte("package pkg\n\nfunc A() { /* edited */ }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	code := run([]string{"code", "verify", "--db", db, "--manifest", manifestPath, "--json"})
+	w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 2 {
+		t.Fatalf("verify after file edit: exit=%d, want 2, stdout=%q", code, buf.String())
+	}
+	var decoded codeVerifyOutput
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("stdout not valid JSON: %v (%q)", err, buf.String())
+	}
+	if decoded.Clean {
+		t.Fatal("decoded.Clean = true, want false after file edit")
+	}
+	if len(decoded.Entries) != 1 || !decoded.Entries[0].Stale {
+		t.Fatalf("decoded.Entries = %+v, want one stale entry", decoded.Entries)
+	}
+}
+
+// A manifest entry whose stable key no longer resolves (the symbol was
+// deleted from the store, not just edited) AND whose qualified_name/path no
+// longer identifies any indexed symbol must be reported as an unresolved,
+// ambiguous-resolution entry -- not crash the command or silently guess.
+func TestCmdCodeVerifyAmbiguousResolutionReportsUnresolved(t *testing.T) {
+	root, db, manifest := codeVerifyWorkspace(t)
+
+	// Remove the only symbol at that qualified_name+path from the store, so
+	// ResolveRef's key lookup AND its fallback findSymbol lookup both fail:
+	// zero matches is ambiguous (see coderetrieval.ErrAmbiguousResolution).
+	s, err := openCodeStoreAt(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertSymbols("pkg/foo.go", "some-other-hash", nil, 0, fakeCodeEmbed); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	s.Close()
+
+	manifestPath := writeManifestFile(t, manifest)
+	_ = root
+
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	code := run([]string{"code", "verify", "--db", db, "--manifest", manifestPath, "--json"})
+	w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 2 {
+		t.Fatalf("verify with unresolvable entry: exit=%d, want 2, stdout=%q", code, buf.String())
+	}
+	var decoded codeVerifyOutput
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("stdout not valid JSON: %v (%q)", err, buf.String())
+	}
+	if decoded.Clean {
+		t.Fatal("decoded.Clean = true, want false")
+	}
+	if len(decoded.Entries) != 1 || decoded.Entries[0].Resolved || decoded.Entries[0].Error == "" {
+		t.Fatalf("decoded.Entries = %+v, want one unresolved entry with a non-empty Error", decoded.Entries)
 	}
 }
