@@ -3,6 +3,7 @@ package coderetrieval
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -59,10 +60,7 @@ func TestCheckStale(t *testing.T) {
 	}
 	readFile := func(path string) ([]byte, error) { return content[path], nil }
 
-	report, err := CheckStale(m, readFile)
-	if err != nil {
-		t.Fatalf("CheckStale: %v", err)
-	}
+	report := CheckStale(m, readFile)
 	if !report.Stale {
 		t.Fatalf("report.Stale = false, want true (changed.go differs)")
 	}
@@ -88,12 +86,45 @@ func TestCheckStale_NothingChanged(t *testing.T) {
 	m := Manifest{Symbols: []SymbolRef{{Key: "a", Path: "x.go", FileHash: codeindex.FileHash(unchanged)}}}
 	readFile := func(path string) ([]byte, error) { return unchanged, nil }
 
-	report, err := CheckStale(m, readFile)
-	if err != nil {
-		t.Fatalf("CheckStale: %v", err)
-	}
+	report := CheckStale(m, readFile)
 	if report.Stale {
 		t.Fatalf("report.Stale = true, want false")
+	}
+}
+
+func TestCheckStale_MissingFileMarksStaleAndContinues(t *testing.T) {
+	present := []byte("package x\n")
+	m := Manifest{
+		Symbols: []SymbolRef{
+			{Key: "a", Path: "deleted.go", FileHash: "irrelevant"},
+			{Key: "b", Path: "present.go", FileHash: codeindex.FileHash(present)},
+		},
+	}
+	readFile := func(path string) ([]byte, error) {
+		if path == "deleted.go" {
+			return nil, os.ErrNotExist
+		}
+		return present, nil
+	}
+
+	report := CheckStale(m, readFile)
+	if !report.Stale {
+		t.Fatalf("report.Stale = false, want true (deleted.go is unreadable)")
+	}
+	if len(report.Entries) != 2 {
+		t.Fatalf("len(report.Entries) = %d, want 2 -- a missing file must not abort the rest of the report", len(report.Entries))
+	}
+	for _, e := range report.Entries {
+		switch e.Key {
+		case "a":
+			if !e.Stale {
+				t.Fatalf("entry %q (deleted file): Stale = false, want true", e.Key)
+			}
+		case "b":
+			if e.Stale {
+				t.Fatalf("entry %q (present, unchanged file): Stale = true, want false", e.Key)
+			}
+		}
 	}
 }
 

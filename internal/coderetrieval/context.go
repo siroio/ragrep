@@ -88,12 +88,16 @@ func BuildContextPack(candidates []codestore.SymbolHit, opts AssembleOptions) (C
 		pack.Candidates = append(pack.Candidates, c)
 	}
 
+	fetched := make([]codeindex.Symbol, 0, len(opts.SelectedKeys))
 	for _, key := range opts.SelectedKeys {
 		sym, err := opts.GetSymbol(key)
 		if err != nil {
 			return ContextPack{}, fmt.Errorf("coderetrieval: fetch symbol %q: %w", key, err)
 		}
-		if !pack.tryAdd(sym, key) {
+		fetched = append(fetched, sym)
+	}
+	for _, sym := range dedupSymbols(fetched) {
+		if !pack.tryAdd(sym, sym.Key) {
 			continue
 		}
 		pack.Symbols = append(pack.Symbols, sym)
@@ -142,28 +146,71 @@ func (p *ContextPack) tryAdd(item any, id string) bool {
 // the same declaration reached via different match paths (FTS vs. vector,
 // or an overlapping nested symbol), so the metadata stage doesn't spend
 // budget twice describing one location.
-//
-// ponytail: O(n*m) scan (m = merged groups so far); fine at typical top-k
-// sizes, switch to a per-file sort+sweep if k grows into the thousands.
 func DedupCandidates(hits []codestore.SymbolHit) []codestore.SymbolHit {
-	out := make([]codestore.SymbolHit, 0, len(hits))
-	for _, h := range hits {
-		merged := false
-		for i := range out {
-			if out[i].Path == h.Path && out[i].StartLine <= h.EndLine && h.StartLine <= out[i].EndLine {
-				if h.StartLine < out[i].StartLine {
-					out[i].StartLine = h.StartLine
+	return mergeOverlapping(hits,
+		func(h codestore.SymbolHit) (path string, start, end int) { return h.Path, h.StartLine, h.EndLine },
+		func(dst *codestore.SymbolHit, start, end int) { dst.StartLine, dst.EndLine = start, end })
+}
+
+// dedupSymbols applies the same overlapping-range merge as DedupCandidates
+// to selected symbol bodies (BuildContextPack's stage 2): two SelectedKeys
+// whose declarations overlap or nest in the same file (e.g. a type and one
+// of its own methods, or two ranges a caller picked that turned out to
+// intersect) collapse into one packed body instead of paying the budget
+// twice for overlapping source. As with DedupCandidates, the first-seen
+// symbol's Body is what survives; its Range widens to the union.
+func dedupSymbols(symbols []codeindex.Symbol) []codeindex.Symbol {
+	return mergeOverlapping(symbols,
+		func(s codeindex.Symbol) (path string, start, end int) { return s.Path, s.Range.Start.Line, s.Range.End.Line },
+		func(dst *codeindex.Symbol, start, end int) { dst.Range.Start.Line, dst.Range.End.Line = start, end })
+}
+
+// mergeOverlapping merges items that share a path and an overlapping
+// [start,end] line range (get extracts that triple; widen applies a
+// unioned range to the surviving item), keeping the first-seen item in
+// each group as the representative. Merging cascades to a fixpoint: after
+// each item is folded in, every pair of surviving groups is re-checked, so
+// a later item that bridges two previously-disjoint groups (e.g. groups
+// [0,5] and [20,25], then an item [4,22] that overlaps both) correctly
+// collapses all three into one instead of leaving the bridged pair
+// unmerged.
+//
+// ponytail: O(n^3) worst case (fixpoint re-scan after every merge); fine at
+// typical top-k / selected-symbol sizes (single digits to low hundreds),
+// switch to a union-find over a per-file sort if that ever changes.
+func mergeOverlapping[T any](items []T, get func(T) (path string, start, end int), widen func(dst *T, start, end int)) []T {
+	out := make([]T, 0, len(items))
+	for _, item := range items {
+		out = append(out, item)
+		out = collapseOverlaps(out, get, widen)
+	}
+	return out
+}
+
+func collapseOverlaps[T any](out []T, get func(T) (path string, start, end int), widen func(dst *T, start, end int)) []T {
+	for {
+		mergedAny := false
+		for i := 0; i < len(out) && !mergedAny; i++ {
+			pi, si, ei := get(out[i])
+			for j := i + 1; j < len(out); j++ {
+				pj, sj, ej := get(out[j])
+				if pi != pj || si > ej || sj > ei {
+					continue
 				}
-				if h.EndLine > out[i].EndLine {
-					out[i].EndLine = h.EndLine
+				if sj < si {
+					si = sj
 				}
-				merged = true
+				if ej > ei {
+					ei = ej
+				}
+				widen(&out[i], si, ei)
+				out = append(out[:j], out[j+1:]...)
+				mergedAny = true
 				break
 			}
 		}
-		if !merged {
-			out = append(out, h)
+		if !mergedAny {
+			return out
 		}
 	}
-	return out
 }

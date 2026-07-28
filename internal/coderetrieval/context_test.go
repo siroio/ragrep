@@ -54,6 +54,73 @@ func TestDedupCandidates_NoOverlapKeepsAll(t *testing.T) {
 	}
 }
 
+// TestDedupCandidates_BridgingOrderCascades covers the controller-flagged
+// bug: a group formed by widening (a merged with c) must itself be
+// re-checked against every other existing group (b), not just left as-is --
+// otherwise a later item that bridges two earlier, disjoint groups leaves
+// the output with two entries that still overlap each other.
+func TestDedupCandidates_BridgingOrderCascades(t *testing.T) {
+	hits := []codestore.SymbolHit{
+		hit("a", "x.go", 0, 5),   // group 1
+		hit("b", "x.go", 20, 25), // group 2, disjoint from a
+		hit("c", "x.go", 4, 22),  // bridges a and b: overlaps both
+	}
+
+	out := DedupCandidates(hits)
+
+	if len(out) != 1 {
+		t.Fatalf("len(out) = %d, want 1 (c must bridge a and b into one group): %+v", len(out), out)
+	}
+	if out[0].Key != "a" {
+		t.Fatalf("out[0].Key = %q, want %q (first-seen representative)", out[0].Key, "a")
+	}
+	if out[0].StartLine != 0 || out[0].EndLine != 25 {
+		t.Fatalf("merged range = [%d,%d], want [0,25] (union of a, b, c)", out[0].StartLine, out[0].EndLine)
+	}
+}
+
+func TestBuildContextPack_SelectedSymbolsDedupOverlappingRanges(t *testing.T) {
+	// "outer" contains "inner" entirely (a struct and one of its own
+	// methods, say); "partial" merely overlaps "outer"'s tail. All three
+	// are in the same file and must collapse into a single packed body.
+	symTable := map[string]codeindex.Symbol{
+		"outer": {
+			Key: "outer", QualifiedName: "Outer", Path: "x.go", Body: "type Outer struct{ ... }",
+			Range: codeindex.Range{Start: codeindex.Position{Line: 1}, End: codeindex.Position{Line: 20}},
+		},
+		"inner": {
+			Key: "inner", QualifiedName: "Outer.Method", Path: "x.go", Body: "func (o *Outer) Method() {}",
+			Range: codeindex.Range{Start: codeindex.Position{Line: 5}, End: codeindex.Position{Line: 10}},
+		},
+		"partial": {
+			Key: "partial", QualifiedName: "Adjacent", Path: "x.go", Body: "func Adjacent() {}",
+			Range: codeindex.Range{Start: codeindex.Position{Line: 18}, End: codeindex.Position{Line: 30}},
+		},
+	}
+
+	opts := AssembleOptions{
+		Budget:       100_000,
+		SelectedKeys: []string{"outer", "inner", "partial"},
+		GetSymbol:    func(k string) (codeindex.Symbol, error) { return symTable[k], nil },
+		GetRelations: func(k string) ([]codeindex.Relation, error) { return nil, nil },
+	}
+
+	pack, err := BuildContextPack(nil, opts)
+	if err != nil {
+		t.Fatalf("BuildContextPack: %v", err)
+	}
+	if len(pack.Symbols) != 1 {
+		t.Fatalf("len(pack.Symbols) = %d, want 1 (nested + overlapping selections must collapse): %+v", len(pack.Symbols), pack.Symbols)
+	}
+	got := pack.Symbols[0]
+	if got.Key != "outer" {
+		t.Fatalf("pack.Symbols[0].Key = %q, want %q (first-selected representative)", got.Key, "outer")
+	}
+	if got.Range.Start.Line != 1 || got.Range.End.Line != 30 {
+		t.Fatalf("merged range = [%d,%d], want [1,30] (union of outer, inner, partial)", got.Range.Start.Line, got.Range.End.Line)
+	}
+}
+
 func TestBuildContextPack_MetadataOnlyStaysWithinBudget(t *testing.T) {
 	hits := []codestore.SymbolHit{
 		hit("a", "x.go", 1, 5),
@@ -84,8 +151,14 @@ func TestBuildContextPack_StagedSymbolBodiesAndRelations(t *testing.T) {
 	hits := []codestore.SymbolHit{hit("a", "x.go", 1, 5), hit("b", "x.go", 10, 15)}
 
 	symTable := map[string]codeindex.Symbol{
-		"a": {Key: "a", QualifiedName: "A", Path: "x.go", Body: "func A() {}"},
-		"b": {Key: "b", QualifiedName: "B", Path: "x.go", Body: "func B() {}"},
+		"a": {
+			Key: "a", QualifiedName: "A", Path: "x.go", Body: "func A() {}",
+			Range: codeindex.Range{Start: codeindex.Position{Line: 1}, End: codeindex.Position{Line: 5}},
+		},
+		"b": {
+			Key: "b", QualifiedName: "B", Path: "x.go", Body: "func B() {}",
+			Range: codeindex.Range{Start: codeindex.Position{Line: 10}, End: codeindex.Position{Line: 15}},
+		},
 	}
 	relTable := map[string][]codeindex.Relation{
 		"a": {{FromKey: "a", ToKey: "b", Kind: "calls", Source: "gopls"}},

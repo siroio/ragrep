@@ -55,26 +55,38 @@ type StaleReport struct {
 // what's on disk) and compares it against the hash recorded at plan time.
 // Each distinct path is read and hashed once even if several symbols
 // reference it.
-func CheckStale(m Manifest, readFile func(path string) ([]byte, error)) (StaleReport, error) {
-	hashes := map[string]string{}
+//
+// readFile failing -- the file was deleted or otherwise became unreadable
+// since the manifest was built -- is itself treated as staleness, not an
+// aborting error: that entry (and every other entry sharing its path) is
+// reported Stale:true and CheckStale keeps going, so one missing file never
+// prevents the rest of the manifest from being reported on. A deleted file
+// is unambiguously stale; there's no separate "why" to model here.
+func CheckStale(m Manifest, readFile func(path string) ([]byte, error)) StaleReport {
+	type cached struct {
+		hash    string
+		unread  bool // readFile failed for this path; always stale
+	}
+	cache := map[string]cached{}
 	var report StaleReport
 	for _, ref := range m.Symbols {
-		hash, ok := hashes[ref.Path]
+		c, ok := cache[ref.Path]
 		if !ok {
 			content, err := readFile(ref.Path)
 			if err != nil {
-				return StaleReport{}, fmt.Errorf("coderetrieval: read %q: %w", ref.Path, err)
+				c = cached{unread: true}
+			} else {
+				c = cached{hash: codeindex.FileHash(content)}
 			}
-			hash = codeindex.FileHash(content)
-			hashes[ref.Path] = hash
+			cache[ref.Path] = c
 		}
-		stale := hash != ref.FileHash
+		stale := c.unread || c.hash != ref.FileHash
 		report.Entries = append(report.Entries, StaleEntry{Key: ref.Key, Path: ref.Path, Stale: stale})
 		if stale {
 			report.Stale = true
 		}
 	}
-	return report, nil
+	return report
 }
 
 // SymbolFinder looks up symbols by exact qualified name and
