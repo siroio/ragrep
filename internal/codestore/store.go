@@ -10,6 +10,12 @@ import (
 	"fmt"
 	"strconv"
 
+	// Registers the vec0 virtual table module and (critically) the WASM
+	// SQLite binary that bundles it; without this blank import, opening any
+	// db that creates/uses symbol_vec fails with "no SQLite binary
+	// embed/set/loaded" unless some other package in the same binary
+	// happens to import this too (see internal/store/store.go).
+	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
 	_ "github.com/ncruces/go-sqlite3/driver"
 )
 
@@ -30,7 +36,9 @@ var ErrNotCodeDatabase = errors.New("not a code-symbol database")
 
 type Store struct{ db *sql.DB }
 
-const schema = `
+// schemaTemplate holds one %d verb: symbol_vec's vector width, filled in
+// from Open's embeddingDim argument (see schemaSQL).
+const schemaTemplate = `
 CREATE TABLE code_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -68,7 +76,7 @@ CREATE VIRTUAL TABLE symbol_fts USING fts5(
 );
 
 CREATE VIRTUAL TABLE symbol_vec USING vec0(
-    embedding float[768]
+    embedding float[%d]
 );
 
 CREATE TABLE symbol_edges (
@@ -92,6 +100,10 @@ CREATE TABLE index_runs (
 );
 `
 
+func schemaSQL(embeddingDim int) string {
+	return fmt.Sprintf(schemaTemplate, embeddingDim)
+}
+
 // Open opens (creating if needed) the code-symbol SQLite database at path.
 //
 // On a fresh file it creates the schema above, stamps PRAGMA user_version
@@ -102,6 +114,10 @@ CREATE TABLE index_runs (
 // aren't this schema (e.g. it's the document index.db), it returns an error
 // wrapping ErrNotCodeDatabase.
 func Open(path, modelID string, embeddingDim int) (*Store, error) {
+	if embeddingDim <= 0 {
+		return nil, fmt.Errorf("codestore: embeddingDim must be > 0, got %d", embeddingDim)
+	}
+
 	db, err := sql.Open("sqlite3", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
@@ -164,7 +180,7 @@ func createSchema(db *sql.DB, modelID string, embeddingDim int) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(schema); err != nil {
+	if _, err := tx.Exec(schemaSQL(embeddingDim)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO code_meta(key, value) VALUES ('model_id', ?), ('embedding_dim', ?)`,
