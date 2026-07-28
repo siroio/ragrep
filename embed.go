@@ -182,15 +182,25 @@ type Embedder struct {
 	sess *ort.DynamicAdvancedSession
 }
 
+// missingAsset returns the name of the first required asset file not found
+// in dir, or "" if all are present. Shared by newEmbedder (to error out) and
+// tests (to decide skip vs. run) so the two checks can't drift apart.
+func missingAsset(dir string, asset ortAsset) string {
+	for _, f := range []string{asset.lib, modelFile, modelDataFile, spmFile} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			return f
+		}
+	}
+	return ""
+}
+
 func newEmbedder(dir string) (*Embedder, error) {
 	asset, err := ortAssetFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return nil, err
 	}
-	for _, f := range []string{asset.lib, modelFile, modelDataFile, spmFile} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
-			return nil, fmt.Errorf("missing %s: run 'rag init' first", f)
-		}
+	if f := missingAsset(dir, asset); f != "" {
+		return nil, fmt.Errorf("missing %s: run 'rag init' first", f)
 	}
 	ort.SetSharedLibraryPath(filepath.Join(dir, asset.lib))
 	if err := ort.InitializeEnvironment(); err != nil {
@@ -198,11 +208,13 @@ func newEmbedder(dir string) (*Embedder, error) {
 	}
 	proc, err := sentencepiece.NewProcessorFromPath(filepath.Join(dir, spmFile))
 	if err != nil {
+		ort.DestroyEnvironment()
 		return nil, err
 	}
 	sess, err := ort.NewDynamicAdvancedSession(filepath.Join(dir, modelFile),
 		[]string{"input_ids", "attention_mask"}, []string{"sentence_embedding"}, nil)
 	if err != nil {
+		ort.DestroyEnvironment()
 		return nil, err
 	}
 	return &Embedder{proc: proc, sess: sess}, nil

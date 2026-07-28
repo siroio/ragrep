@@ -3,7 +3,7 @@ package main
 import (
 	"math"
 	"os"
-	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -14,8 +14,12 @@ func testEmbedder(t *testing.T) *Embedder {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, modelFile)); err != nil {
-		t.Skip("model not cached; run 'rag init' to enable this test")
+	asset, err := ortAssetFor(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := missingAsset(dir, asset); f != "" {
+		t.Skipf("%s not cached; run 'rag init' to enable this test", f)
 	}
 	e, err := newEmbedder(dir)
 	if err != nil {
