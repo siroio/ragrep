@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"io/fs"
+	"testing"
+)
 
 // -h/--help must print usage and exit 0, not read as a generic parse error
 // (exit 1). Doesn't need the model: parsing fails before the embedder or DB
@@ -44,6 +48,23 @@ func TestGetContentLines(t *testing.T) {
 // A panic escaping run() must surface as exit 1 (this CLI's generic error
 // code), not Go's own panic exit code 2 -- which would collide with the
 // "no hits / not found" contract.
+// pruneDecision must only treat a "file gone" stat error as prunable; any
+// other stat error (permission denied, transient I/O, AV lock, ...) must
+// abort rather than be silently treated as "gone" (which would delete a
+// still-valid document).
+func TestPruneDecision(t *testing.T) {
+	if prune, err := pruneDecision(nil); prune || err != nil {
+		t.Fatalf("nil stat err: prune=%v err=%v, want false,nil", prune, err)
+	}
+	if prune, err := pruneDecision(fs.ErrNotExist); !prune || err != nil {
+		t.Fatalf("ErrNotExist: prune=%v err=%v, want true,nil", prune, err)
+	}
+	other := errors.New("permission denied")
+	if prune, err := pruneDecision(other); prune || err != other {
+		t.Fatalf("other stat err: prune=%v err=%v, want false,%v", prune, err, other)
+	}
+}
+
 func TestProtect(t *testing.T) {
 	if code := protect(func() int { panic("boom") }); code != 1 {
 		t.Fatalf("panic: got %d, want 1", code)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -148,6 +149,20 @@ func isTextFile(path string) bool {
 
 const maxFileSize = 10 << 20 // 10MB
 
+// pruneDecision interprets an os.Stat error for --prune: a file that's gone
+// (fs.ErrNotExist) should be pruned; any other stat error (permission
+// denied, transient I/O, AV lock, ...) must abort the run rather than be
+// silently treated as "gone" -- which would delete a still-valid document.
+func pruneDecision(statErr error) (prune bool, err error) {
+	if statErr == nil {
+		return false, nil
+	}
+	if errors.Is(statErr, fs.ErrNotExist) {
+		return true, nil
+	}
+	return false, statErr
+}
+
 func cmdIndex(args []string) int {
 	fset := newFlagSet("index")
 	db := dbFlag(fset)
@@ -231,8 +246,13 @@ func cmdIndex(args []string) int {
 			if !underRoot {
 				continue
 			}
-			if _, err := os.Stat(filepath.FromSlash(p)); err == nil {
-				continue // still exists
+			_, statErr := os.Stat(filepath.FromSlash(p))
+			doPrune, err := pruneDecision(statErr)
+			if err != nil {
+				return fail(err)
+			}
+			if !doPrune {
+				continue
 			}
 			if err := s.DeleteDoc(p); err != nil {
 				return fail(err)
