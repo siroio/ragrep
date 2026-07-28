@@ -4,12 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/horiuchi-unico/rag/internal/embed"
 )
 
 // End-to-end: index a small corpus and search it with the real model.
 // Skips when model assets are not cached (run 'rag init' first).
 func TestSmoke(t *testing.T) {
-	dir, err := cacheDir()
+	dir, err := embed.CacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}

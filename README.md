@@ -5,7 +5,7 @@
 
 ## Install / Build
 
-    go build -o rag.exe .
+    go build -o rag.exe ./cmd/rag
 
 ビルドにはcgo（Cツールチェーン）が必要（`github.com/yalue/onnxruntime_go`がcgo必須のため）。埋め込みモデルはembeddinggemma-300m（quantized ONNX, 768次元）。
 

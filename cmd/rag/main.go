@@ -10,6 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/horiuchi-unico/rag/internal/embed"
+	"github.com/horiuchi-unico/rag/internal/store"
 )
 
 const usage = `rag - adaptive retrieval unit search CLI
@@ -101,11 +104,11 @@ func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
 	return fail(err), true
 }
 
-func openStoreAt(path string) (*Store, error) {
+func openStoreAt(path string) (*store.Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	return openStore(path)
+	return store.Open(path)
 }
 
 func cmdInit(args []string) int {
@@ -114,11 +117,11 @@ func cmdInit(args []string) int {
 	if code, handled := parseArgs(fs, args); handled {
 		return code
 	}
-	dir, err := cacheDir()
+	dir, err := embed.CacheDir()
 	if err != nil {
 		return fail(err)
 	}
-	if err := ensureAssets(dir); err != nil {
+	if err := embed.EnsureAssets(dir); err != nil {
 		return fail(err)
 	}
 	s, err := openStoreAt(*db)
@@ -178,11 +181,11 @@ func cmdIndex(args []string) int {
 		return fail(err)
 	}
 	defer s.Close()
-	dir, err := cacheDir()
+	dir, err := embed.CacheDir()
 	if err != nil {
 		return fail(err)
 	}
-	e, err := newEmbedder(dir)
+	e, err := embed.New(dir)
 	if err != nil {
 		return fail(err)
 	}
@@ -287,16 +290,16 @@ func cmdSearch(args []string) int {
 	}
 	defer s.Close()
 
-	var hits []Hit
+	var hits []store.Hit
 	switch *mode {
 	case "text":
 		hits, err = s.SearchText(query, *k)
 	case "vector", "hybrid":
-		dir, derr := cacheDir()
+		dir, derr := embed.CacheDir()
 		if derr != nil {
 			return fail(derr)
 		}
-		e, eerr := newEmbedder(dir)
+		e, eerr := embed.New(dir)
 		if eerr != nil {
 			return fail(eerr)
 		}
@@ -354,7 +357,7 @@ func cmdGet(args []string) int {
 	defer s.Close()
 
 	out, err := getContent(s, path, *lines, *para, *context)
-	if err == errNotFound {
+	if err == store.ErrNotFound {
 		fmt.Fprintln(os.Stderr, "not found")
 		return 2
 	}
@@ -369,7 +372,7 @@ func cmdGet(args []string) int {
 // range, a paragraph ± context window, or (default) the whole document.
 // Split out of cmdGet because the brief's inline switch/break mixed err
 // scopes across cases in a way that didn't read cleanly as straight-line code.
-func getContent(s *Store, path, lines string, para, context int) (string, error) {
+func getContent(s *store.Store, path, lines string, para, context int) (string, error) {
 	switch {
 	case lines != "":
 		var a, b int
@@ -382,7 +385,7 @@ func getContent(s *Store, path, lines string, para, context int) (string, error)
 		}
 		ls := strings.Split(strings.ReplaceAll(doc, "\r\n", "\n"), "\n")
 		if a > len(ls) {
-			return "", errNotFound
+			return "", store.ErrNotFound
 		}
 		if b > len(ls) {
 			b = len(ls)

@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"crypto/sha256"
@@ -13,7 +13,8 @@ import (
 	_ "github.com/ncruces/go-sqlite3/driver"
 )
 
-var errNotFound = errors.New("not found")
+// ErrNotFound is returned when a requested document or paragraph doesn't exist.
+var ErrNotFound = errors.New("not found")
 
 const embedDim = 768
 
@@ -50,7 +51,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(text, tokenize='trigram');
 CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0(embedding float[768]);
 `
 
-func openStore(path string) (*Store, error) {
+// Open opens (creating if needed) the SQLite index at path and ensures schema.
+func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite3", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
@@ -298,13 +300,13 @@ func (s *Store) ListPaths() ([]string, error) {
 	return paths, rows.Err()
 }
 
-// DeleteDoc removes a document and its paragraphs/fts/vec rows. errNotFound
+// DeleteDoc removes a document and its paragraphs/fts/vec rows. ErrNotFound
 // if relPath isn't indexed.
 func (s *Store) DeleteDoc(relPath string) error {
 	var docID int64
 	err := s.db.QueryRow(`SELECT id FROM documents WHERE path=?`, relPath).Scan(&docID)
 	if err == sql.ErrNoRows {
-		return errNotFound
+		return ErrNotFound
 	}
 	if err != nil {
 		return err
@@ -335,7 +337,7 @@ func (s *Store) GetDoc(relPath string) (string, error) {
 	var content string
 	err := s.db.QueryRow(`SELECT content FROM documents WHERE path=?`, relPath).Scan(&content)
 	if err == sql.ErrNoRows {
-		return "", errNotFound
+		return "", ErrNotFound
 	}
 	return content, err
 }
@@ -363,7 +365,7 @@ func (s *Store) GetParas(relPath string, seq, context int) (string, error) {
 		return "", err
 	}
 	if !found {
-		return "", errNotFound
+		return "", ErrNotFound
 	}
 	// Verify the requested seq itself exists (context rows alone don't count).
 	var n int
@@ -373,7 +375,7 @@ func (s *Store) GetParas(relPath string, seq, context int) (string, error) {
 		return "", err
 	}
 	if n == 0 {
-		return "", errNotFound
+		return "", ErrNotFound
 	}
 	return strings.Join(parts, "\n\n"), rows.Err()
 }

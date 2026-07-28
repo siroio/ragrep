@@ -122,6 +122,16 @@ rag get docs/auth.md --lines 12-18       # 行範囲
 - E2E: 小コーパスで `init → index → search → get` を通すスモークテスト
   （埋め込みは実モデルで実行。CI不要、ローカル`go test`で完結）
 
+## パッケージ構成
+
+```
+cmd/rag/         # CLI dispatch (init/index/search/get), package main
+internal/store/  # SQLite: schema/Upsert/search/get, paragraph分割, package store
+internal/embed/  # モデルDL/tokenize/ONNX推論, package embed
+```
+
+依存方向: `cmd/rag` → `internal/store` + `internal/embed`。`store`と`embed`は互いに依存しない（`EmbedFunc`型が境界）。
+
 ## 将来拡張（実装しない）
 
 - Markdown見出しベースのSection単位 / コードAST（Function単位）

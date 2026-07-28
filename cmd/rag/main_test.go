@@ -3,8 +3,34 @@ package main
 import (
 	"errors"
 	"io/fs"
+	"path/filepath"
 	"testing"
+
+	"github.com/horiuchi-unico/rag/internal/store"
 )
+
+// fakeEmbed returns a fixed-dimension deterministic vector (no ONNX needed).
+// Duplicated from internal/store's test helper of the same name: that one is
+// unexported to package store and unreachable from here across the package
+// boundary, and the value only needs to match store's own embedDim (768).
+func fakeEmbed(text string) ([]float32, error) {
+	const embedDim = 768
+	v := make([]float32, embedDim)
+	for i, r := range text {
+		v[i%embedDim] += float32(r % 13)
+	}
+	return v, nil
+}
+
+func newTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
 
 // -h/--help must print usage and exit 0, not read as a generic parse error
 // (exit 1). Doesn't need the model: parsing fails before the embedder or DB
@@ -35,8 +61,8 @@ func TestGetContentLines(t *testing.T) {
 	if _, err := getContent(s, "a.txt", "3-2", -1, 0); err == nil {
 		t.Fatal("want error for b<a")
 	}
-	if _, err := getContent(s, "a.txt", "100-200", -1, 0); err != errNotFound {
-		t.Fatalf("want errNotFound for a>len(lines), got %v", err)
+	if _, err := getContent(s, "a.txt", "100-200", -1, 0); err != store.ErrNotFound {
+		t.Fatalf("want ErrNotFound for a>len(lines), got %v", err)
 	}
 
 	got, err = getContent(s, "a.txt", "4-100", -1, 0)

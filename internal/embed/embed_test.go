@@ -1,4 +1,4 @@
-package main
+package embed
 
 import (
 	"math"
@@ -10,7 +10,7 @@ import (
 // Requires cached assets; run `rag init` (or ensureAssets) once beforehand.
 func testEmbedder(t *testing.T) *Embedder {
 	t.Helper()
-	dir, err := cacheDir()
+	dir, err := CacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +21,7 @@ func testEmbedder(t *testing.T) *Embedder {
 	if f := missingAsset(dir, asset); f != "" {
 		t.Skipf("%s not cached; run 'rag init' to enable this test", f)
 	}
-	e, err := newEmbedder(dir)
+	e, err := New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,11 +70,11 @@ func TestEnsureAssets(t *testing.T) {
 	if os.Getenv("RAG_DOWNLOAD") != "1" {
 		t.Skip("set RAG_DOWNLOAD=1 to download ~310MB of model assets")
 	}
-	dir, err := cacheDir()
+	dir, err := CacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureAssets(dir); err != nil {
+	if err := EnsureAssets(dir); err != nil {
 		t.Fatal(err)
 	}
 }

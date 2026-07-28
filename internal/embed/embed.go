@@ -1,4 +1,4 @@
-package main
+package embed
 
 import (
 	"archive/tar"
@@ -34,6 +34,11 @@ const (
 	eosID = 1
 )
 
+// embedDim is the embeddinggemma-300m output dimension (matches the
+// sentence_embedding graph output; store's vec0 schema is pinned to the same
+// value independently since the two packages don't import each other).
+const embedDim = 768
+
 type ortAsset struct{ url, inner, lib string }
 
 func ortAssetFor(goos, goarch string) (ortAsset, error) {
@@ -55,7 +60,9 @@ func ortAssetFor(goos, goarch string) (ortAsset, error) {
 	return a, nil
 }
 
-func cacheDir() (string, error) {
+// CacheDir returns (creating if needed) the per-user cache directory where
+// model/runtime assets are stored.
+func CacheDir() (string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
@@ -162,7 +169,9 @@ func extractOrtLib(dir string, asset ortAsset) error {
 	return fmt.Errorf("%s not found in %s", asset.inner, archive)
 }
 
-func ensureAssets(dir string) error {
+// EnsureAssets downloads (if not already cached in dir) the ONNX runtime
+// shared library, the embedding model, and the tokenizer.
+func EnsureAssets(dir string) error {
 	asset, err := ortAssetFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return err
@@ -185,7 +194,7 @@ type Embedder struct {
 }
 
 // missingAsset returns the name of the first required asset file not found
-// in dir, or "" if all are present. Shared by newEmbedder (to error out) and
+// in dir, or "" if all are present. Shared by New (to error out) and
 // tests (to decide skip vs. run) so the two checks can't drift apart.
 func missingAsset(dir string, asset ortAsset) string {
 	for _, f := range []string{asset.lib, modelFile, modelDataFile, spmFile} {
@@ -196,7 +205,9 @@ func missingAsset(dir string, asset ortAsset) string {
 	return ""
 }
 
-func newEmbedder(dir string) (*Embedder, error) {
+// New creates an Embedder using the ONNX runtime, model, and tokenizer
+// cached in dir (see EnsureAssets).
+func New(dir string) (*Embedder, error) {
 	asset, err := ortAssetFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return nil, err

@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"path/filepath"
@@ -16,7 +16,7 @@ func fakeEmbed(text string) ([]float32, error) {
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := openStore(filepath.Join(t.TempDir(), "index.db"))
+	s, err := Open(filepath.Join(t.TempDir(), "index.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,8 +117,8 @@ func TestGet(t *testing.T) {
 	if err != nil || doc != content {
 		t.Fatalf("GetDoc: %q err=%v", doc, err)
 	}
-	if _, err := s.GetDoc("missing.txt"); err != errNotFound {
-		t.Fatalf("want errNotFound, got %v", err)
+	if _, err := s.GetDoc("missing.txt"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 
 	got, err := s.GetParas("a.txt", 1, 0)
@@ -135,8 +135,8 @@ func TestGet(t *testing.T) {
 	if err != nil || got != "p0\n\np1\n\np2\n\np3" {
 		t.Fatalf("GetParas(0,5)=%q err=%v", got, err)
 	}
-	if _, err := s.GetParas("a.txt", 99, 0); err != errNotFound {
-		t.Fatalf("want errNotFound, got %v", err)
+	if _, err := s.GetParas("a.txt", 99, 0); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
 
@@ -160,14 +160,14 @@ func TestDeleteDoc(t *testing.T) {
 	if len(hits) != 0 {
 		t.Fatalf("stale hits after delete: %+v", hits)
 	}
-	if _, err := s.GetDoc("a.txt"); err != errNotFound {
-		t.Fatalf("want errNotFound, got %v", err)
+	if _, err := s.GetDoc("a.txt"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	if doc, err := s.GetDoc("b.txt"); err != nil || doc != "beta content UNIQUEBBB222" {
 		t.Fatalf("other doc affected: %q err=%v", doc, err)
 	}
 
-	if err := s.DeleteDoc("missing.txt"); err != errNotFound {
-		t.Fatalf("want errNotFound, got %v", err)
+	if err := s.DeleteDoc("missing.txt"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
