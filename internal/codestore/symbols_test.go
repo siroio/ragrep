@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/siroio/ragrep/internal/codeindex"
@@ -222,28 +223,126 @@ func TestUpsertSymbolsReEmbedsOnlyWhenDocOrBodyChanges(t *testing.T) {
 	if fe.calls != 2 {
 		t.Fatalf("calls after doc-changed re-upsert = %d, want 2", fe.calls)
 	}
+
+	// Now change only Body (Documentation held fixed at k1Doc's value):
+	// must also re-embed. This is the BodyHash-changed branch, distinct
+	// from the Documentation-changed branch exercised above.
+	k1Body := k1Doc
+	k1Body.Body = "func ParseConfig() { return nil }"
+	k1Body.BodyHash = fmt.Sprintf("bodyhash:%s", k1Body.Body)
+	k1Body.EmbeddingText = codeindex.RenderEmbeddingText(k1Body)
+	fe.register(k1Body, []float32{0, 0, 1})
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-4", []codeindex.Symbol{k1Body}, fe.embed); err != nil {
+		t.Fatalf("body-changed re-upsert: %v", err)
+	}
+	if fe.calls != 3 {
+		t.Fatalf("calls after body-changed re-upsert = %d, want 3", fe.calls)
+	}
 }
 
+// TestUpsertSymbolsResyncsFTSWhenIndexedColumnChanges exercises updateSymbol's
+// FTS resync (the fts5 external-content 'delete' of the old indexed values
+// followed by an insert of the new ones) on its own, independent of the
+// re-embed cache rule: Documentation and Body are held fixed (so embed is
+// NOT called on the second upsert — asserted below) while Name/QualifiedName/
+// Signature change. If the FTS resync were missing or used stale rowid/old
+// values incorrectly, the old name would still be findable and/or the new
+// name would not be.
+//
+// Note: the store trusts the caller-supplied Symbol.Key; it never recomputes
+// it. In production codeindex.Extract derives Key from language+path+kind+
+// qualified_name+signature, so a real qualified_name/signature change also
+// changes Key (handled by the insert/delete paths, covered by
+// TestUpsertSymbolsRemovesOrphanRowsAcrossAllIndexes). This test targets the
+// update-in-place path specifically, so it deliberately keeps Key constant
+// while changing the other indexed columns.
+func TestUpsertSymbolsResyncsFTSWhenIndexedColumnChanges(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	fixedBody := "func Symbol() {}" // held constant so BodyHash never changes
+	k1 := sym("k1", "AlphaWidget", "AlphaWidget", "", fixedBody)
+	fe.register(k1, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, fe.embed); err != nil {
+		t.Fatalf("initial upsert: %v", err)
+	}
+
+	hits, err := s.SearchSymbolsText("AlphaWidget", 10)
+	if err != nil {
+		t.Fatalf("SearchSymbolsText(old name) before rename: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Key != "k1" {
+		t.Fatalf("SearchSymbolsText(AlphaWidget) before rename = %+v, want single hit for k1", hits)
+	}
+
+	k1Renamed := sym("k1", "BetaGadget", "BetaGadget", "", fixedBody)
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-2", []codeindex.Symbol{k1Renamed}, fe.embed); err != nil {
+		t.Fatalf("rename re-upsert: %v", err)
+	}
+	if fe.calls != 1 {
+		t.Fatalf("embed calls after rename-only re-upsert = %d, want still 1 (doc/body unchanged)", fe.calls)
+	}
+
+	hits, err = s.SearchSymbolsText("AlphaWidget", 10)
+	if err != nil {
+		t.Fatalf("SearchSymbolsText(old name) after rename: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("SearchSymbolsText(AlphaWidget) after rename = %+v, want no hits (stale FTS entry)", hits)
+	}
+
+	hits, err = s.SearchSymbolsText("BetaGadget", 10)
+	if err != nil {
+		t.Fatalf("SearchSymbolsText(new name) after rename: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Key != "k1" {
+		t.Fatalf("SearchSymbolsText(BetaGadget) after rename = %+v, want single hit for k1", hits)
+	}
+}
+
+// TestSearchSymbolsHybridExactMatchBeatsSemanticSimilarity constructs a case
+// where the exact-name match would actually LOSE under plain RRF fusion (no
+// exact-match pin), so the assertion is falsifiable rather than
+// coincidentally true. See task-5-report.md's fix-round-1 section for the
+// experiment confirming this: with the pin block temporarily bypassed, this
+// test fails (a decoy ranks first, not "exact-key").
+//
+// "exact" has a lean FTS document (its own name, once, in each column) and
+// an embedding placed maximally far from the query vector, so it gets only
+// one weak contribution (FTS rank 1) to its RRF score and a near-worst
+// vector rank.
+//
+// Each "decoy" is a lexically-noisy near-duplicate: its Documentation
+// repeats the query substring many times, which drives up its FTS bm25
+// score enough to outrank "exact"'s single occurrence — and its embedding
+// is placed exactly at the query vector, giving it the best possible vector
+// rank too. A decoy that wins on both signals accumulates a higher fused
+// RRF score than "exact", which only wins outright on one signal (FTS) and
+// is worst-ranked on the other (vector).
 func TestSearchSymbolsHybridExactMatchBeatsSemanticSimilarity(t *testing.T) {
 	s := openTestStore(t, 3)
 	fe := newFakeEmbedder(t)
 
-	// exact: name matches the query text exactly, but its embedding is far
-	// from the query vector (so vector search alone ranks it last).
+	queryVector := []float32{1, 0, 0}
+
 	exact := sym("exact-key", "ParseConfig", "ParseConfig", "", "func ParseConfig() {}")
-	fe.register(exact, []float32{0, 0, 1})
+	fe.register(exact, []float32{0, 0, 1}) // far from queryVector
 
-	// semantic: not an exact name match, but its embedding is exactly the
-	// query vector (so vector search alone ranks it first) and it also
-	// shares no useful FTS tokens with the query.
-	semantic := sym("semantic-key", "LoadSettings", "ConfigLoader.LoadSettings", "", "func LoadSettings() {}")
-	fe.register(semantic, []float32{1, 0, 0})
+	symbols := []codeindex.Symbol{exact}
+	const numDecoys = 4
+	for i := 0; i < numDecoys; i++ {
+		name := fmt.Sprintf("ParseConfigDecoy%d", i)
+		decoy := sym(name, name, name,
+			strings.Repeat("ParseConfig ", 8), // heavy repetition inflates bm25 past "exact"'s
+			"func "+name+"() {}")
+		fe.register(decoy, queryVector) // sits exactly at the query vector
+		symbols = append(symbols, decoy)
+	}
 
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{exact, semantic}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", symbols, fe.embed); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	queryVector := []float32{1, 0, 0} // == semantic's embedding
 	hits, err := s.SearchSymbolsHybrid("ParseConfig", queryVector, 10)
 	if err != nil {
 		t.Fatalf("SearchSymbolsHybrid: %v", err)
@@ -252,7 +351,7 @@ func TestSearchSymbolsHybridExactMatchBeatsSemanticSimilarity(t *testing.T) {
 		t.Fatalf("got %d hits, want >= 2", len(hits))
 	}
 	if hits[0].Key != "exact-key" {
-		t.Errorf("hits[0].Key = %q, want exact-key (exact identifier match must be pinned above semantic similarity)", hits[0].Key)
+		t.Errorf("hits[0].Key = %q, want exact-key (exact identifier match must be pinned above decoys that outrank it under plain RRF)", hits[0].Key)
 	}
 	if !hits[0].ExactMatch {
 		t.Errorf("hits[0].ExactMatch = false, want true")
