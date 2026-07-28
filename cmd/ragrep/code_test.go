@@ -1108,6 +1108,76 @@ func TestCmdCodeIndexPrunesDeletedFiles(t *testing.T) {
 	assertPaths("a.go")
 }
 
+// A `code expand` call records its own index_runs row (see
+// serverIdentity/RecordIndexRun in cmdCodeExpand), which used to make
+// LatestIndexRun -- and therefore any manifest built afterward -- advertise
+// a revision at which symbols were never actually (re)indexed, since it just
+// picked the highest id regardless of scope. Now `code index` scopes its own
+// run "index:..." and `code expand` scopes its "expand:...", and
+// LatestIndexRun only ever considers "index:"-scoped rows -- so an expand
+// call right after an index must leave LatestIndexRun pointing at the index
+// run, unchanged.
+func TestLatestIndexRunSurvivesSubsequentExpand(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileSrc := "package p\n\nfunc Foo() {\n\n}\n"
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte(fileSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	docSymExe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-docsym-scope", fakeLSPServerDocumentSymbolSrc)
+	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(docSymExe)+`"}}`)
+	db := filepath.Join(root, ".ragrep", "code.db")
+
+	if code := run([]string{"code", "index", "--db", db, "--language", "go", root}); code != 0 {
+		t.Fatalf("code index: exit=%d", code)
+	}
+
+	s, err := codestore.Open(db, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexRun, err := s.LatestIndexRun()
+	if err != nil {
+		t.Fatalf("LatestIndexRun after index: %v", err)
+	}
+	if !strings.HasPrefix(indexRun.Scope, "index:") {
+		t.Fatalf("index run scope = %q, want an \"index:\" prefix", indexRun.Scope)
+	}
+	matches, err := s.FindByQualifiedName("Foo", "a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("FindByQualifiedName(Foo, a.go) = %v, want exactly 1 match", matches)
+	}
+	key := matches[0].Key
+	s.Close()
+
+	// Switch the configured server to one that answers textDocument/references
+	// (with an empty result -- RecordIndexRun happens regardless of whether
+	// the query found anything, so a "no results" expand still needs to not
+	// disturb LatestIndexRun).
+	emptyExe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-allcaps-empty-scope", fakeLSPServerAllCapsEmptySrc)
+	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(emptyExe)+`"}}`)
+	run([]string{"code", "expand", "--db", db, "--symbol", key, "--relation", "references"}) // exit code irrelevant here
+
+	s2, err := codestore.Open(db, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	after, err := s2.LatestIndexRun()
+	if err != nil {
+		t.Fatalf("LatestIndexRun after expand: %v", err)
+	}
+	if after.ID != indexRun.ID || after.Scope != indexRun.Scope {
+		t.Fatalf("LatestIndexRun after expand = %+v, want unchanged from before expand (%+v)", after, indexRun)
+	}
+}
+
 // --include-code disables the default code-extension exclusion.
 func TestCmdIndexIncludeCodeFlag(t *testing.T) {
 	root, err := filepath.Abs(t.TempDir())
@@ -1179,7 +1249,7 @@ func TestRunCodePackBudgetRespectedAndTruncationSurfaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	when := time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
-	if _, err := s.RecordIndexRun("root", "rev123", "go", "gopls", "v1.2.3", codeModelID, when); err != nil {
+	if _, err := s.RecordIndexRun("index:root", "rev123", "go", "gopls", "v1.2.3", codeModelID, when); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1309,7 +1379,7 @@ func codeVerifyWorkspace(t *testing.T) (root, db string, manifest coderetrieval.
 		s.Close()
 		t.Fatal(err)
 	}
-	if _, err := s.RecordIndexRun("root", "rev1", "go", "gopls", "v1", codeModelID, time.Now()); err != nil {
+	if _, err := s.RecordIndexRun("index:root", "rev1", "go", "gopls", "v1", codeModelID, time.Now()); err != nil {
 		s.Close()
 		t.Fatal(err)
 	}

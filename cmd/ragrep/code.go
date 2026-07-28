@@ -384,7 +384,11 @@ func cmdCodeIndex(args []string) int {
 	// needs a real runID to stamp into symbols.index_run_id as it goes, so
 	// the row's own id must exist first.
 	serverName, serverVersion := serverIdentity(initResult)
-	runID, err := s.RecordIndexRun(strings.Join(relRoots, ","), gitRevision(wsRoot), *language, serverName, serverVersion, codeModelID, time.Now())
+	// Scoped "index:..." so LatestIndexRun can tell this run apart from a
+	// `code expand` call's own "expand:..."-scoped run (see LatestIndexRun's
+	// doc comment) -- expand never (re)indexes any symbol, so it must never
+	// win a manifest's identity just by recording a later id.
+	runID, err := s.RecordIndexRun("index:"+strings.Join(relRoots, ","), gitRevision(wsRoot), *language, serverName, serverVersion, codeModelID, time.Now())
 	if err != nil {
 		return fail(err)
 	}
@@ -985,7 +989,10 @@ func cmdCodeExpand(args []string) int {
 		return fail(*resolveErr)
 	}
 
-	runID, err := s.RecordIndexRun(sym.Path, gitRevision(wsRoot), sym.Language, serverName, serverVersion, codeModelID, time.Now())
+	// Scoped "expand:<relation>:<key>", never "index:...", so it's excluded
+	// from LatestIndexRun -- see that method's doc comment and the sibling
+	// "index:" scope cmdCodeIndex records.
+	runID, err := s.RecordIndexRun(fmt.Sprintf("expand:%s:%s", *relation, sym.Key), gitRevision(wsRoot), sym.Language, serverName, serverVersion, codeModelID, time.Now())
 	if err != nil {
 		return fail(err)
 	}
