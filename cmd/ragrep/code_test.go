@@ -1218,6 +1218,108 @@ func TestCmdCodeVerifyDetectsStaleFile(t *testing.T) {
 	}
 }
 
+// `code verify --manifest FILE` is documented (README) to be pointed
+// directly at a `code pack --json` output file, which is the wrapper shape
+// {"pack":...,"manifest":...} -- not a bare Manifest. Verify must unwrap it
+// (using the real symbols inside "manifest"), not silently unmarshal the
+// wrapper into a bare Manifest and get zero symbols (which used to always
+// report clean=true).
+func TestCmdCodeVerifyAcceptsPackJSONWrapperAndDetectsStaleness(t *testing.T) {
+	root, db, manifest := codeVerifyWorkspace(t)
+	packPath := writePackWrapperFile(t, manifest)
+
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	code := run([]string{"code", "verify", "--db", db, "--manifest", packPath, "--json"})
+	w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 0 {
+		t.Fatalf("verify against pack-wrapper JSON: exit=%d, want 0, stdout=%q", code, buf.String())
+	}
+	var decoded codeVerifyOutput
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("stdout not valid JSON: %v (%q)", err, buf.String())
+	}
+	if !decoded.Clean || len(decoded.Entries) != 1 {
+		t.Fatalf("decoded = %+v, want one clean entry", decoded)
+	}
+
+	// Edit the file the manifest's only entry points at: verify against the
+	// same pack-wrapper file must now detect staleness, not stay clean.
+	if err := os.WriteFile(filepath.Join(root, "pkg", "foo.go"), []byte("package pkg\n\nfunc A() { /* edited */ }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r2, w2, _ := os.Pipe()
+	os.Stdout = w2
+	code2 := run([]string{"code", "verify", "--db", db, "--manifest", packPath, "--json"})
+	w2.Close()
+	os.Stdout = old
+	var buf2 bytes.Buffer
+	buf2.ReadFrom(r2)
+
+	if code2 != 2 {
+		t.Fatalf("verify after edit: exit=%d, want 2, stdout=%q", code2, buf2.String())
+	}
+	var decoded2 codeVerifyOutput
+	if err := json.Unmarshal(buf2.Bytes(), &decoded2); err != nil {
+		t.Fatalf("stdout not valid JSON: %v (%q)", err, buf2.String())
+	}
+	if decoded2.Clean {
+		t.Fatal("decoded2.Clean = true, want false after file edit")
+	}
+}
+
+// A manifest that loads with zero symbols -- whether that's junk JSON, an
+// empty object, or any other shape that isn't a real manifest/pack -- must
+// be reported as an error, never as a clean (or even non-clean-but-parsed)
+// verify result: an empty manifest silently reporting clean=true is exactly
+// how this bug went unnoticed.
+func TestCmdCodeVerifyRejectsManifestWithZeroSymbols(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "code.db")
+	junkPath := filepath.Join(t.TempDir(), "junk.json")
+	if err := os.WriteFile(junkPath, []byte(`{"hello":"world"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+	code := run([]string{"code", "verify", "--db", db, "--manifest", junkPath})
+	w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 1 {
+		t.Fatalf("verify with zero-symbol manifest: exit=%d, want 1, stderr=%q", code, buf.String())
+	}
+	if !strings.Contains(buf.String(), "zero symbols") {
+		t.Fatalf("stderr=%q, want a clear zero-symbols message", buf.String())
+	}
+}
+
+// writePackWrapperFile writes m wrapped exactly the way `code pack --json`
+// emits it (codePackOutput's own json tags: "pack","manifest") -- Pack is
+// left zero-value since verify never reads it, only "manifest".
+func writePackWrapperFile(t *testing.T, m coderetrieval.Manifest) string {
+	t.Helper()
+	out := codePackOutput{Manifest: m}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "pack.json")
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 // A manifest entry whose stable key no longer resolves (the symbol was
 // deleted from the store, not just edited) AND whose qualified_name/path no
 // longer identifies any indexed symbol must be reported as an unresolved,

@@ -1186,6 +1186,31 @@ func formatCodeVerifyOutput(w io.Writer, out codeVerifyOutput, asJSON bool) erro
 	return nil
 }
 
+// loadManifest parses data as either shape `code verify --manifest` may be
+// pointed at: a bare coderetrieval.Manifest, or the wrapper `code pack
+// --json` actually writes to disk ({"pack":...,"manifest":...}, see
+// codePackOutput) -- the README documents pointing verify straight at a
+// pack's JSON output file, which is the wrapper shape, not a bare manifest.
+// A wrapper is detected by its "manifest" key successfully binding; anything
+// else (including a bare manifest, or JSON with no recognizable shape at
+// all) falls back to unmarshaling data directly as a Manifest -- the caller
+// is responsible for treating a resulting zero-symbol Manifest as an error,
+// since json.Unmarshal itself can't distinguish "a real empty manifest"
+// from "not a manifest at all" (e.g. `{"hello":"world"}`).
+func loadManifest(data []byte) (coderetrieval.Manifest, error) {
+	var wrapper struct {
+		Manifest *coderetrieval.Manifest `json:"manifest"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err == nil && wrapper.Manifest != nil {
+		return *wrapper.Manifest, nil
+	}
+	var m coderetrieval.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return coderetrieval.Manifest{}, err
+	}
+	return m, nil
+}
+
 func cmdCodeVerify(args []string) int {
 	fs := newFlagSet("code verify")
 	db := codeDBFlag(fs)
@@ -1202,9 +1227,12 @@ func cmdCodeVerify(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	var m coderetrieval.Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
+	m, err := loadManifest(data)
+	if err != nil {
 		return fail(fmt.Errorf("parsing manifest %s: %w", *manifestPath, err))
+	}
+	if len(m.Symbols) == 0 {
+		return fail(fmt.Errorf("manifest %s has zero symbols (not a valid manifest or code-pack output?)", *manifestPath))
 	}
 
 	wsRoot, err := workspaceRoot(*db)
