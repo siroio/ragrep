@@ -15,7 +15,7 @@ import (
 
 var errNotFound = errors.New("not found")
 
-const embedDim = 384
+const embedDim = 768
 
 type EmbedFunc func(text string) ([]float32, error)
 
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS paragraphs(
 );
 CREATE INDEX IF NOT EXISTS idx_para_doc ON paragraphs(doc_id, seq);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(text, tokenize='trigram');
-CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0(embedding float[384]);
+CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0(embedding float[768]);
 `
 
 func openStore(path string) (*Store, error) {
@@ -118,7 +118,7 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 		if _, err := tx.Exec(`INSERT INTO fts(rowid, text) VALUES(?,?)`, paraID, p.Text); err != nil {
 			return false, err
 		}
-		v, err := embed("passage: " + p.Text)
+		v, err := embed("title: none | text: " + p.Text)
 		if err != nil {
 			return false, fmt.Errorf("embed %s#%d: %w", relPath, p.Seq, err)
 		}

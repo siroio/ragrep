@@ -7,9 +7,9 @@ import (
 
 // fakeEmbed returns a fixed-dimension deterministic vector (no ONNX needed).
 func fakeEmbed(text string) ([]float32, error) {
-	v := make([]float32, 384)
+	v := make([]float32, embedDim)
 	for i, r := range text {
-		v[i%384] += float32(r % 13)
+		v[i%embedDim] += float32(r % 13)
 	}
 	return v, nil
 }
@@ -85,7 +85,7 @@ func TestSearchVectorAndHybrid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	qv, _ := fakeEmbed("passage: りんごは赤い果物です。") // identical vector -> distance 0
+	qv, _ := fakeEmbed("title: none | text: りんごは赤い果物です。") // identical vector -> distance 0
 	hits, err := s.SearchVector(qv, 2)
 	if err != nil {
 		t.Fatal(err)
