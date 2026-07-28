@@ -4,7 +4,9 @@
 ハイブリッド検索（ベクトル + 全文）と Adaptive Context Expansion による取得を提供する。
 
 - 埋め込みモデル: embeddinggemma-300m（quantized ONNX, 768次元）
-- インデックス: SQLite（`.ragrep/index.db`。`--db PATH` か環境変数 `RAGREP_DB` で変更可。ワークスペース共有や切り替えに使える）
+- インデックス: SQLite（デフォルトはcwdから親方向に最も近い `.ragrep/index.db` を自動発見。
+  `--db PATH` か環境変数 `RAGREP_DB` で明示指定でき、ワークスペース共有や切り替えに使える。
+  優先順位: `--db` > `RAGREP_DB` > 祖先の `.ragrep/index.db` > cwd の `.ragrep/index.db`）
 - 対応プラットフォーム: windows/amd64, windows/arm64, linux/amd64, darwin/arm64
 
 ## Install / Build
@@ -44,8 +46,9 @@ ragrep get --lines 12-18 docs/auth.md         # 行範囲
 - `search --json` は `{doc, para, lines, score, snippet}` のJSON配列を出力。
 - 終了コード: 0=成功 / 1=エラー / 2=ヒットなし・get未検出（2はエラーではない）。
 - インデックスはドットディレクトリ・10MB超・バイナリファイルを自動スキップする。
-- `index`/`get` は常にインデックス時と同じカレントディレクトリから相対パスで実行すること。
-  ドキュメントキーは入力パスそのままのため、`docs` と `D:\...\docs` は別キーになる。
+- ドキュメントキーは絶対パスに正規化されるため、相対・`./x`・絶対のどの形で渡しても
+  同じキーに解決され、サブディレクトリからの実行でも動く。
+  旧形式（入力パスそのまま）でインデックスしたDBは `ragrep index` の再実行が必要。
 
 ## Agent Skills
 
