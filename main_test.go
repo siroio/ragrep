@@ -40,3 +40,15 @@ func TestGetContentLines(t *testing.T) {
 		t.Fatalf("clamp to EOF: got %q err=%v", got, err)
 	}
 }
+
+// A panic escaping run() must surface as exit 1 (this CLI's generic error
+// code), not Go's own panic exit code 2 -- which would collide with the
+// "no hits / not found" contract.
+func TestProtect(t *testing.T) {
+	if code := protect(func() int { panic("boom") }); code != 1 {
+		t.Fatalf("panic: got %d, want 1", code)
+	}
+	if code := protect(func() int { return 2 }); code != 2 {
+		t.Fatalf("no panic: got %d, want 2", code)
+	}
+}

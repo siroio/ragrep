@@ -139,3 +139,35 @@ func TestGet(t *testing.T) {
 		t.Fatalf("want errNotFound, got %v", err)
 	}
 }
+
+func TestDeleteDoc(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("a.txt", "alpha content UNIQUEAAA111", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("b.txt", "beta content UNIQUEBBB222", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteDoc("a.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := s.SearchText("UNIQUEAAA111", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("stale hits after delete: %+v", hits)
+	}
+	if _, err := s.GetDoc("a.txt"); err != errNotFound {
+		t.Fatalf("want errNotFound, got %v", err)
+	}
+	if doc, err := s.GetDoc("b.txt"); err != nil || doc != "beta content UNIQUEBBB222" {
+		t.Fatalf("other doc affected: %q err=%v", doc, err)
+	}
+
+	if err := s.DeleteDoc("missing.txt"); err != errNotFound {
+		t.Fatalf("want errNotFound, got %v", err)
+	}
+}

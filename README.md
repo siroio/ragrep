@@ -13,6 +13,7 @@
 
     rag init                     # モデル・ランタイムをDL（初回のみ、~310MB）
     rag index docs/              # テキストファイルをインデックス
+    rag index --prune docs/      # 削除済みファイルをインデックスから除去
     rag search --json "認証エラー"          # ハイブリッド検索（段落単位でヒット）
     rag search --mode text -k 5 "ERR_AUTH"  # 全文検索のみ
     rag get docs/auth.md                     # Document全体

@@ -25,12 +25,18 @@ func TestSmoke(t *testing.T) {
 	os.WriteFile(filepath.Join(corpus, "net.md"), []byte(
 		"ネットワーク設定。\nプロキシはenvで指定する。\n"), 0o644)
 
+	// A doc outside the "docs" root, indexed alongside it, to prove --prune
+	// only touches paths under the pruned root(s).
+	other := filepath.Join(tmp, "other")
+	os.MkdirAll(other, 0o755)
+	os.WriteFile(filepath.Join(other, "keep.md"), []byte("キープ対象のドキュメント。\n"), 0o644)
+
 	db := filepath.Join(tmp, "index.db")
 	wd, _ := os.Getwd()
 	os.Chdir(tmp)
 	defer os.Chdir(wd)
 
-	if code := run([]string{"index", "--db", db, "docs"}); code != 0 {
+	if code := run([]string{"index", "--db", db, "docs", "other"}); code != 0 {
 		t.Fatalf("index exit=%d", code)
 	}
 	if code := run([]string{"search", "--db", db, "--json", "ERR_AUTH_104"}); code != 0 {
@@ -49,6 +55,24 @@ func TestSmoke(t *testing.T) {
 	// "docs/auth.md" key stored (with ToSlash) at index time.
 	if code := run([]string{"get", "--db", db, `docs\auth.md`}); code != 0 {
 		t.Fatalf("get backslash-path exit=%d, want 0", code)
+	}
+
+	// --prune: remove indexed docs under the given root(s) that no longer
+	// exist on disk, leaving docs outside the pruned root untouched.
+	if err := os.Remove(filepath.Join(corpus, "auth.md")); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"index", "--prune", "--db", db, "docs"}); code != 0 {
+		t.Fatalf("index --prune exit=%d", code)
+	}
+	if code := run([]string{"get", "--db", db, "docs/auth.md"}); code != 2 {
+		t.Fatalf("get pruned doc exit=%d, want 2", code)
+	}
+	if code := run([]string{"get", "--db", db, "docs/net.md"}); code != 0 {
+		t.Fatalf("get untouched doc in pruned root exit=%d, want 0", code)
+	}
+	if code := run([]string{"get", "--db", db, "other/keep.md"}); code != 0 {
+		t.Fatalf("get doc outside pruned root exit=%d, want 0", code)
 	}
 }
 

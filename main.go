@@ -26,7 +26,21 @@ Exit codes: 0 success, 1 error, 2 no hits / not found
 `
 
 func main() {
-	os.Exit(run(os.Args[1:]))
+	os.Exit(protect(func() int { return run(os.Args[1:]) }))
+}
+
+// protect recovers a panic escaping f and converts it to exit code 1 (this
+// CLI's generic error code) instead of letting it escape main() and exit
+// with Go's own panic code 2 -- which would collide with the "no hits /
+// not found" contract.
+func protect(f func() int) (code int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintln(os.Stderr, "panic:", r)
+			code = 1
+		}
+	}()
+	return f()
 }
 
 func fail(err error) int {
@@ -137,6 +151,7 @@ const maxFileSize = 10 << 20 // 10MB
 func cmdIndex(args []string) int {
 	fset := newFlagSet("index")
 	db := dbFlag(fset)
+	prune := fset.Bool("prune", false, "remove indexed docs under the given roots that no longer exist on disk")
 	if code, handled := parseArgs(fset, args); handled {
 		return code
 	}
@@ -195,7 +210,40 @@ func cmdIndex(args []string) int {
 			return fail(err)
 		}
 	}
-	fmt.Printf("done: %d indexed, %d skipped\n", indexed, skipped)
+	pruned := 0
+	if *prune {
+		roots := make([]string, len(fset.Args()))
+		for i, r := range fset.Args() {
+			roots[i] = filepath.ToSlash(filepath.Clean(r))
+		}
+		paths, err := s.ListPaths()
+		if err != nil {
+			return fail(err)
+		}
+		for _, p := range paths {
+			underRoot := false
+			for _, root := range roots {
+				if p == root || strings.HasPrefix(p, root+"/") {
+					underRoot = true
+					break
+				}
+			}
+			if !underRoot {
+				continue
+			}
+			if _, err := os.Stat(filepath.FromSlash(p)); err == nil {
+				continue // still exists
+			}
+			if err := s.DeleteDoc(p); err != nil {
+				return fail(err)
+			}
+			fmt.Println("pruned", p)
+			pruned++
+		}
+		fmt.Printf("done: %d indexed, %d skipped, %d pruned\n", indexed, skipped, pruned)
+	} else {
+		fmt.Printf("done: %d indexed, %d skipped\n", indexed, skipped)
+	}
 	return 0
 }
 

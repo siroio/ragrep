@@ -51,7 +51,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0(embedding float[768]);
 `
 
 func openStore(path string) (*Store, error) {
-	db, err := sql.Open("sqlite3", "file:"+path)
+	db, err := sql.Open("sqlite3", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
@@ -278,6 +278,57 @@ func (s *Store) SearchHybrid(query string, qvec []float32, k int) ([]Hit, error)
 		ids = ids[:k]
 	}
 	return s.hitsByParaIDs(ids, scores)
+}
+
+// ListPaths returns the stored path of every indexed document.
+func (s *Store) ListPaths() ([]string, error) {
+	rows, err := s.db.Query(`SELECT path FROM documents`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
+// DeleteDoc removes a document and its paragraphs/fts/vec rows. errNotFound
+// if relPath isn't indexed.
+func (s *Store) DeleteDoc(relPath string) error {
+	var docID int64
+	err := s.db.QueryRow(`SELECT id FROM documents WHERE path=?`, relPath).Scan(&docID)
+	if err == sql.ErrNoRows {
+		return errNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, q := range []string{
+		`DELETE FROM fts WHERE rowid IN (SELECT id FROM paragraphs WHERE doc_id=?)`,
+		`DELETE FROM vec WHERE rowid IN (SELECT id FROM paragraphs WHERE doc_id=?)`,
+		`DELETE FROM paragraphs WHERE doc_id=?`,
+	} {
+		if _, err := tx.Exec(q, docID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM documents WHERE id=?`, docID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) GetDoc(relPath string) (string, error) {
