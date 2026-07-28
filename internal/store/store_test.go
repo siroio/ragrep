@@ -38,7 +38,7 @@ func TestUpsertAndTextSearch(t *testing.T) {
 		t.Fatalf("re-upsert: changed=%v err=%v", changed, err)
 	}
 
-	hits, err := s.SearchText("ERR_AUTH_104", 10)
+	hits, err := s.SearchText("ERR_AUTH_104", 10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestUpsertAndTextSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hits, _ = s.SearchText("ERR_AUTH_104", 10)
+	hits, _ = s.SearchText("ERR_AUTH_104", 10, nil)
 	if len(hits) != 0 {
 		t.Fatalf("stale hits after update: %+v", hits)
 	}
@@ -86,7 +86,7 @@ func TestSearchVectorAndHybrid(t *testing.T) {
 	}
 
 	qv, _ := fakeEmbed("title: none | text: りんごは赤い果物です。") // identical vector -> distance 0
-	hits, err := s.SearchVector(qv, 2)
+	hits, err := s.SearchVector(qv, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestSearchVectorAndHybrid(t *testing.T) {
 		t.Fatalf("scores not descending: %+v", hits)
 	}
 
-	hy, err := s.SearchHybrid("りんご", qv, 2)
+	hy, err := s.SearchHybrid("りんご", qv, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestDeleteDoc(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hits, err := s.SearchText("UNIQUEAAA111", 10)
+	hits, err := s.SearchText("UNIQUEAAA111", 10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

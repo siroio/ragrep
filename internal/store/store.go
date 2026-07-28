@@ -100,6 +100,7 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 			`DELETE FROM fts WHERE rowid IN (SELECT id FROM paragraphs WHERE doc_id=?)`,
 			`DELETE FROM vec WHERE rowid IN (SELECT id FROM paragraphs WHERE doc_id=?)`,
 			`DELETE FROM paragraphs WHERE doc_id=?`,
+			`DELETE FROM doc_tags WHERE doc_id=?`,
 		} {
 			if _, err := tx.Exec(q, docID); err != nil {
 				return false, err
@@ -118,7 +119,11 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 		docID, _ = res.LastInsertId()
 	}
 
+	fmLines := frontmatterLineCount(content)
 	for _, p := range splitParas(content) {
+		if fmLines > 0 && p.EndLine <= fmLines {
+			continue // frontmatter block is metadata, not searchable content
+		}
 		res, err := tx.Exec(`INSERT INTO paragraphs(doc_id, seq, start_line, end_line, text) VALUES(?,?,?,?,?)`,
 			docID, p.Seq, p.StartLine, p.EndLine, p.Text)
 		if err != nil {
@@ -140,6 +145,13 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 			return false, err
 		}
 	}
+
+	for _, tag := range ParseTags(content) {
+		if _, err := tx.Exec(`INSERT INTO doc_tags(doc_id, tag) VALUES(?,?)`, docID, tag); err != nil {
+			return false, err
+		}
+	}
+
 	return true, tx.Commit()
 }
 
@@ -156,6 +168,25 @@ func snippet(text string) string {
 		return string(r[:120]) + "…"
 	}
 	return s
+}
+
+// tagFilter builds an "AND rowid IN (...)" SQL fragment (plus its bound args)
+// that restricts fts/vec rowids to paragraphs whose document carries every
+// tag in tags (AND semantics; tags are lowercased since ParseTags stores them
+// lowercased). Returns ("", nil) when tags is empty, meaning no filtering.
+func tagFilter(tags []string) (string, []any) {
+	if len(tags) == 0 {
+		return "", nil
+	}
+	frag := `AND rowid IN (SELECT id FROM paragraphs WHERE doc_id IN (
+		SELECT doc_id FROM doc_tags WHERE tag IN (` + strings.TrimSuffix(strings.Repeat("?,", len(tags)), ",") + `)
+		GROUP BY doc_id HAVING COUNT(DISTINCT tag)=?))`
+	args := make([]any, 0, len(tags)+1)
+	for _, t := range tags {
+		args = append(args, strings.ToLower(t))
+	}
+	args = append(args, len(tags))
+	return frag, args
 }
 
 func (s *Store) hitsByParaIDs(ids []int64, scores map[int64]float64) ([]Hit, error) {
@@ -180,10 +211,13 @@ func (s *Store) hitsByParaIDs(ids []int64, scores map[int64]float64) ([]Hit, err
 }
 
 // searchTextIDs returns paragraph ids ordered by BM25 rank.
-func (s *Store) searchTextIDs(query string, k int) ([]int64, error) {
+func (s *Store) searchTextIDs(query string, k int, tags []string) ([]int64, error) {
+	frag, targs := tagFilter(tags)
+	args := append([]any{ftsQuery(query)}, targs...)
+	args = append(args, k)
 	rows, err := s.db.Query(
-		`SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?`,
-		ftsQuery(query), k)
+		`SELECT rowid FROM fts WHERE fts MATCH ? `+frag+` ORDER BY bm25(fts) LIMIT ?`,
+		args...)
 	if err != nil {
 		return nil, err
 	}
@@ -199,8 +233,8 @@ func (s *Store) searchTextIDs(query string, k int) ([]int64, error) {
 	return ids, rows.Err()
 }
 
-func (s *Store) SearchText(query string, k int) ([]Hit, error) {
-	ids, err := s.searchTextIDs(query, k)
+func (s *Store) SearchText(query string, k int, tags []string) ([]Hit, error) {
+	ids, err := s.searchTextIDs(query, k, tags)
 	if err != nil {
 		return nil, err
 	}
@@ -234,14 +268,17 @@ func rrfMerge(lists [][]int64) ([]int64, map[int64]float64) {
 }
 
 // searchVectorIDs returns paragraph ids ordered by ascending distance.
-func (s *Store) searchVectorIDs(qvec []float32, k int) ([]int64, map[int64]float64, error) {
+func (s *Store) searchVectorIDs(qvec []float32, k int, tags []string) ([]int64, map[int64]float64, error) {
 	blob, err := sqlite_vec.SerializeFloat32(qvec)
 	if err != nil {
 		return nil, nil, err
 	}
+	frag, targs := tagFilter(tags)
+	args := append([]any{blob}, targs...)
+	args = append(args, k)
 	rows, err := s.db.Query(
-		`SELECT rowid, distance FROM vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?`,
-		blob, k)
+		`SELECT rowid, distance FROM vec WHERE embedding MATCH ? `+frag+` ORDER BY distance LIMIT ?`,
+		args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -260,8 +297,8 @@ func (s *Store) searchVectorIDs(qvec []float32, k int) ([]int64, map[int64]float
 	return ids, dists, rows.Err()
 }
 
-func (s *Store) SearchVector(qvec []float32, k int) ([]Hit, error) {
-	ids, dists, err := s.searchVectorIDs(qvec, k)
+func (s *Store) SearchVector(qvec []float32, k int, tags []string) ([]Hit, error) {
+	ids, dists, err := s.searchVectorIDs(qvec, k, tags)
 	if err != nil {
 		return nil, err
 	}
@@ -274,12 +311,12 @@ func (s *Store) SearchVector(qvec []float32, k int) ([]Hit, error) {
 
 const rrfFetch = 50 // candidates fetched from each ranking before fusion
 
-func (s *Store) SearchHybrid(query string, qvec []float32, k int) ([]Hit, error) {
-	textIDs, err := s.searchTextIDs(query, rrfFetch)
+func (s *Store) SearchHybrid(query string, qvec []float32, k int, tags []string) ([]Hit, error) {
+	textIDs, err := s.searchTextIDs(query, rrfFetch, tags)
 	if err != nil {
 		return nil, err
 	}
-	vecIDs, _, err := s.searchVectorIDs(qvec, rrfFetch)
+	vecIDs, _, err := s.searchVectorIDs(qvec, rrfFetch, tags)
 	if err != nil {
 		return nil, err
 	}

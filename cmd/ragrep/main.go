@@ -327,7 +327,7 @@ func cmdSearch(args []string) int {
 	var hits []store.Hit
 	switch *mode {
 	case "text":
-		hits, err = s.SearchText(query, *k)
+		hits, err = s.SearchText(query, *k, nil)
 	case "vector", "hybrid":
 		dir, derr := embed.CacheDir()
 		if derr != nil {
@@ -343,9 +343,9 @@ func cmdSearch(args []string) int {
 			return fail(verr)
 		}
 		if *mode == "vector" {
-			hits, err = s.SearchVector(qv, *k)
+			hits, err = s.SearchVector(qv, *k, nil)
 		} else {
-			hits, err = s.SearchHybrid(query, qv, *k)
+			hits, err = s.SearchHybrid(query, qv, *k, nil)
 		}
 	default:
 		return fail(fmt.Errorf("unknown mode %q", *mode))
