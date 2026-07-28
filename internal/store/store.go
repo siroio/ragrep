@@ -120,12 +120,13 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 	}
 
 	fmLines := frontmatterLineCount(content)
+	seq := 0
 	for _, p := range splitParas(content) {
 		if fmLines > 0 && p.EndLine <= fmLines {
 			continue // frontmatter block is metadata, not searchable content
 		}
 		res, err := tx.Exec(`INSERT INTO paragraphs(doc_id, seq, start_line, end_line, text) VALUES(?,?,?,?,?)`,
-			docID, p.Seq, p.StartLine, p.EndLine, p.Text)
+			docID, seq, p.StartLine, p.EndLine, p.Text)
 		if err != nil {
 			return false, err
 		}
@@ -135,7 +136,7 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 		}
 		v, err := embed("title: none | text: " + p.Text)
 		if err != nil {
-			return false, fmt.Errorf("embed %s#%d: %w", relPath, p.Seq, err)
+			return false, fmt.Errorf("embed %s#%d: %w", relPath, seq, err)
 		}
 		blob, err := sqlite_vec.SerializeFloat32(v)
 		if err != nil {
@@ -144,6 +145,7 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 		if _, err := tx.Exec(`INSERT INTO vec(rowid, embedding) VALUES(?,?)`, paraID, blob); err != nil {
 			return false, err
 		}
+		seq++
 	}
 
 	for _, tag := range ParseTags(content) {
@@ -367,6 +369,7 @@ func (s *Store) DeleteDoc(relPath string) error {
 		`DELETE FROM fts WHERE rowid IN (SELECT id FROM paragraphs WHERE doc_id=?)`,
 		`DELETE FROM vec WHERE rowid IN (SELECT id FROM paragraphs WHERE doc_id=?)`,
 		`DELETE FROM paragraphs WHERE doc_id=?`,
+		`DELETE FROM doc_tags WHERE doc_id=?`,
 	} {
 		if _, err := tx.Exec(q, docID); err != nil {
 			return err

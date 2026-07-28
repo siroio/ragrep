@@ -100,3 +100,51 @@ func TestSearchTagFilter(t *testing.T) {
 		t.Fatalf("after tag removal: %+v", hits)
 	}
 }
+
+// TestDeleteDocPurgesTags reproduces rowid-reuse tag inheritance: documents.id
+// is INTEGER PRIMARY KEY without AUTOINCREMENT, so SQLite reuses a deleted
+// row's id for the next insert. If DeleteDoc doesn't purge doc_tags, a new
+// untagged document can silently inherit the deleted document's tags.
+func TestDeleteDocPurgesTags(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("d1.md", "---\ntags: [design]\n---\n\n最初の keyword 文書。", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteDoc("d1.md"); err != nil {
+		t.Fatal(err)
+	}
+	// d2.md is the only document left, so it reuses id=1 (the id DeleteDoc
+	// just freed) and must not inherit d1.md's "design" tag.
+	if _, err := s.UpsertDoc("d2.md", "タグなしの keyword 文書。", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.SearchText("keyword", 10, []string{"design"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("tag=design should not match untagged d2.md via inherited rowid tags: %+v", hits)
+	}
+}
+
+// TestFrontmatterSeqRenumbered checks that skipping the frontmatter block
+// during paragraph indexing still leaves the first indexed content
+// paragraph at Seq/Para 0, matching the 0-based-contiguous invariant every
+// other document shape has.
+func TestFrontmatterSeqRenumbered(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("fm.md", "---\ntags: [x]\n---\n\n本文パラグラフ。", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.SearchText("パラグラフ", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Para != 0 {
+		t.Fatalf("expected Para=0 for the first indexed content paragraph, got %+v", hits)
+	}
+	got, err := s.GetParas("fm.md", 0, 0)
+	if err != nil || got != "本文パラグラフ。" {
+		t.Fatalf("GetParas(0,0)=%q err=%v", got, err)
+	}
+}
