@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/siroio/ragrep/internal/codeindex"
 )
@@ -85,7 +86,7 @@ func TestUpsertSymbolsSkipsReindexWhenFileHashUnchanged(t *testing.T) {
 	s1 := sym("k1", "ParseConfig", "ParseConfig", "", "func ParseConfig() {}")
 	fe.register(s1, []float32{1, 0, 0})
 
-	changed, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{s1}, fe.embed)
+	changed, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{s1}, 0, fe.embed)
 	if err != nil {
 		t.Fatalf("first UpsertSymbols: %v", err)
 	}
@@ -98,7 +99,7 @@ func TestUpsertSymbolsSkipsReindexWhenFileHashUnchanged(t *testing.T) {
 
 	// Same file hash, even if the caller (hypothetically) re-parsed the same
 	// content into an equal symbol list: must skip without touching embed.
-	changed, err = s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{s1}, fe.embed)
+	changed, err = s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{s1}, 0, fe.embed)
 	if err != nil {
 		t.Fatalf("second UpsertSymbols: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestUpsertSymbolsRemovesOrphanRowsAcrossAllIndexes(t *testing.T) {
 	fe.register(k1, []float32{1, 0, 0})
 	fe.register(k2, []float32{0, 1, 0})
 
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1, k2}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1, k2}, 0, fe.embed); err != nil {
 		t.Fatalf("initial upsert: %v", err)
 	}
 
@@ -135,7 +136,7 @@ func TestUpsertSymbolsRemovesOrphanRowsAcrossAllIndexes(t *testing.T) {
 	}
 
 	// Re-index the file with k1 removed (only k2 remains).
-	changed, err := s.UpsertSymbols("pkg/file.go", "filehash-2", []codeindex.Symbol{k2}, fe.embed)
+	changed, err := s.UpsertSymbols("pkg/file.go", "filehash-2", []codeindex.Symbol{k2}, 0, fe.embed)
 	if err != nil {
 		t.Fatalf("re-upsert dropping k1: %v", err)
 	}
@@ -192,7 +193,7 @@ func TestUpsertSymbolsReEmbedsOnlyWhenDocOrBodyChanges(t *testing.T) {
 
 	k1 := sym("k1", "ParseConfig", "ParseConfig", "", "func ParseConfig() {}")
 	fe.register(k1, []float32{1, 0, 0})
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, 0, fe.embed); err != nil {
 		t.Fatalf("initial upsert: %v", err)
 	}
 	if fe.calls != 1 {
@@ -201,7 +202,7 @@ func TestUpsertSymbolsReEmbedsOnlyWhenDocOrBodyChanges(t *testing.T) {
 
 	// Re-upsert with a new file hash, but the symbol content (doc + body)
 	// unchanged: must not re-embed.
-	changed, err := s.UpsertSymbols("pkg/file.go", "filehash-2", []codeindex.Symbol{k1}, fe.embed)
+	changed, err := s.UpsertSymbols("pkg/file.go", "filehash-2", []codeindex.Symbol{k1}, 0, fe.embed)
 	if err != nil {
 		t.Fatalf("no-op content re-upsert: %v", err)
 	}
@@ -217,7 +218,7 @@ func TestUpsertSymbolsReEmbedsOnlyWhenDocOrBodyChanges(t *testing.T) {
 	k1Doc.Documentation = "ParseConfig parses the config file."
 	k1Doc.EmbeddingText = codeindex.RenderEmbeddingText(k1Doc)
 	fe.register(k1Doc, []float32{0, 1, 0})
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-3", []codeindex.Symbol{k1Doc}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-3", []codeindex.Symbol{k1Doc}, 0, fe.embed); err != nil {
 		t.Fatalf("doc-changed re-upsert: %v", err)
 	}
 	if fe.calls != 2 {
@@ -232,7 +233,7 @@ func TestUpsertSymbolsReEmbedsOnlyWhenDocOrBodyChanges(t *testing.T) {
 	k1Body.BodyHash = fmt.Sprintf("bodyhash:%s", k1Body.Body)
 	k1Body.EmbeddingText = codeindex.RenderEmbeddingText(k1Body)
 	fe.register(k1Body, []float32{0, 0, 1})
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-4", []codeindex.Symbol{k1Body}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-4", []codeindex.Symbol{k1Body}, 0, fe.embed); err != nil {
 		t.Fatalf("body-changed re-upsert: %v", err)
 	}
 	if fe.calls != 3 {
@@ -263,7 +264,7 @@ func TestUpsertSymbolsResyncsFTSWhenIndexedColumnChanges(t *testing.T) {
 	fixedBody := "func Symbol() {}" // held constant so BodyHash never changes
 	k1 := sym("k1", "AlphaWidget", "AlphaWidget", "", fixedBody)
 	fe.register(k1, []float32{1, 0, 0})
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, 0, fe.embed); err != nil {
 		t.Fatalf("initial upsert: %v", err)
 	}
 
@@ -276,7 +277,7 @@ func TestUpsertSymbolsResyncsFTSWhenIndexedColumnChanges(t *testing.T) {
 	}
 
 	k1Renamed := sym("k1", "BetaGadget", "BetaGadget", "", fixedBody)
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-2", []codeindex.Symbol{k1Renamed}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-2", []codeindex.Symbol{k1Renamed}, 0, fe.embed); err != nil {
 		t.Fatalf("rename re-upsert: %v", err)
 	}
 	if fe.calls != 1 {
@@ -339,7 +340,7 @@ func TestSearchSymbolsHybridExactMatchBeatsSemanticSimilarity(t *testing.T) {
 		symbols = append(symbols, decoy)
 	}
 
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", symbols, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", symbols, 0, fe.embed); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -370,7 +371,7 @@ func TestSearchSymbolsVectorRecallsSemanticMatchWithoutLexicalOverlap(t *testing
 	far := sym("far-key", "RenderWidget", "RenderWidget", "", "func RenderWidget() {}")
 	fe.register(far, []float32{0, 0, 1})
 
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{near, far}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{near, far}, 0, fe.embed); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -401,7 +402,7 @@ func TestSearchResultsCarryNoBody(t *testing.T) {
 	bigBody := "func ParseConfig() {\n\t// a lot of source code here\n\treturn nil\n}"
 	k1 := sym("k1", "ParseConfig", "ParseConfig", "", bigBody)
 	fe.register(k1, []float32{1, 0, 0})
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, 0, fe.embed); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -441,7 +442,7 @@ func TestReplaceRelationsReplacesOnlyMatchingFromKeys(t *testing.T) {
 	k2 := sym("k2", "CallerTwo", "CallerTwo", "", "func CallerTwo() {}")
 	fe.register(k1, []float32{1, 0, 0})
 	fe.register(k2, []float32{0, 1, 0})
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1, k2}, fe.embed); err != nil {
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1, k2}, 0, fe.embed); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -478,5 +479,162 @@ func TestReplaceRelationsReplacesOnlyMatchingFromKeys(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("untouched k2 edge was removed, want it to survive (from_key not mentioned in second call)")
+	}
+}
+
+// --- RecordIndexRun: the sole write path for index_runs (replaces the
+// raw-SQL insert cmd/ragrep used to do itself) ---
+
+func TestRecordIndexRunInsertsRowAndReturnsIncrementingID(t *testing.T) {
+	s := openTestStore(t, 3)
+
+	when := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	id1, err := s.RecordIndexRun("pkg", "rev1", "go", "gopls", "v1.0.0", "test-model", when)
+	if err != nil {
+		t.Fatalf("RecordIndexRun: %v", err)
+	}
+	if id1 <= 0 {
+		t.Fatalf("first RecordIndexRun id = %d, want > 0", id1)
+	}
+
+	id2, err := s.RecordIndexRun("pkg2", "rev2", "go", "gopls", "v1.0.0", "test-model", when)
+	if err != nil {
+		t.Fatalf("second RecordIndexRun: %v", err)
+	}
+	if id2 <= id1 {
+		t.Fatalf("second RecordIndexRun id = %d, want > first id %d", id2, id1)
+	}
+
+	var scope, revision, language, serverName, serverVersion, modelID string
+	if err := s.db.QueryRow(`
+		SELECT scope, revision, language, server_name, server_version, model_id
+		FROM index_runs WHERE id=?`, id1).Scan(&scope, &revision, &language, &serverName, &serverVersion, &modelID); err != nil {
+		t.Fatalf("querying recorded run: %v", err)
+	}
+	if scope != "pkg" || revision != "rev1" || language != "go" || serverName != "gopls" || serverVersion != "v1.0.0" || modelID != "test-model" {
+		t.Fatalf("recorded run = (%q,%q,%q,%q,%q,%q), want (pkg,rev1,go,gopls,v1.0.0,test-model)",
+			scope, revision, language, serverName, serverVersion, modelID)
+	}
+}
+
+// --- UpsertSymbols(..., runID, ...): symbols.index_run_id must carry the
+// real run that produced the row, on both insert and update ---
+
+func TestUpsertSymbolsStampsIndexRunID(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	k1 := sym("k1", "ParseConfig", "ParseConfig", "", "func ParseConfig() {}")
+	fe.register(k1, []float32{1, 0, 0})
+
+	runID, err := s.RecordIndexRun("pkg", "rev1", "go", "gopls", "v1", "test-model", time.Now())
+	if err != nil {
+		t.Fatalf("RecordIndexRun: %v", err)
+	}
+
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, runID, fe.embed); err != nil {
+		t.Fatalf("insert upsert: %v", err)
+	}
+	var gotRunID int64
+	if err := s.db.QueryRow(`SELECT index_run_id FROM symbols WHERE key='k1'`).Scan(&gotRunID); err != nil {
+		t.Fatal(err)
+	}
+	if gotRunID != runID {
+		t.Fatalf("index_run_id after insert = %d, want %d", gotRunID, runID)
+	}
+
+	// A later run updating the same symbol (content changed, so the update
+	// path runs) must re-stamp index_run_id to the new run.
+	runID2, err := s.RecordIndexRun("pkg", "rev2", "go", "gopls", "v1", "test-model", time.Now())
+	if err != nil {
+		t.Fatalf("second RecordIndexRun: %v", err)
+	}
+	k1Doc := k1
+	k1Doc.Documentation = "now documented"
+	k1Doc.EmbeddingText = codeindex.RenderEmbeddingText(k1Doc)
+	fe.register(k1Doc, []float32{0, 1, 0})
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-2", []codeindex.Symbol{k1Doc}, runID2, fe.embed); err != nil {
+		t.Fatalf("update upsert: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT index_run_id FROM symbols WHERE key='k1'`).Scan(&gotRunID); err != nil {
+		t.Fatal(err)
+	}
+	if gotRunID != runID2 {
+		t.Fatalf("index_run_id after update = %d, want %d", gotRunID, runID2)
+	}
+}
+
+// --- SymbolAt: (path, line) -> enclosing indexed symbol's key, the
+// resolution primitive relations.go's Resolver needs ---
+
+func TestSymbolAtResolvesEnclosingSymbol(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	k1 := sym("k1", "ParseConfig", "ParseConfig", "", "func ParseConfig() {}")
+	k1.Range = codeindex.Range{Start: codeindex.Position{Line: 10}, End: codeindex.Position{Line: 20}}
+	fe.register(k1, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	key, ok, err := s.SymbolAt("pkg/file.go", 15)
+	if err != nil {
+		t.Fatalf("SymbolAt(inside range): %v", err)
+	}
+	if !ok || key != "k1" {
+		t.Fatalf("SymbolAt(pkg/file.go, 15) = (%q, %v), want (k1, true)", key, ok)
+	}
+
+	// Boundary lines are inclusive.
+	if _, ok, err := s.SymbolAt("pkg/file.go", 10); err != nil || !ok {
+		t.Fatalf("SymbolAt(start line): ok=%v err=%v, want ok=true", ok, err)
+	}
+	if _, ok, err := s.SymbolAt("pkg/file.go", 20); err != nil || !ok {
+		t.Fatalf("SymbolAt(end line): ok=%v err=%v, want ok=true", ok, err)
+	}
+
+	if _, ok, err := s.SymbolAt("pkg/file.go", 25); err != nil || ok {
+		t.Fatalf("SymbolAt(outside range): ok=%v err=%v, want ok=false", ok, err)
+	}
+	if _, ok, err := s.SymbolAt("pkg/other.go", 15); err != nil || ok {
+		t.Fatalf("SymbolAt(wrong path): ok=%v err=%v, want ok=false", ok, err)
+	}
+}
+
+// SymbolAt must pick the innermost (smallest-span) enclosing symbol when
+// ranges overlap, not just any match -- otherwise a reference inside a
+// method would resolve to a loosely-overlapping outer symbol instead of the
+// method itself.
+func TestSymbolAtPicksInnermostOnOverlap(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	outer := sym("outer", "Container", "Container", "", "type Container struct{}")
+	outer.Range = codeindex.Range{Start: codeindex.Position{Line: 1}, End: codeindex.Position{Line: 100}}
+	inner := sym("inner", "Method", "Container.Method", "", "func (c Container) Method() {}")
+	inner.Range = codeindex.Range{Start: codeindex.Position{Line: 40}, End: codeindex.Position{Line: 50}}
+	fe.register(outer, []float32{1, 0, 0})
+	fe.register(inner, []float32{0, 1, 0})
+
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{outer, inner}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	key, ok, err := s.SymbolAt("pkg/file.go", 45)
+	if err != nil {
+		t.Fatalf("SymbolAt: %v", err)
+	}
+	if !ok || key != "inner" {
+		t.Fatalf("SymbolAt(45) = (%q, %v), want (inner, true)", key, ok)
+	}
+
+	// A line only the outer symbol covers must still resolve to it.
+	key, ok, err = s.SymbolAt("pkg/file.go", 5)
+	if err != nil {
+		t.Fatalf("SymbolAt: %v", err)
+	}
+	if !ok || key != "outer" {
+		t.Fatalf("SymbolAt(5) = (%q, %v), want (outer, true)", key, ok)
 	}
 }

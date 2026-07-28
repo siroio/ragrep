@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"time"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/ncruces"
 
@@ -69,10 +70,10 @@ type existingSymbolRow struct {
 // touching the declaration) or a different Body/BodyHash. This is the
 // re-embed cache rule; unchanged symbols keep their stored vector untouched.
 //
-// index_run_id on inserted/updated symbols rows is stamped 0: UpsertSymbols
-// has no runID parameter (only ReplaceRelations does), so symbol-to-run
-// provenance isn't tracked at this layer.
-func (s *Store) UpsertSymbols(path, fileHash string, symbols []codeindex.Symbol, embed EmbedFunc) (bool, error) {
+// runID is stamped into index_run_id on every inserted or updated symbols
+// row (see RecordIndexRun) -- both branches, since an update means this run
+// re-produced the row's content just as much as an insert would.
+func (s *Store) UpsertSymbols(path, fileHash string, symbols []codeindex.Symbol, runID int64, embed EmbedFunc) (bool, error) {
 	existing, err := s.existingSymbolRows(path)
 	if err != nil {
 		return false, err
@@ -113,12 +114,12 @@ func (s *Store) UpsertSymbols(path, fileHash string, symbols []codeindex.Symbol,
 	for _, sym := range symbols {
 		old, ok := existing[sym.Key]
 		if !ok {
-			if err := insertSymbol(tx, fileHash, sym, embed); err != nil {
+			if err := insertSymbol(tx, fileHash, sym, runID, embed); err != nil {
 				return false, err
 			}
 			continue
 		}
-		if err := updateSymbol(tx, fileHash, sym, old, embed); err != nil {
+		if err := updateSymbol(tx, fileHash, sym, old, runID, embed); err != nil {
 			return false, err
 		}
 	}
@@ -175,16 +176,16 @@ func deleteSymbolRow(tx *sql.Tx, key string, old existingSymbolRow) error {
 	return nil
 }
 
-func insertSymbol(tx *sql.Tx, fileHash string, sym codeindex.Symbol, embed EmbedFunc) error {
+func insertSymbol(tx *sql.Tx, fileHash string, sym codeindex.Symbol, runID int64, embed EmbedFunc) error {
 	res, err := tx.Exec(`
 		INSERT INTO symbols(
 			key, language, kind, name, qualified_name, signature, documentation, container,
 			path, start_line, start_character, end_line, end_character, body, body_hash,
 			file_hash, index_run_id
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		sym.Key, sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.Signature, sym.Documentation, sym.Container,
 		sym.Path, sym.Range.Start.Line, sym.Range.Start.Character, sym.Range.End.Line, sym.Range.End.Character,
-		sym.Body, sym.BodyHash, fileHash)
+		sym.Body, sym.BodyHash, fileHash, runID)
 	if err != nil {
 		return err
 	}
@@ -200,16 +201,16 @@ func insertSymbol(tx *sql.Tx, fileHash string, sym codeindex.Symbol, embed Embed
 	return embedAndStoreVector(tx, id, sym.EmbeddingText, embed)
 }
 
-func updateSymbol(tx *sql.Tx, fileHash string, sym codeindex.Symbol, old existingSymbolRow, embed EmbedFunc) error {
+func updateSymbol(tx *sql.Tx, fileHash string, sym codeindex.Symbol, old existingSymbolRow, runID int64, embed EmbedFunc) error {
 	if _, err := tx.Exec(`
 		UPDATE symbols SET
 			language=?, kind=?, name=?, qualified_name=?, signature=?, documentation=?, container=?,
 			path=?, start_line=?, start_character=?, end_line=?, end_character=?, body=?, body_hash=?,
-			file_hash=?
+			file_hash=?, index_run_id=?
 		WHERE id=?`,
 		sym.Language, sym.Kind, sym.Name, sym.QualifiedName, sym.Signature, sym.Documentation, sym.Container,
 		sym.Path, sym.Range.Start.Line, sym.Range.Start.Character, sym.Range.End.Line, sym.Range.End.Character,
-		sym.Body, sym.BodyHash, fileHash, old.id); err != nil {
+		sym.Body, sym.BodyHash, fileHash, runID, old.id); err != nil {
 		return err
 	}
 
@@ -316,6 +317,63 @@ func (s *Store) ReplaceRelations(runID int64, relations []codeindex.Relation) er
 	}
 
 	return tx.Commit()
+}
+
+// RecordIndexRun inserts one index_runs row (see the schema in store.go) and
+// returns its id, for callers to pass into UpsertSymbols' runID parameter
+// and ReplaceRelations' own runID argument. This is the only write path for
+// index_runs -- cmd/ragrep used to insert this row itself via a second raw
+// database/sql connection to the same file; that bypassed this package
+// entirely and left symbols.index_run_id stamped 0 forever (UpsertSymbols
+// had no way to learn the id created here). createdAt is stored in UTC,
+// RFC3339 (matching the raw-SQL insert this replaces).
+func (s *Store) RecordIndexRun(scope, revision, language, serverName, serverVersion, modelID string, createdAt time.Time) (int64, error) {
+	res, err := s.db.Exec(`
+		INSERT INTO index_runs(scope, revision, language, server_name, server_version, model_id, created_at)
+		VALUES (?,?,?,?,?,?,?)`,
+		scope, revision, language, serverName, serverVersion, modelID, createdAt.UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// SymbolAt returns the key of the indexed symbol at path whose Range
+// contains line (start_line <= line <= end_line) -- the resolution
+// primitive codeindex.Resolver needs to turn an LSP location into a stable
+// symbol key. When more than one stored symbol's range contains line (an
+// outer container and a nested member both covering it), the smallest
+// (innermost) range wins, tie-broken by the later start_line -- both push
+// the result toward the most specific enclosing declaration rather than a
+// loosely-overlapping outer one. ok is false, with no error, when no stored
+// symbol at path contains line -- that is not a failure, it just means the
+// location isn't (yet) an indexed symbol; the caller must not fabricate a
+// key for it (see codeindex.Relation's ToPath/ToPosition fallback).
+func (s *Store) SymbolAt(path string, line int) (key string, ok bool, err error) {
+	rows, err := s.db.Query(`
+		SELECT key, start_line, end_line FROM symbols
+		WHERE path=? AND start_line<=? AND end_line>=?`, path, line, line)
+	if err != nil {
+		return "", false, err
+	}
+	defer rows.Close()
+
+	bestSpan, bestStart := 0, 0
+	for rows.Next() {
+		var k string
+		var start, end int
+		if err := rows.Scan(&k, &start, &end); err != nil {
+			return "", false, err
+		}
+		span := end - start
+		if !ok || span < bestSpan || (span == bestSpan && start > bestStart) {
+			key, ok, bestSpan, bestStart = k, true, span, start
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	return key, ok, nil
 }
 
 // ftsQuery wraps query as a quoted FTS5 phrase so operators/quotes in it

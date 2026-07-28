@@ -49,4 +49,14 @@ type Relation struct {
 	ToKey   string
 	Kind    string
 	Source  string
+
+	// ToPath and ToPosition preserve the target location for a relation
+	// whose target didn't resolve to an indexed symbol -- ToKey is left ""
+	// rather than fabricated (see relations.go's toRelation). Both are the
+	// zero value when ToKey is set. Neither is persisted by
+	// codestore.ReplaceRelations (symbol_edges has no columns for them);
+	// they exist only so a caller (cmd/ragrep's `code expand`) can still
+	// describe an unresolved reference instead of silently dropping it.
+	ToPath     string
+	ToPosition Position
 }
