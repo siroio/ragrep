@@ -253,6 +253,59 @@ func embedAndStoreVector(tx *sql.Tx, id int64, embeddingText string, embed Embed
 	return err
 }
 
+// ListPaths returns the distinct paths of every currently indexed symbol --
+// the store-side counterpart to cmd/ragrep's discoverCodeFiles walk, letting
+// a caller (e.g. `code index`'s default pruning pass) diff "what's stored"
+// against "what this run actually saw on disk".
+func (s *Store) ListPaths() ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT path FROM symbols`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
+// DeleteSymbolsForPath removes every symbol stored for path -- each one's
+// symbols row, FTS entry, vec row, and any symbol_edges row it originates
+// (see deleteSymbolRow) -- in one transaction. A no-op, not an error, when
+// path has no stored symbols. This is `code index`'s pruning primitive: a
+// file that's been deleted (or moved out of an indexed root) is no longer
+// discovered by a re-index, so its stale symbols would otherwise linger in
+// search forever.
+func (s *Store) DeleteSymbolsForPath(path string) error {
+	existing, err := s.existingSymbolRows(path)
+	if err != nil {
+		return err
+	}
+	if len(existing) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for key, old := range existing {
+		if err := deleteSymbolRow(tx, key, old); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 // GetSymbol returns the full stored record for key, including Body.
 // EmbeddingText isn't a stored column; it's recomputed deterministically via
 // codeindex.RenderEmbeddingText from the other fields.

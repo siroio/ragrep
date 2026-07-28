@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -631,6 +632,85 @@ func TestSymbolAtResolvesEnclosingSymbol(t *testing.T) {
 	}
 	if _, ok, err := s.SymbolAt("pkg/other.go", 15); err != nil || ok {
 		t.Fatalf("SymbolAt(wrong path): ok=%v err=%v, want ok=false", ok, err)
+	}
+}
+
+// --- ListPaths / DeleteSymbolsForPath: the store-side primitives `code
+// index`'s default pruning pass needs to remove symbols for files no longer
+// discovered under an indexed root ---
+
+func TestListPathsAndDeleteSymbolsForPath(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	a := sym("k1", "ParseConfig", "ParseConfig", "", "func ParseConfig() {}")
+	a.Path = "pkg/a.go"
+	a.EmbeddingText = codeindex.RenderEmbeddingText(a)
+	fe.register(a, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols(a.Path, "hash-a", []codeindex.Symbol{a}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+
+	b := sym("k2", "RunServer", "RunServer", "", "func RunServer() {}")
+	b.Path = "pkg/b.go"
+	b.EmbeddingText = codeindex.RenderEmbeddingText(b)
+	fe.register(b, []float32{0, 1, 0})
+	if _, err := s.UpsertSymbols(b.Path, "hash-b", []codeindex.Symbol{b}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+
+	paths, err := s.ListPaths()
+	if err != nil {
+		t.Fatalf("ListPaths: %v", err)
+	}
+	sort.Strings(paths)
+	if !reflect.DeepEqual(paths, []string{"pkg/a.go", "pkg/b.go"}) {
+		t.Fatalf("ListPaths() = %v, want [pkg/a.go pkg/b.go]", paths)
+	}
+
+	var k1ID int64
+	if err := s.db.QueryRow(`SELECT id FROM symbols WHERE key='k1'`).Scan(&k1ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteSymbolsForPath("pkg/a.go"); err != nil {
+		t.Fatalf("DeleteSymbolsForPath: %v", err)
+	}
+
+	if _, err := s.GetSymbol("k1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetSymbol(k1) after DeleteSymbolsForPath: err=%v, want ErrNotFound", err)
+	}
+	if _, err := s.GetSymbol("k2"); err != nil {
+		t.Fatalf("GetSymbol(k2), a different path, must be untouched: %v", err)
+	}
+
+	paths2, err := s.ListPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths2) != 1 || paths2[0] != "pkg/b.go" {
+		t.Fatalf("ListPaths() after delete = %v, want [pkg/b.go]", paths2)
+	}
+
+	// FTS and vec rows must also be gone, not just the symbols row.
+	hits, err := s.SearchSymbolsText("ParseConfig", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("FTS hit for a pruned symbol still present: %v", hits)
+	}
+	var vecCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM symbol_vec WHERE rowid=?`, k1ID).Scan(&vecCount); err != nil {
+		t.Fatal(err)
+	}
+	if vecCount != 0 {
+		t.Fatalf("symbol_vec row for pruned symbol still present: count=%d", vecCount)
+	}
+
+	// A path with no stored symbols is a no-op, not an error.
+	if err := s.DeleteSymbolsForPath("pkg/never-indexed.go"); err != nil {
+		t.Fatalf("DeleteSymbolsForPath on an unindexed path: %v", err)
 	}
 }
 
