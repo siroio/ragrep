@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/ncruces"
@@ -196,6 +197,85 @@ func (s *Store) SearchText(query string, k int) ([]Hit, error) {
 	scores := map[int64]float64{}
 	for r, id := range ids {
 		scores[id] = 1.0 / float64(r+1)
+	}
+	return s.hitsByParaIDs(ids, scores)
+}
+
+// rrfMerge combines rankings with Reciprocal Rank Fusion (k=60).
+// Returns ids sorted by descending score (ties: ascending id) and the score map.
+func rrfMerge(lists [][]int64) ([]int64, map[int64]float64) {
+	scores := map[int64]float64{}
+	for _, l := range lists {
+		for r, id := range l {
+			scores[id] += 1.0 / float64(60+r+1)
+		}
+	}
+	ids := make([]int64, 0, len(scores))
+	for id := range scores {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		if scores[ids[i]] != scores[ids[j]] {
+			return scores[ids[i]] > scores[ids[j]]
+		}
+		return ids[i] < ids[j]
+	})
+	return ids, scores
+}
+
+// searchVectorIDs returns paragraph ids ordered by ascending distance.
+func (s *Store) searchVectorIDs(qvec []float32, k int) ([]int64, map[int64]float64, error) {
+	blob, err := sqlite_vec.SerializeFloat32(qvec)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := s.db.Query(
+		`SELECT rowid, distance FROM vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?`,
+		blob, k)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	dists := map[int64]float64{}
+	for rows.Next() {
+		var id int64
+		var d float64
+		if err := rows.Scan(&id, &d); err != nil {
+			return nil, nil, err
+		}
+		ids = append(ids, id)
+		dists[id] = d
+	}
+	return ids, dists, rows.Err()
+}
+
+func (s *Store) SearchVector(qvec []float32, k int) ([]Hit, error) {
+	ids, dists, err := s.searchVectorIDs(qvec, k)
+	if err != nil {
+		return nil, err
+	}
+	scores := map[int64]float64{}
+	for id, d := range dists {
+		scores[id] = 1.0 / (1.0 + d)
+	}
+	return s.hitsByParaIDs(ids, scores)
+}
+
+const rrfFetch = 50 // candidates fetched from each ranking before fusion
+
+func (s *Store) SearchHybrid(query string, qvec []float32, k int) ([]Hit, error) {
+	textIDs, err := s.searchTextIDs(query, rrfFetch)
+	if err != nil {
+		return nil, err
+	}
+	vecIDs, _, err := s.searchVectorIDs(qvec, rrfFetch)
+	if err != nil {
+		return nil, err
+	}
+	ids, scores := rrfMerge([][]int64{textIDs, vecIDs})
+	if len(ids) > k {
+		ids = ids[:k]
 	}
 	return s.hitsByParaIDs(ids, scores)
 }

@@ -57,6 +57,55 @@ func TestUpsertAndTextSearch(t *testing.T) {
 	}
 }
 
+func TestRRFMerge(t *testing.T) {
+	ids, scores := rrfMerge([][]int64{
+		{1, 2, 3}, // text ranking
+		{3, 1},    // vector ranking
+	})
+	// id1: 1/61 + 1/62 ≈ 0.03252, id3: 1/63 + 1/61 ≈ 0.03227, id2: 1/62 ≈ 0.01613
+	want := []int64{1, 3, 2}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("order: got %v, want %v (scores=%v)", ids, want, scores)
+		}
+	}
+	if scores[2] >= scores[3] {
+		t.Fatalf("scores not descending: %v", scores)
+	}
+}
+
+func TestSearchVectorAndHybrid(t *testing.T) {
+	s := newTestStore(t)
+	// Two docs with distinct content; fakeEmbed is deterministic so the
+	// same text always maps to the same vector.
+	if _, err := s.UpsertDoc("a.txt", "りんごは赤い果物です。", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("b.txt", "会計システムの締め処理について。", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	qv, _ := fakeEmbed("passage: りんごは赤い果物です。") // identical vector -> distance 0
+	hits, err := s.SearchVector(qv, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 2 || hits[0].Doc != "a.txt" {
+		t.Fatalf("vector hits: %+v", hits)
+	}
+	if hits[0].Score <= hits[1].Score {
+		t.Fatalf("scores not descending: %+v", hits)
+	}
+
+	hy, err := s.SearchHybrid("りんご", qv, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hy) == 0 || hy[0].Doc != "a.txt" {
+		t.Fatalf("hybrid hits: %+v", hy)
+	}
+}
+
 func TestGet(t *testing.T) {
 	s := newTestStore(t)
 	content := "p0\n\np1\n\np2\n\np3"
