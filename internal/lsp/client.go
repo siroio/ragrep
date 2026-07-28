@@ -99,6 +99,17 @@ func Start(name string, args []string, opts ...Option) (*Client, error) {
 func (c *Client) readLoop(stdout io.Reader) {
 	readErr := c.readAll(bufio.NewReader(stdout))
 
+	// The connection is unusable now regardless of why readAll returned:
+	// on a clean EOF the process has already exited and this is a no-op;
+	// on a framing/decode error the process could still be alive (it just
+	// sent us something unparseable), and Wait below would then block
+	// forever waiting for a process we can no longer talk to. Kill
+	// unconditionally so Wait is always bounded — same kill-then-wait
+	// sequence as Close.
+	if c.cmd.Process != nil {
+		_ = c.cmd.Process.Kill()
+	}
+
 	// cmd.Wait closes the pipes it created; readAll above has already read
 	// stdout to EOF/error, so all reads are done and this is safe (see
 	// exec.Cmd.StdoutPipe's doc comment on that ordering requirement).
@@ -293,12 +304,16 @@ func (c *Client) Shutdown(ctx context.Context) error {
 
 // Exit sends the "exit" notification and closes stdin, telling the server
 // to terminate. It does not wait for the process to actually exit; use
-// Wait or Close for that.
+// Wait or Close for that. stdin is closed even if the notify itself
+// failed (mirroring Close, which always attempts both) — a broken
+// connection should end up fully torn down either way, not half-closed.
 func (c *Client) Exit() error {
-	if err := c.notify("exit", nil); err != nil {
-		return err
+	notifyErr := c.notify("exit", nil)
+	closeErr := c.stdin.Close()
+	if notifyErr != nil {
+		return notifyErr
 	}
-	return c.stdin.Close()
+	return closeErr
 }
 
 // Wait blocks until the server process has exited (following Exit, or the

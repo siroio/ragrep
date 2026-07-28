@@ -273,6 +273,51 @@ func TestServerProcessDeath(t *testing.T) {
 	}
 }
 
+// TestReadLoopKillsStillAliveProcessOnMalformedFrame covers a case
+// TestServerProcessDeath doesn't: here the fake server process stays
+// alive (blocked waiting for more input that will never come) after
+// sending a malformed frame instead of crashing/exiting. Before readLoop
+// killed the process unconditionally on any readAll error, cmd.Wait()
+// would block forever on a still-running process in this scenario,
+// wedging both the in-flight call and Close(). Goes through the real
+// Start/exec path (not the hand-wired pipe tests) since the whole point
+// is exercising Wait() against a genuinely still-running OS process.
+func TestReadLoopKillsStillAliveProcessOnMalformedFrame(t *testing.T) {
+	c := startFakeServer(t)
+	mustInitialize(t, c, testdata.Options{MalformedFrameOnMethod: "textDocument/documentSymbol"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.DocumentSymbol(ctx, DocumentSymbolParams{TextDocument: TextDocumentIdentifier{URI: "file:///fake/foo.go"}})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error after a malformed frame from a still-alive server")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("DocumentSymbol call hung after a malformed frame from a still-alive server")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		c.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close hung: readLoop is likely stuck in cmd.Wait() on a still-alive process")
+	}
+	if c.cmd.ProcessState == nil {
+		t.Fatal("expected the still-alive fake server process to have been killed and reaped")
+	}
+}
+
 // TestCloseTerminatesProcess exercises Windows process termination: Close
 // kills the subprocess without a graceful shutdown/exit handshake, Wait
 // completes (proving the OS process was reaped), and further calls fail
@@ -337,16 +382,18 @@ func TestWaitCancelsAndKillsOnContextDone(t *testing.T) {
 	}
 }
 
-// TestServerRequestGetsMethodNotFound is a white-box test (constructing a
-// Client directly over an in-memory pipe, bypassing Start/exec) that
-// precisely verifies the wire-level reply to a server-to-client request:
-// a JSON-RPC error with code -32601 (MethodNotFound), carrying the same
-// id, so a real server like gopls doesn't stall waiting for it.
-func TestServerRequestGetsMethodNotFound(t *testing.T) {
-	serverToClientR, serverToClientW := io.Pipe() // server "sends" on W, client's readLoop reads R
-	clientToServerR, clientToServerW := io.Pipe() // client writes its stdin to W, test reads replies on R
+// newPipeClient wires a Client directly to in-memory pipes, bypassing
+// Start/exec entirely, for white-box tests of the read loop's
+// framing/dispatch logic in isolation. Returns the client, a writer the
+// test uses to simulate bytes arriving from "the server" (client's
+// stdout), and a reader the test uses to observe bytes the client wrote
+// to "its stdin".
+func newPipeClient(t *testing.T) (c *Client, serverToClientW io.WriteCloser, clientToServerR io.ReadCloser) {
+	t.Helper()
+	serverToClientR, w := io.Pipe()
+	r, clientToServerW := io.Pipe()
 
-	c := &Client{
+	c = &Client{
 		cmd:     exec.Command("go"), // never started; only used by Close's cleanup path
 		stdin:   clientToServerW,
 		pending: make(map[int64]chan rpcResult),
@@ -354,14 +401,21 @@ func TestServerRequestGetsMethodNotFound(t *testing.T) {
 	}
 	go c.readLoop(serverToClientR)
 	t.Cleanup(func() {
-		serverToClientW.Close()
-		clientToServerR.Close()
+		w.Close()
+		r.Close()
 	})
+	return c, w, r
+}
+
+// TestServerRequestGetsMethodNotFound is a white-box test that precisely
+// verifies the wire-level reply to a server-to-client request: a
+// JSON-RPC error with code -32601 (MethodNotFound), carrying the same id,
+// so a real server like gopls doesn't stall waiting for it.
+func TestServerRequestGetsMethodNotFound(t *testing.T) {
+	_, serverToClientW, clientToServerR := newPipeClient(t)
 
 	req := []byte(`{"jsonrpc":"2.0","id":9001,"method":"workspace/configuration","params":[{}]}`)
-	go func() {
-		fmt.Fprintf(serverToClientW, "Content-Length: %d\r\n\r\n%s", len(req), req)
-	}()
+	go fmt.Fprintf(serverToClientW, "Content-Length: %d\r\n\r\n%s", len(req), req)
 
 	tp := textproto.NewReader(bufio.NewReader(clientToServerR))
 	hdr, err := tp.ReadMIMEHeader()
@@ -392,5 +446,96 @@ func TestServerRequestGetsMethodNotFound(t *testing.T) {
 	}
 	if reply.Error == nil || reply.Error.Code != ErrCodeMethodNotFound {
 		t.Fatalf("reply.Error = %+v, want code %d", reply.Error, ErrCodeMethodNotFound)
+	}
+}
+
+// TestServerNotificationAndRequestDontBreakClient goes through the real
+// Start/exec path (unlike the white-box pipe tests) with the fake server
+// configured to send a window/logMessage notification and a
+// server-to-client request right after replying to initialize. It checks
+// both halves the review asked for: the client keeps working afterward
+// (a normal request round-trips fine), and the fake server itself
+// confirms it got a proper MethodNotFound reply to its request (recorded
+// at shutdown time — see testdata.Run's gotMethodNotFoundReply comment
+// for why it's checked there rather than immediately).
+func TestServerNotificationAndRequestDontBreakClient(t *testing.T) {
+	c := startFakeServer(t)
+	mustInitialize(t, c, testdata.Options{
+		NotifyAfterInitialize:  true,
+		RequestAfterInitialize: true,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	symbols, err := c.DocumentSymbol(ctx, DocumentSymbolParams{TextDocument: TextDocumentIdentifier{URI: "file:///fake/foo.go"}})
+	if err != nil {
+		t.Fatalf("DocumentSymbol after notification+request: %v", err)
+	}
+	if len(symbols) != 1 || symbols[0].Name != "Foo" {
+		t.Fatalf("DocumentSymbol result = %+v", symbols)
+	}
+
+	if err := c.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown (fake server reports it never got a proper MethodNotFound reply): %v", err)
+	}
+	if err := c.Exit(); err != nil {
+		t.Fatalf("Exit: %v", err)
+	}
+}
+
+// TestReadLoopFailsOnBadContentLength verifies a malformed Content-Length
+// header fails any pending call and shuts the read loop down, rather than
+// leaving the client stuck waiting on a stream it can no longer parse.
+func TestReadLoopFailsOnBadContentLength(t *testing.T) {
+	c, serverToClientW, _ := newPipeClient(t)
+
+	ch := make(chan rpcResult, 1)
+	c.mu.Lock()
+	c.pending[1] = ch
+	c.mu.Unlock()
+
+	go fmt.Fprint(serverToClientW, "Content-Length: notanumber\r\n\r\n")
+
+	select {
+	case res := <-ch:
+		if res.err == nil {
+			t.Fatal("expected an error after a malformed Content-Length header")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending call hung after a malformed Content-Length header")
+	}
+	select {
+	case <-c.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("read loop did not exit after a malformed Content-Length header")
+	}
+}
+
+// TestReadLoopFailsOnBadJSONBody verifies an undecodable JSON body (but
+// correctly framed) fails any pending call and shuts the read loop down.
+func TestReadLoopFailsOnBadJSONBody(t *testing.T) {
+	c, serverToClientW, _ := newPipeClient(t)
+
+	ch := make(chan rpcResult, 1)
+	c.mu.Lock()
+	c.pending[1] = ch
+	c.mu.Unlock()
+
+	body := []byte(`{not valid json`)
+	go fmt.Fprintf(serverToClientW, "Content-Length: %d\r\n\r\n%s", len(body), body)
+
+	select {
+	case res := <-ch:
+		if res.err == nil {
+			t.Fatal("expected an error after an undecodable JSON body")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending call hung after an undecodable JSON body")
+	}
+	select {
+	case <-c.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("read loop did not exit after an undecodable JSON body")
 	}
 }

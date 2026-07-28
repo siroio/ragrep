@@ -43,6 +43,13 @@ type Options struct {
 	// request (which this client doesn't implement) right after replying
 	// to initialize, to exercise the MethodNotFound auto-reply path.
 	RequestAfterInitialize bool `json:"requestAfterInitialize"`
+	// MalformedFrameOnMethod makes the server write a malformed frame (a
+	// non-numeric Content-Length) instead of responding when it receives a
+	// request for this method, then keep running (blocked waiting for
+	// more input, which never arrives) rather than exit — for testing
+	// that the client kills a still-alive-but-unparseable server instead
+	// of hanging in Wait.
+	MalformedFrameOnMethod string `json:"malformedFrameOnMethod"`
 }
 
 // Canned results for the request methods this server understands. Content
@@ -77,7 +84,14 @@ type inMessage struct {
 	ID     *json.RawMessage `json:"id,omitempty"`
 	Method string           `json:"method,omitempty"`
 	Params json.RawMessage  `json:"params,omitempty"`
+	Error  *struct {
+		Code int `json:"code"`
+	} `json:"error,omitempty"`
 }
+
+// bogusRequestID is the id used for the server-to-client request sent when
+// Options.RequestAfterInitialize is set (see writeRequest below).
+const bogusRequestID = 9001
 
 // Run speaks the fake protocol over r/w until the client sends "exit" or
 // closes the connection. A non-nil error means something other than a
@@ -85,6 +99,15 @@ type inMessage struct {
 func Run(r io.Reader, w io.Writer) error {
 	tp := textproto.NewReader(bufio.NewReader(r))
 	var opts Options
+	// gotMethodNotFoundReply becomes true once the client correctly answers
+	// our bogusRequestID request with a MethodNotFound error. Only checked
+	// at shutdown time (see below) rather than as soon as it arrives,
+	// since the client sends it from a background read-loop goroutine
+	// racing against its own "initialized" notification — checking it
+	// immediately would make this fixture's behavior order-dependent on a
+	// race that isn't the client's bug to have. By shutdown, plenty of
+	// round trips have happened either way.
+	var gotMethodNotFoundReply bool
 
 	for {
 		hdr, err := tp.ReadMIMEHeader()
@@ -107,6 +130,17 @@ func Run(r io.Reader, w io.Writer) error {
 			return fmt.Errorf("testdata: bad message: %w", err)
 		}
 
+		// A message with no method is a reply to a request *we* sent to
+		// the client (i.e. the bogusRequestID request below), not
+		// something the client is asking us to do. Handle that shape
+		// first, independent of method-based dispatch below.
+		if msg.Method == "" {
+			if isMethodNotFoundReplyTo(bogusRequestID, msg) {
+				gotMethodNotFoundReply = true
+			}
+			continue
+		}
+
 		switch msg.Method {
 		case "initialize":
 			var p struct {
@@ -123,7 +157,7 @@ func Run(r io.Reader, w io.Writer) error {
 				}
 			}
 			if opts.RequestAfterInitialize {
-				if err := writeRequest(w, 9001, "workspace/configuration", []byte(`[{}]`)); err != nil {
+				if err := writeRequest(w, bogusRequestID, "workspace/configuration", []byte(`[{}]`)); err != nil {
 					return err
 				}
 			}
@@ -132,6 +166,12 @@ func Run(r io.Reader, w io.Writer) error {
 			// Notification; nothing to do.
 
 		case "shutdown":
+			if opts.RequestAfterInitialize && !gotMethodNotFoundReply {
+				if err := writeError(w, msg.ID, -32001, "client never replied MethodNotFound to our bogus request"); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := writeResult(w, msg.ID, []byte(`null`)); err != nil {
 				return err
 			}
@@ -160,11 +200,33 @@ func Run(r io.Reader, w io.Writer) error {
 	}
 }
 
+// isMethodNotFoundReplyTo reports whether msg is a JSON-RPC error response
+// for id, carrying MethodNotFound (-32601).
+func isMethodNotFoundReplyTo(id int, msg inMessage) bool {
+	if msg.ID == nil || msg.Error == nil {
+		return false
+	}
+	var gotID int
+	if err := json.Unmarshal(*msg.ID, &gotID); err != nil || gotID != id {
+		return false
+	}
+	return msg.Error.Code == -32601
+}
+
 // respond implements the CrashOnMethod/DelayOnMethod/ErrorOnMethod
 // scenarios for request methods that otherwise return a canned fixture.
 func respond(w io.Writer, msg inMessage, opts Options, fixture []byte) error {
 	if opts.CrashOnMethod == msg.Method {
 		os.Exit(1)
+	}
+	if opts.MalformedFrameOnMethod == msg.Method {
+		// Deliberately bogus: a non-numeric Content-Length. The server
+		// stays up after this (the caller's loop keeps running, blocked
+		// on the next read) — this simulates a still-alive process that
+		// just sent something the client can't parse, as opposed to
+		// CrashOnMethod's process-death scenario.
+		_, err := io.WriteString(w, "Content-Length: notanumber\r\n\r\n")
+		return err
 	}
 	if opts.DelayOnMethod == msg.Method && opts.DelayMillis > 0 {
 		time.Sleep(time.Duration(opts.DelayMillis) * time.Millisecond)
