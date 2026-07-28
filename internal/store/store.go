@@ -47,6 +47,11 @@ CREATE TABLE IF NOT EXISTS paragraphs(
   text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_para_doc ON paragraphs(doc_id, seq);
+CREATE TABLE IF NOT EXISTS doc_tags(
+  doc_id INTEGER NOT NULL,
+  tag TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_doc_tags ON doc_tags(tag, doc_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(text, tokenize='trigram');
 CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0(embedding float[768]);
 `
@@ -67,7 +72,10 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc) (bool, error) {
-	h := sha256.Sum256([]byte(content))
+	// "v2\x00" versions the change-detection hash: bumping it forces every
+	// doc to re-index once on the next `index` run (v2 = frontmatter tags,
+	// so pre-tags DBs get doc_tags populated without a manual rebuild).
+	h := sha256.Sum256([]byte("v2\x00" + content))
 	hash := hex.EncodeToString(h[:])
 
 	var docID int64
