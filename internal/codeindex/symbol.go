@@ -11,14 +11,14 @@ package codeindex
 // rather than aliasing lsp.Position so this package's public API carries no
 // dependency on internal/lsp.
 type Position struct {
-	Line      int
-	Character int
+	Line      int `json:"line"`
+	Character int `json:"character"`
 }
 
 // Range is a half-open [Start, End) span of Positions.
 type Range struct {
-	Start Position
-	End   Position
+	Start Position `json:"start"`
+	End   Position `json:"end"`
 }
 
 // Symbol is one code-index record: a single named declaration (function,
@@ -26,29 +26,37 @@ type Range struct {
 // re-resolve it. A struct/class and each of its methods are always separate
 // Symbol values — Body never includes a child symbol's body (see extract.go
 // and render.go).
+//
+// JSON tags are snake_case, matching codestore.SymbolHit's own convention --
+// Symbol is serialized straight into `code pack`'s JSON output (see
+// coderetrieval.ContextPack.Symbols). EmbeddingText is deliberately excluded
+// (json:"-"): it's internal render output, always recomputable from the
+// other fields via RenderEmbeddingText, not something a pack consumer needs.
 type Symbol struct {
-	Key           string
-	Language      string
-	Kind          string
-	Name          string
-	QualifiedName string
-	Signature     string
-	Documentation string
-	Container     string
-	Path          string
-	Range         Range
-	Body          string
-	BodyHash      string
-	EmbeddingText string
+	Key           string `json:"key"`
+	Language      string `json:"language"`
+	Kind          string `json:"kind"`
+	Name          string `json:"name"`
+	QualifiedName string `json:"qualified_name"`
+	Signature     string `json:"signature"`
+	Documentation string `json:"documentation,omitempty"`
+	Container     string `json:"container,omitempty"`
+	Path          string `json:"path"`
+	Range         Range  `json:"range"`
+	Body          string `json:"body,omitempty"`
+	BodyHash      string `json:"body_hash,omitempty"`
+	EmbeddingText string `json:"-"`
 }
 
 // Relation is a directed edge between two symbols (e.g. "calls", "extends"),
-// keyed by the symbols' stable Keys.
+// keyed by the symbols' stable Keys. JSON tags are snake_case, matching
+// Symbol's own convention -- Relation is serialized straight into `code
+// pack`'s JSON output (see coderetrieval.ContextPack.Relations).
 type Relation struct {
-	FromKey string
-	ToKey   string
-	Kind    string
-	Source  string
+	FromKey string `json:"from_key"`
+	ToKey   string `json:"to_key"`
+	Kind    string `json:"kind"`
+	Source  string `json:"source"`
 
 	// ToPath and ToPosition preserve the target location for a relation
 	// whose target didn't resolve to an indexed symbol -- ToKey is left ""
@@ -57,6 +65,6 @@ type Relation struct {
 	// codestore.ReplaceRelations (symbol_edges has no columns for them);
 	// they exist only so a caller (cmd/ragrep's `code expand`) can still
 	// describe an unresolved reference instead of silently dropping it.
-	ToPath     string
-	ToPosition Position
+	ToPath     string   `json:"to_path,omitempty"`
+	ToPosition Position `json:"to_position,omitempty"`
 }
