@@ -158,6 +158,60 @@ func TestDefaultDBPathWalksUp(t *testing.T) {
 	}
 }
 
+// Resolution order for the --db default: RAGREP_DB > .ragrep/config.json's
+// "db" field > the plain default -- CLI flag > default is already covered by
+// TestDBFlagEnvDefault (an explicit --db always wins over whatever default
+// dbFlag was built with).
+func TestDefaultDBPathUsesConfig(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
+
+	ragrepDir := filepath.Join(root, ".ragrep")
+	if err := os.MkdirAll(ragrepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgJSON := `{"db": "custom/idx.db"}`
+	if err := os.WriteFile(filepath.Join(ragrepDir, "config.json"), []byte(cfgJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(root, "custom", "idx.db")
+	if got := defaultDBPath(); got != want {
+		t.Fatalf("config db: got %q, want %q", got, want)
+	}
+
+	t.Setenv("RAGREP_DB", "env.db")
+	if got := defaultDBPath(); got != "env.db" {
+		t.Fatalf("env should win over config: got %q", got)
+	}
+}
+
+// A malformed .ragrep/config.json must not crash --db default resolution
+// (which runs at flagset-construction time, before any command can report a
+// clean error) -- it falls back to the plain default under the discovered
+// root instead.
+func TestDefaultDBPathBadConfigFallsBack(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+
+	ragrepDir := filepath.Join(root, ".ragrep")
+	if err := os.MkdirAll(ragrepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ragrepDir, "config.json"), []byte(`{not valid json`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(root, ".ragrep", "index.db")
+	if got := defaultDBPath(); got != want {
+		t.Fatalf("bad config: got %q, want fallback %q", got, want)
+	}
+}
+
 // strFlags is a repeatable string flag (e.g. --tag t1 --tag t2); Set appends
 // rather than overwrites so multiple occurrences accumulate.
 func TestStrFlagsSet(t *testing.T) {

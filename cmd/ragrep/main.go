@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/siroio/ragrep/internal/config"
 	"github.com/siroio/ragrep/internal/embed"
 	"github.com/siroio/ragrep/internal/store"
 )
@@ -26,7 +27,7 @@ Usage:
   ragrep add [--tag t]... <path>            (reads content from stdin)
 
 Flags common to all commands:
-  --db PATH    index database (default $RAGREP_DB, else .ragrep/index.db)
+  --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
 
 Exit codes: 0 success, 1 error, 2 no hits / not found
 `
@@ -81,10 +82,16 @@ func dbFlag(fs *flag.FlagSet) *string {
 	return fs.String("db", defaultDBPath(), "index database path")
 }
 
-// defaultDBPath resolves the --db default: $RAGREP_DB if set, else the
-// nearest existing .ragrep/index.db walking up from cwd (so running from a
-// subdirectory of an indexed repo finds the root index), else
-// .ragrep/index.db in cwd. DB keys are workspace-root-relative (see
+// defaultDBPath resolves the --db default, in priority order: $RAGREP_DB
+// (kept for compatibility) > .ragrep/config.json's "db" field > the plain
+// default. The workspace root is found by walking up from cwd looking for a
+// .ragrep directory (so running from a subdirectory of an indexed repo finds
+// the root index/config), else the default is cwd-relative. A config.json
+// that fails to parse doesn't abort here -- this runs at flagset-construction
+// time for every command, before any command can report a clean error -- so
+// it falls back to the plain default under the discovered root instead; the
+// same malformed file is still reported clearly by config.Load's own callers
+// (e.g. language server lookups). DB keys are workspace-root-relative (see
 // normPath), not absolute -- any-subdirectory operation comes from this
 // walk-up discovery plus resolving paths relative to the discovered root,
 // not from the keys themselves.
@@ -92,15 +99,18 @@ func defaultDBPath() string {
 	if p := os.Getenv("RAGREP_DB"); p != "" {
 		return p
 	}
-	local := filepath.Join(".ragrep", "index.db")
+	local := filepath.FromSlash(config.DefaultDB)
 	dir, err := os.Getwd()
 	if err != nil {
 		return local
 	}
 	for {
-		p := filepath.Join(dir, ".ragrep", "index.db")
-		if _, err := os.Stat(p); err == nil {
-			return p
+		if info, err := os.Stat(filepath.Join(dir, ".ragrep")); err == nil && info.IsDir() {
+			cfg, err := config.Load(dir)
+			if err != nil {
+				return filepath.Join(dir, local)
+			}
+			return filepath.Join(dir, filepath.FromSlash(cfg.DB))
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
