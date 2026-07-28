@@ -1,4 +1,4 @@
-rag.exe
-.rag/
+ragrep.exe
+.ragrep/
 docs/
 基本設計書.md

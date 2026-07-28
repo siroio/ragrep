@@ -67,7 +67,7 @@ func CacheDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(base, "rag")
+	dir := filepath.Join(base, "ragrep")
 	return dir, os.MkdirAll(dir, 0o755)
 }
 
@@ -213,7 +213,7 @@ func New(dir string) (*Embedder, error) {
 		return nil, err
 	}
 	if f := missingAsset(dir, asset); f != "" {
-		return nil, fmt.Errorf("missing %s: run 'rag init' first", f)
+		return nil, fmt.Errorf("missing %s: run 'ragrep init' first", f)
 	}
 	ort.SetSharedLibraryPath(filepath.Join(dir, asset.lib))
 	if err := ort.InitializeEnvironment(); err != nil {

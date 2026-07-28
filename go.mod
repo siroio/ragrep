@@ -1,4 +1,4 @@
-module github.com/horiuchi-unico/rag
+module github.com/siroio/ragrep
 
 go 1.26.1
 

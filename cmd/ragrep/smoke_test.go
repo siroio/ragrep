@@ -5,18 +5,18 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/horiuchi-unico/rag/internal/embed"
+	"github.com/siroio/ragrep/internal/embed"
 )
 
 // End-to-end: index a small corpus and search it with the real model.
-// Skips when model assets are not cached (run 'rag init' first).
+// Skips when model assets are not cached (run 'ragrep init' first).
 func TestSmoke(t *testing.T) {
 	dir, err := embed.CacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "model_quantized.onnx")); err != nil {
-		t.Skip("model not cached; run 'rag init' to enable this test")
+		t.Skip("model not cached; run 'ragrep init' to enable this test")
 	}
 
 	tmp := t.TempDir()

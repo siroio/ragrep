@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// Requires cached assets; run `rag init` (or ensureAssets) once beforehand.
+// Requires cached assets; run `ragrep init` (or ensureAssets) once beforehand.
 func testEmbedder(t *testing.T) *Embedder {
 	t.Helper()
 	dir, err := CacheDir()
@@ -19,7 +19,7 @@ func testEmbedder(t *testing.T) *Embedder {
 		t.Fatal(err)
 	}
 	if f := missingAsset(dir, asset); f != "" {
-		t.Skipf("%s not cached; run 'rag init' to enable this test", f)
+		t.Skipf("%s not cached; run 'ragrep init' to enable this test", f)
 	}
 	e, err := New(dir)
 	if err != nil {

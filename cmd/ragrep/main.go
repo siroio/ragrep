@@ -11,20 +11,20 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/horiuchi-unico/rag/internal/embed"
-	"github.com/horiuchi-unico/rag/internal/store"
+	"github.com/siroio/ragrep/internal/embed"
+	"github.com/siroio/ragrep/internal/store"
 )
 
-const usage = `rag - adaptive retrieval unit search CLI
+const usage = `ragrep - adaptive retrieval unit search CLI
 
 Usage:
-  rag init                              create DB, download model assets
-  rag index <path>...                   index text files (recursive)
-  rag search <query> [--mode hybrid|vector|text] [-k 10] [--json]
-  rag get <path> [--para N] [--context N] [--lines A-B]
+  ragrep init                              create DB, download model assets
+  ragrep index <path>...                   index text files (recursive)
+  ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json]
+  ragrep get <path> [--para N] [--context N] [--lines A-B]
 
 Flags common to all commands:
-  --db PATH    index database (default .rag/index.db)
+  --db PATH    index database (default .ragrep/index.db)
 
 Exit codes: 0 success, 1 error, 2 no hits / not found
 `
@@ -74,7 +74,7 @@ func run(args []string) int {
 }
 
 func dbFlag(fs *flag.FlagSet) *string {
-	return fs.String("db", filepath.Join(".rag", "index.db"), "index database path")
+	return fs.String("db", filepath.Join(".ragrep", "index.db"), "index database path")
 }
 
 // newFlagSet builds a FlagSet that reports parse errors to the caller
@@ -174,7 +174,7 @@ func cmdIndex(args []string) int {
 		return code
 	}
 	if fset.NArg() == 0 {
-		return fail(fmt.Errorf("usage: rag index <path>..."))
+		return fail(fmt.Errorf("usage: ragrep index <path>..."))
 	}
 	s, err := openStoreAt(*db)
 	if err != nil {
@@ -280,7 +280,7 @@ func cmdSearch(args []string) int {
 		return code
 	}
 	if fs.NArg() != 1 {
-		return fail(fmt.Errorf("usage: rag search <query>"))
+		return fail(fmt.Errorf("usage: ragrep search <query>"))
 	}
 	query := fs.Arg(0)
 
@@ -343,7 +343,7 @@ func cmdGet(args []string) int {
 		return code
 	}
 	if fs.NArg() != 1 {
-		return fail(fmt.Errorf("usage: rag get <path>"))
+		return fail(fmt.Errorf("usage: ragrep get <path>"))
 	}
 	// Normalize like cmdIndex's filepath.ToSlash(path) at index time, so a
 	// Windows-style "docs\auth.md" argument still matches the "docs/auth.md"

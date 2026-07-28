@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/horiuchi-unico/rag/internal/store"
+	"github.com/siroio/ragrep/internal/store"
 )
 
 // fakeEmbed returns a fixed-dimension deterministic vector (no ONNX needed).
