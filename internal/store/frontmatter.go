@@ -29,6 +29,18 @@ func frontmatterLineCount(content string) int {
 	return end + 1
 }
 
+// blankLines returns content with its first n lines replaced by empty
+// lines. The total line count is unchanged, so line numbers computed over
+// the result (e.g. splitParas's StartLine/EndLine) still match the original
+// file; only used to hide the frontmatter block from paragraph splitting.
+func blankLines(content string, n int) string {
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	for i := 0; i < n && i < len(lines); i++ {
+		lines[i] = ""
+	}
+	return strings.Join(lines, "\n")
+}
+
 // ParseTags extracts the "tags" list from a leading YAML frontmatter block
 // (--- ... ---). Supported forms: inline `tags: [a, b]` (brackets optional)
 // and a block list of `- item` lines. Values are trimmed, unquoted,

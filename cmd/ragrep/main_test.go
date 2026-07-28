@@ -173,7 +173,7 @@ func TestStrFlagsSet(t *testing.T) {
 // given or content already starts with one.
 func TestWithFrontmatter(t *testing.T) {
 	got := withFrontmatter("body text", []string{"go", "cli"})
-	want := "---\ntags: [go, cli]\n---\nbody text"
+	want := "---\ntags: [go, cli]\n---\n\nbody text"
 	if got != want {
 		t.Fatalf("with tags: got %q, want %q", got, want)
 	}
@@ -203,6 +203,33 @@ func TestCmdAddRefusesExisting(t *testing.T) {
 
 	if code := run([]string{"add", "--db", db, path}); code != 1 {
 		t.Fatalf("add existing file: got exit %d, want 1", code)
+	}
+
+	// Flags-first, tags before the path -- the only ordering `flag` accepts
+	// (it stops parsing at the first non-flag argument). Reaching the
+	// existing-file refusal (exit 1, not a usage error) proves the flagset
+	// parsed --tag and --db as flags and the path as the sole positional arg.
+	if code := run([]string{"add", "--tag", "x", "--db", db, path}); code != 1 {
+		t.Fatalf("add --tag x --db db path: got exit %d, want 1 (refusal)", code)
+	}
+}
+
+// cmdAdd's flagset must parse `--tag t]... <path>` (flags before the sole
+// positional), matching every other ragrep subcommand -- documenting this in
+// a flagset-only test protects it independent of the CLI usage strings.
+func TestCmdAddFlagOrdering(t *testing.T) {
+	fs := newFlagSet("add")
+	dbFlag(fs)
+	var tags strFlags
+	fs.Var(&tags, "tag", "tag to add to the new file's frontmatter (repeatable)")
+	if err := fs.Parse([]string{"--tag", "x", "--tag", "y", "some/path.md"}); err != nil {
+		t.Fatal(err)
+	}
+	if fs.NArg() != 1 || fs.Arg(0) != "some/path.md" {
+		t.Fatalf("NArg=%d Arg(0)=%q, want 1 arg %q", fs.NArg(), fs.Arg(0), "some/path.md")
+	}
+	if len(tags) != 2 || tags[0] != "x" || tags[1] != "y" {
+		t.Fatalf("tags=%v, want [x y]", tags)
 	}
 }
 

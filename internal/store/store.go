@@ -120,13 +120,17 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 	}
 
 	fmLines := frontmatterLineCount(content)
-	seq := 0
-	for _, p := range splitParas(content) {
-		if fmLines > 0 && p.EndLine <= fmLines {
-			continue // frontmatter block is metadata, not searchable content
-		}
+	paraSrc := content
+	if fmLines > 0 {
+		// Blank out the frontmatter lines (same line count, so StartLine/
+		// EndLine of later paragraphs stay aligned with the original file)
+		// so splitParas never fuses frontmatter with the first body block --
+		// robust even when there's no blank line after the closing "---".
+		paraSrc = blankLines(content, fmLines)
+	}
+	for _, p := range splitParas(paraSrc) {
 		res, err := tx.Exec(`INSERT INTO paragraphs(doc_id, seq, start_line, end_line, text) VALUES(?,?,?,?,?)`,
-			docID, seq, p.StartLine, p.EndLine, p.Text)
+			docID, p.Seq, p.StartLine, p.EndLine, p.Text)
 		if err != nil {
 			return false, err
 		}
@@ -136,7 +140,7 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 		}
 		v, err := embed("title: none | text: " + p.Text)
 		if err != nil {
-			return false, fmt.Errorf("embed %s#%d: %w", relPath, seq, err)
+			return false, fmt.Errorf("embed %s#%d: %w", relPath, p.Seq, err)
 		}
 		blob, err := sqlite_vec.SerializeFloat32(v)
 		if err != nil {
@@ -145,7 +149,6 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 		if _, err := tx.Exec(`INSERT INTO vec(rowid, embedding) VALUES(?,?)`, paraID, blob); err != nil {
 			return false, err
 		}
-		seq++
 	}
 
 	for _, tag := range ParseTags(content) {

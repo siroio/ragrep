@@ -1,6 +1,9 @@
 package store
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func docSet(hits []Hit) map[string]bool {
 	m := map[string]bool{}
@@ -146,5 +149,27 @@ func TestFrontmatterSeqRenumbered(t *testing.T) {
 	got, err := s.GetParas("fm.md", 0, 0)
 	if err != nil || got != "本文パラグラフ。" {
 		t.Fatalf("GetParas(0,0)=%q err=%v", got, err)
+	}
+}
+
+// TestFrontmatterNoBlankLineExcluded reproduces frontmatter fusing with the
+// first body paragraph when there's no blank line after the closing "---":
+// splitParas would otherwise treat frontmatter+body as a single paragraph
+// (the `p.EndLine <= fmLines` skip never fires because EndLine extends past
+// fmLines), leaking "tags:" into FTS/embeddings/snippets.
+func TestFrontmatterNoBlankLineExcluded(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("nb.md", "---\ntags: [x]\n---\n本文 keyword。", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.SearchText("keyword", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Para != 0 {
+		t.Fatalf("expected exactly 1 hit at Para 0, got %+v", hits)
+	}
+	if strings.Contains(hits[0].Snippet, "tags:") {
+		t.Fatalf("frontmatter leaked into snippet: %q", hits[0].Snippet)
 	}
 }

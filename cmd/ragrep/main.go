@@ -22,7 +22,7 @@ Usage:
   ragrep index <path>...                   index text files (recursive)
   ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--tag t]...
   ragrep get <path> [--para N] [--context N] [--lines A-B]
-  ragrep add <path> [--tag t]... [--db PATH]   (reads content from stdin)
+  ragrep add [--tag t]... <path>            (reads content from stdin)
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/index.db)
@@ -469,7 +469,7 @@ func withFrontmatter(content string, tags []string) string {
 	if len(tags) == 0 || strings.HasPrefix(content, "---") {
 		return content
 	}
-	return "---\ntags: [" + strings.Join(tags, ", ") + "]\n---\n" + content
+	return "---\ntags: [" + strings.Join(tags, ", ") + "]\n---\n\n" + content
 }
 
 // cmdAdd creates a new file from stdin content, indexes it, and reports its
@@ -485,7 +485,7 @@ func cmdAdd(args []string) int {
 		return code
 	}
 	if fs.NArg() != 1 {
-		return fail(fmt.Errorf("usage: ragrep add <path> [--tag t]..."))
+		return fail(fmt.Errorf("usage: ragrep add [--tag t]... <path>"))
 	}
 	path := fs.Arg(0)
 
@@ -509,7 +509,7 @@ func cmdAdd(args []string) int {
 		return fail(err)
 	}
 
-	rel, err := normPath(path)
+	key, err := normPath(path)
 	if err != nil {
 		return fail(err)
 	}
@@ -533,9 +533,9 @@ func cmdAdd(args []string) int {
 	}
 	defer e.Close()
 
-	if _, err := s.UpsertDoc(rel, content, info.ModTime().Unix(), e.Embed); err != nil {
+	if _, err := s.UpsertDoc(key, content, info.ModTime().Unix(), e.Embed); err != nil {
 		return fail(err)
 	}
-	fmt.Println("indexed", rel)
+	fmt.Println("indexed", key)
 	return 0
 }
