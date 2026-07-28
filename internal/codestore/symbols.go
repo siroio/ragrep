@@ -416,15 +416,20 @@ type IndexRun struct {
 }
 
 // LatestIndexRun returns the most recently recorded index_runs row (highest
-// id), for a caller that needs the index's current identity
-// (revision/server/model -- e.g. `code pack`'s manifest header) without
-// tracking a specific run id of its own. ErrNotFound when no run has been
-// recorded yet.
+// id) whose scope has the "index:" prefix, for a caller that needs the
+// index's current identity (revision/server/model -- e.g. `code pack`'s
+// manifest header) without tracking a specific run id of its own.
+// Non-"index:"-scoped rows (e.g. cmd/ragrep's `code expand`, which records
+// its own run scoped "expand:...") are deliberately excluded: without this
+// filter, an expand call -- which never (re)indexes any symbol -- would win
+// over the last real index run just by having a higher id, letting a
+// manifest advertise a revision at which symbols were never actually
+// indexed. ErrNotFound when no index-scoped run has been recorded yet.
 func (s *Store) LatestIndexRun() (IndexRun, error) {
 	var r IndexRun
 	err := s.db.QueryRow(`
 		SELECT id, scope, revision, language, server_name, server_version, model_id, created_at
-		FROM index_runs ORDER BY id DESC LIMIT 1`).Scan(
+		FROM index_runs WHERE scope LIKE 'index:%' ORDER BY id DESC LIMIT 1`).Scan(
 		&r.ID, &r.Scope, &r.Revision, &r.Language, &r.ServerName, &r.ServerVersion, &r.ModelID, &r.CreatedAt)
 	if err == sql.ErrNoRows {
 		return IndexRun{}, ErrNotFound

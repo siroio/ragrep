@@ -730,10 +730,10 @@ func TestLatestIndexRunReturnsMostRecentRow(t *testing.T) {
 	s := openTestStore(t, 3)
 
 	when := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	if _, err := s.RecordIndexRun("pkg1", "rev1", "go", "gopls", "v1.0.0", "test-model", when); err != nil {
+	if _, err := s.RecordIndexRun("index:pkg1", "rev1", "go", "gopls", "v1.0.0", "test-model", when); err != nil {
 		t.Fatalf("first RecordIndexRun: %v", err)
 	}
-	id2, err := s.RecordIndexRun("pkg2", "rev2", "go", "gopls", "v2.0.0", "test-model", when.Add(time.Hour))
+	id2, err := s.RecordIndexRun("index:pkg2", "rev2", "go", "gopls", "v2.0.0", "test-model", when.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("second RecordIndexRun: %v", err)
 	}
@@ -742,8 +742,34 @@ func TestLatestIndexRunReturnsMostRecentRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LatestIndexRun: %v", err)
 	}
-	if run.ID != id2 || run.Scope != "pkg2" || run.Revision != "rev2" || run.ServerVersion != "v2.0.0" {
-		t.Fatalf("LatestIndexRun = %+v, want the most recently recorded run (id=%d, scope=pkg2, rev2, v2.0.0)", run, id2)
+	if run.ID != id2 || run.Scope != "index:pkg2" || run.Revision != "rev2" || run.ServerVersion != "v2.0.0" {
+		t.Fatalf("LatestIndexRun = %+v, want the most recently recorded run (id=%d, scope=index:pkg2, rev2, v2.0.0)", run, id2)
+	}
+}
+
+// A `code expand` call records its own index_runs row (see cmd/ragrep's
+// cmdCodeExpand) with scope "expand:...", not "index:...", so it must never
+// win LatestIndexRun even though it has a higher id than the last real
+// index run -- otherwise a manifest could advertise a revision at which
+// symbols were never actually (re)indexed.
+func TestLatestIndexRunIgnoresNonIndexScopedRuns(t *testing.T) {
+	s := openTestStore(t, 3)
+
+	when := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	indexID, err := s.RecordIndexRun("index:pkg1", "rev1", "go", "gopls", "v1.0.0", "test-model", when)
+	if err != nil {
+		t.Fatalf("index-scoped RecordIndexRun: %v", err)
+	}
+	if _, err := s.RecordIndexRun("expand:references:somekey", "rev1", "go", "gopls", "v1.0.0", "test-model", when.Add(time.Hour)); err != nil {
+		t.Fatalf("expand-scoped RecordIndexRun: %v", err)
+	}
+
+	run, err := s.LatestIndexRun()
+	if err != nil {
+		t.Fatalf("LatestIndexRun: %v", err)
+	}
+	if run.ID != indexID || run.Scope != "index:pkg1" {
+		t.Fatalf("LatestIndexRun = %+v, want the index-scoped run (id=%d, scope=index:pkg1), not the later expand-scoped one", run, indexID)
 	}
 }
 
