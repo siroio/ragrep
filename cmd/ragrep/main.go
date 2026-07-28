@@ -568,6 +568,10 @@ func cmdAdd(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	key, err := normPath(path, wsRoot)
+	if err != nil {
+		return fail(err)
+	}
 
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -585,10 +589,6 @@ func cmdAdd(args []string) int {
 		return fail(err)
 	}
 
-	key, err := normPath(path, wsRoot)
-	if err != nil {
-		return fail(err)
-	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return fail(err)

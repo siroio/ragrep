@@ -218,6 +218,41 @@ func TestCmdAddRefusesExisting(t *testing.T) {
 	}
 }
 
+// cmdAdd must validate the target is inside the workspace root BEFORE
+// writing anything to disk. Validating late (after os.MkdirAll/os.WriteFile)
+// would leave a stray unindexed file outside the workspace when the command
+// then fails.
+func TestCmdAddRejectsOutsideRoot(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(root, ".ragrep", "index.db")
+
+	outside := filepath.Join(filepath.Dir(root), "ragrep-add-outside-test.md")
+	os.Remove(outside) // in case a previous failed run left it behind
+	t.Cleanup(func() { os.Remove(outside) })
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString("stray content"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	if code := run([]string{"add", "--db", db, outside}); code != 1 {
+		t.Fatalf("add outside root: exit=%d, want 1", code)
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("add outside root must not create the file on disk; stat err=%v", err)
+	}
+}
+
 // cmdAdd's flagset must parse `--tag t]... <path>` (flags before the sole
 // positional), matching every other ragrep subcommand -- documenting this in
 // a flagset-only test protects it independent of the CLI usage strings.
@@ -339,6 +374,7 @@ func TestOldKeyGuard(t *testing.T) {
 	}
 	old := os.Stderr
 	os.Stderr = w
+	defer func() { os.Stderr = old }()
 	code := run([]string{"search", "--db", db, "--mode", "text", "q"})
 	w.Close()
 	os.Stderr = old
@@ -389,6 +425,31 @@ func TestGetFallback(t *testing.T) {
 	}
 	if code := run([]string{"get", "--db", db, filepath.Join(sub, "auth.md")}); code != 0 {
 		t.Fatalf("absolute path: exit=%d, want 0", code)
+	}
+}
+
+// If the verbatim key misses and the fallback normPath rejects the arg as
+// outside the workspace root, cmdGet must preserve the original "not found"
+// result (exit 2) rather than surfacing normPath's outside-workspace error
+// as a generic failure (exit 1).
+func TestGetFallbackOutsideRootStaysNotFound(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(root, ".ragrep", "index.db")
+	if err := os.MkdirAll(filepath.Dir(db), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	t.Chdir(root)
+	if code := run([]string{"get", "--db", db, "../nonexistent-outside.md"}); code != 2 {
+		t.Fatalf("get outside-root arg: exit=%d, want 2 (not found), not 1", code)
 	}
 }
 
