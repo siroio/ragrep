@@ -74,11 +74,34 @@ func run(args []string) int {
 }
 
 func dbFlag(fs *flag.FlagSet) *string {
-	def := os.Getenv("RAGREP_DB")
-	if def == "" {
-		def = filepath.Join(".ragrep", "index.db")
+	return fs.String("db", defaultDBPath(), "index database path")
+}
+
+// defaultDBPath resolves the --db default: $RAGREP_DB if set, else the
+// nearest existing .ragrep/index.db walking up from cwd (so running from a
+// subdirectory of an indexed repo finds the root index), else
+// .ragrep/index.db in cwd. DB keys are absolute (see normPath), so any
+// command works from any subdirectory once the DB is found.
+func defaultDBPath() string {
+	if p := os.Getenv("RAGREP_DB"); p != "" {
+		return p
 	}
-	return fs.String("db", def, "index database path")
+	local := filepath.Join(".ragrep", "index.db")
+	dir, err := os.Getwd()
+	if err != nil {
+		return local
+	}
+	for {
+		p := filepath.Join(dir, ".ragrep", "index.db")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return local
+		}
+		dir = parent
+	}
 }
 
 // newFlagSet builds a FlagSet that reports parse errors to the caller
@@ -217,7 +240,10 @@ func cmdIndex(args []string) int {
 			if err != nil {
 				return err
 			}
-			rel := filepath.ToSlash(path)
+			rel, err := normPath(path)
+			if err != nil {
+				return err
+			}
 			changed, err := s.UpsertDoc(rel, string(data), info.ModTime().Unix(), e.Embed)
 			if err != nil {
 				return fmt.Errorf("%s: %w", rel, err)
@@ -236,7 +262,11 @@ func cmdIndex(args []string) int {
 	if *prune {
 		roots := make([]string, len(fset.Args()))
 		for i, r := range fset.Args() {
-			roots[i] = filepath.ToSlash(filepath.Clean(r))
+			root, err := normPath(r)
+			if err != nil {
+				return fail(err)
+			}
+			roots[i] = root
 		}
 		paths, err := s.ListPaths()
 		if err != nil {
@@ -337,6 +367,19 @@ func cmdSearch(args []string) int {
 	return 0
 }
 
+// normPath converts p to the canonical DB key form: absolute, slash-separated.
+// One canonical form means index/get/prune agree no matter what cwd or path
+// style (relative, ./x, absolute) the user passes.
+// ponytail: no case-folding or symlink resolution; on Windows "D:" vs "d:"
+// still mismatch — add EqualFold/EvalSymlinks here if that ever bites.
+func normPath(p string) (string, error) {
+	a, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(a), nil
+}
+
 func cmdGet(args []string) int {
 	fs := newFlagSet("get")
 	db := dbFlag(fs)
@@ -349,10 +392,12 @@ func cmdGet(args []string) int {
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: ragrep get <path>"))
 	}
-	// Normalize like cmdIndex's filepath.ToSlash(path) at index time, so a
-	// Windows-style "docs\auth.md" argument still matches the "docs/auth.md"
-	// key stored in the DB.
-	path := filepath.ToSlash(fs.Arg(0))
+	// Normalize the arg to the canonical absolute slash form used as DB keys,
+	// so relative, ./x, and absolute arguments all match the stored key.
+	path, err := normPath(fs.Arg(0))
+	if err != nil {
+		return fail(err)
+	}
 
 	s, err := openStoreAt(*db)
 	if err != nil {

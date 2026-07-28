@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -119,5 +120,59 @@ func TestDBFlagEnvDefault(t *testing.T) {
 	}
 	if *db2 != "explicit.db" {
 		t.Fatalf("db=%q, want explicit.db", *db2)
+	}
+}
+
+// From a subdirectory, the default db path resolves to the nearest ancestor's
+// existing .ragrep/index.db; with none, it stays cwd-relative.
+func TestDefaultDBPathWalksUp(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
+
+	if got := defaultDBPath(); got != filepath.Join(".ragrep", "index.db") {
+		t.Fatalf("no ancestor db: got %q, want cwd-relative default", got)
+	}
+
+	rootDB := filepath.Join(root, ".ragrep", "index.db")
+	if err := os.MkdirAll(filepath.Dir(rootDB), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rootDB, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := defaultDBPath(); got != rootDB {
+		t.Fatalf("got %q, want %q", got, rootDB)
+	}
+
+	t.Setenv("RAGREP_DB", "env.db")
+	if got := defaultDBPath(); got != "env.db" {
+		t.Fatalf("env should win: got %q", got)
+	}
+}
+
+// All path argument styles normalize to one canonical absolute slash key.
+func TestNormPath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := normPath("docs/foo.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []string{"./docs/foo.md", filepath.Join(cwd, "docs", "foo.md"), want} {
+		got, err := normPath(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("normPath(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
