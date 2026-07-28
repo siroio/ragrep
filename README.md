@@ -7,6 +7,8 @@
 
     go build -o rag.exe .
 
+ビルドにはcgo（Cツールチェーン）が必要（`github.com/yalue/onnxruntime_go`がcgo必須のため）。埋め込みモデルはembeddinggemma-300m（quantized ONNX, 768次元）。
+
 ## Usage
 
     rag init                     # モデル・ランタイムをDL（初回のみ、~310MB）

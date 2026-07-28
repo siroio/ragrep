@@ -24,9 +24,9 @@ Planner（取得単位の判断）と回答生成は呼び出し側のLLMエー�
 | 言語 | Go 1.23+ | シングルバイナリ配布・クロスコンパイル容易 |
 | SQLite | `github.com/ncruces/go-sqlite3` | Pure Go（WASM/wazero）でCGo不要。FTS5同梱 |
 | ベクトル検索 | `sqlite-vec`（`github.com/asg017/sqlite-vec-go-bindings/ncruces`） | FTS5と同一DBファイルに同居。専用ベクトルDB不要 |
-| 埋め込み推論 | ONNX Runtime（`github.com/yalue/onnxruntime_go`） | 共有ライブラリは`rag init`時にGitHub ReleasesからDLしキャッシュ（go:embed不要でビルド単純化）。配布は単一バイナリ |
-| 埋め込みモデル | `multilingual-e5-small`（quantized ONNX, 384次元） | 日本語対応・約120MB。初回`init`時にHugging FaceからDLしキャッシュ |
-| トークナイザ | `github.com/eliben/go-sentencepiece`（Pure Go） | XLM-Rの`sentencepiece.bpe.model`を読み込み、fairseqオフセット(+1)でHF語彙IDへ変換 |
+| 埋め込み推論 | ONNX Runtime（`github.com/yalue/onnxruntime_go`） | 共有ライブラリは`rag init`時にGitHub ReleasesからDLしキャッシュ（go:embed不要でビルド単純化）。配布は単一バイナリ。**cgo必須（ビルドにCツールチェーン必要）** |
+| 埋め込みモデル | `embeddinggemma-300m`（quantized ONNX, 768次元） | 日本語対応・約310MB。初回`init`時にHugging Face（onnx-community、リビジョン固定）からDLしキャッシュ。※当初のmultilingual-e5-smallはトークナイザ非互換（Unigram型spm）のため差し替え |
+| トークナイザ | `github.com/eliben/go-sentencepiece`（Pure Go） | gemmaの`tokenizer.model`を読み込み、spm IDをそのまま使用。プロンプト: 文書=`title: none \| text: `、クエリ=`task: search result \| query: ` |
 | CLI | 標準ライブラリ`flag` + サブコマンド分岐 | cobra等は不使用（YAGNI） |
 | 日本語全文検索 | FTS5 trigramトークナイザ | 形態素解析なしで日本語部分一致が可能 |
 
@@ -61,10 +61,10 @@ CREATE TABLE paragraphs (
 
 -- fts/vec とも rowid = paragraphs.id
 CREATE VIRTUAL TABLE fts USING fts5(text, tokenize='trigram');
-CREATE VIRTUAL TABLE vec USING vec0(embedding float[384]);
+CREATE VIRTUAL TABLE vec USING vec0(embedding float[768]);
 ```
 
-埋め込み・FTSのインデックス単位は段落。長すぎる段落は埋め込み時に510トークンで
+埋め込み・FTSのインデックス単位は段落。長すぎる段落は埋め込み時に1022トークンで
 切り詰める（FTSは全文を保持するためハイブリッド検索で後半もヒットする）。
 
 ## コマンド仕様
