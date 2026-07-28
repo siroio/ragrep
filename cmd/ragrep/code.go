@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/siroio/ragrep/internal/codeindex"
 	"github.com/siroio/ragrep/internal/codestore"
@@ -30,6 +30,9 @@ Usage:
   ragrep code index --language go <path>...        index symbols via the configured language server
   ragrep code search [--json] [-k N] <query>        search indexed symbols (no body in the output)
   ragrep code get --symbol <key> [--body] [--json]  fetch one symbol's metadata (and body with --body)
+  ragrep code expand --symbol <key> --relation definition|references|callers|callees|tests [--json]
+                                                     live-query the language server for one symbol's
+                                                     relations (1 hop), save them, print resolved targets
 
 Flags common to code subcommands:
   --db PATH    code database (default .ragrep/config.json code_db, else .ragrep/code.db)
@@ -64,6 +67,8 @@ func cmdCode(args []string) int {
 		return cmdCodeSearch(rest)
 	case "get":
 		return cmdCodeGet(rest)
+	case "expand":
+		return cmdCodeExpand(rest)
 	case "-h", "--help":
 		fmt.Fprint(os.Stderr, codeUsage)
 		return 0
@@ -236,24 +241,19 @@ func startLanguageServer(serverCmd, wsRoot string) (*lsp.Client, *lsp.Initialize
 	return client, result, nil
 }
 
-// recordIndexRun inserts one index_runs row directly against the code.db
-// file. codestore has no exported API for this table (only ReplaceRelations
-// takes a runID, for symbol_edges) -- wiring symbols.index_run_id itself is
-// deferred to a later task; this only records the run's own provenance
-// (revision, server, model, time), reusing the sqlite3 driver already
-// registered by internal/codestore's blank imports.
-func recordIndexRun(dbPath, language, revision, serverName, serverVersion, modelID string, roots []string) error {
-	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
-	if err != nil {
-		return err
+// serverIdentity extracts the server's self-reported name/version from an
+// initialize response ("unknown"/"unknown" when the server didn't advertise
+// serverInfo, or initResult itself is nil), for index_runs.server_name /
+// server_version and (in cmdCodeExpand) symbol_edges.source.
+func serverIdentity(initResult *lsp.InitializeResult) (name, version string) {
+	name, version = "unknown", "unknown"
+	if initResult != nil && initResult.ServerInfo != nil {
+		name = initResult.ServerInfo.Name
+		if initResult.ServerInfo.Version != "" {
+			version = initResult.ServerInfo.Version
+		}
 	}
-	defer db.Close()
-	_, err = db.Exec(`
-		INSERT INTO index_runs(scope, revision, language, server_name, server_version, model_id, created_at)
-		VALUES (?,?,?,?,?,?,?)`,
-		strings.Join(roots, ","), revision, language, serverName, serverVersion, modelID,
-		time.Now().UTC().Format(time.RFC3339))
-	return err
+	return name, version
 }
 
 func cmdCodeIndex(args []string) int {
@@ -332,6 +332,15 @@ func cmdCodeIndex(args []string) int {
 	}
 	defer s.Close()
 
+	// Record the run BEFORE indexing any file, not after: UpsertSymbols
+	// needs a real runID to stamp into symbols.index_run_id as it goes, so
+	// the row's own id must exist first.
+	serverName, serverVersion := serverIdentity(initResult)
+	runID, err := s.RecordIndexRun(strings.Join(relRoots, ","), gitRevision(wsRoot), *language, serverName, serverVersion, codeModelID, time.Now())
+	if err != nil {
+		return fail(err)
+	}
+
 	dir, err := embed.CacheDir()
 	if err != nil {
 		return fail(err)
@@ -363,7 +372,7 @@ func cmdCodeIndex(args []string) int {
 		if err != nil {
 			return fail(err)
 		}
-		changed, err := s.UpsertSymbols(rel, codeindex.FileHash(content), symbols, e.Embed)
+		changed, err := s.UpsertSymbols(rel, codeindex.FileHash(content), symbols, runID, e.Embed)
 		if err != nil {
 			return fail(fmt.Errorf("%s: %w", rel, err))
 		}
@@ -371,17 +380,6 @@ func cmdCodeIndex(args []string) int {
 			fmt.Println("indexed", rel)
 			indexed++
 		}
-	}
-
-	serverName, serverVersion := "unknown", "unknown"
-	if initResult != nil && initResult.ServerInfo != nil {
-		serverName = initResult.ServerInfo.Name
-		if initResult.ServerInfo.Version != "" {
-			serverVersion = initResult.ServerInfo.Version
-		}
-	}
-	if err := recordIndexRun(*db, *language, gitRevision(wsRoot), serverName, serverVersion, codeModelID, relRoots); err != nil {
-		return fail(err)
 	}
 
 	fmt.Printf("done: %d indexed (%d files scanned)\n", indexed, len(files))
@@ -527,6 +525,371 @@ func cmdCodeGet(args []string) int {
 	}
 
 	if err := formatCodeSymbol(os.Stdout, sym, *body, *asJSON); err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+// codeExpandFeature maps a --relation value to the LSP capability that must
+// be advertised to serve it: "tests" reuses textDocument/references (a test
+// relation is just a references result whose path happens to end in
+// _test.go -- see codeindex.ReferenceRelations), "callers"/"callees" both
+// need call hierarchy (prepareCallHierarchy, then one of
+// incoming/outgoingCalls).
+var codeExpandFeature = map[string]string{
+	"definition": lsp.FeatureDefinition,
+	"references": lsp.FeatureReferences,
+	"tests":      lsp.FeatureReferences,
+	"callers":    lsp.FeatureCallHierarchy,
+	"callees":    lsp.FeatureCallHierarchy,
+}
+
+// declarationPosition locates sym's own name token within its declaration,
+// scanning the source lines sym.Range covers for the first whole-word
+// occurrence of the last dot-separated segment of sym.Name (gopls reports a
+// Go method's Name as "(Receiver).Method"; splitting on "." isolates
+// "Method"). This matters because sym.Range.Start -- a documentSymbol's
+// overall range, not the narrower selectionRange that would point straight
+// at the identifier; codeindex.Symbol doesn't carry that -- usually lands on
+// the "func"/"type"/... keyword instead of the name, and several LSP
+// requests this command drives (prepareCallHierarchy in particular) only
+// resolve when the position is actually on the identifier. Falls back to
+// sym.Range.Start (best-effort, not a hard failure) when content is empty
+// or the name can't be found on any of its declaration lines.
+func declarationPosition(content []byte, sym codeindex.Symbol) lsp.Position {
+	fallback := lsp.Position{Line: sym.Range.Start.Line, Character: sym.Range.Start.Character}
+	name := sym.Name
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "" {
+		return fallback
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for lineNo := sym.Range.Start.Line; lineNo <= sym.Range.End.Line && lineNo < len(lines); lineNo++ {
+		line := strings.TrimSuffix(lines[lineNo], "\r")
+		if idx := indexWholeWord(line, name); idx >= 0 {
+			return lsp.Position{Line: lineNo, Character: utf16Len(line[:idx])}
+		}
+	}
+	return fallback
+}
+
+// indexWholeWord returns the byte offset of the first occurrence of word in
+// line that isn't part of a larger identifier (e.g. "Greet" inside
+// "Greeter" doesn't count), or -1 if there's none.
+func indexWholeWord(line, word string) int {
+	for start := 0; start <= len(line)-len(word); {
+		idx := strings.Index(line[start:], word)
+		if idx < 0 {
+			return -1
+		}
+		idx += start
+		before, after := byte(0), byte(0)
+		if idx > 0 {
+			before = line[idx-1]
+		}
+		if idx+len(word) < len(line) {
+			after = line[idx+len(word)]
+		}
+		if !isIdentByte(before) && !isIdentByte(after) {
+			return idx
+		}
+		start = idx + 1
+	}
+	return -1
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// utf16Len is the number of UTF-16 code units s encodes to -- the unit LSP
+// Position.Character counts in, matching codeindex's own UTF-16 handling
+// (see internal/codeindex/extract.go's lineIndex).
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+// pathFromURI converts a file:// URI (as returned by a language server)
+// back into a display path: workspace-relative and slash-separated (the
+// same convention as codeindex.Symbol.Path) when it's inside wsRoot, or the
+// absolute path as-is when it isn't (e.g. a stdlib location under GOROOT) --
+// still informative even though it won't match anything codestore.SymbolAt
+// can resolve. Mirrors fileURI's construction in reverse.
+func pathFromURI(uri, wsRoot string) string {
+	p := strings.TrimPrefix(uri, "file://")
+	if len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+		p = p[1:] // strip the leading "/" fileURI adds before a Windows drive letter
+	}
+	abs := filepath.FromSlash(p)
+	if rel, err := filepath.Rel(wsRoot, abs); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.ToSlash(abs)
+}
+
+// locsFromLSP converts textDocument/definition or textDocument/references
+// results into codeindex.Loc, anchored at each location's Range.Start.
+func locsFromLSP(wsRoot string, locs []lsp.Location) []codeindex.Loc {
+	out := make([]codeindex.Loc, 0, len(locs))
+	for _, l := range locs {
+		out = append(out, codeindex.Loc{
+			Path:     pathFromURI(l.URI, wsRoot),
+			Position: codeindex.Position{Line: l.Range.Start.Line, Character: l.Range.Start.Character},
+		})
+	}
+	return out
+}
+
+// locsFromCallHierarchyItems converts callHierarchy/incomingCalls' "From"
+// items or callHierarchy/outgoingCalls' "To" items into codeindex.Loc,
+// anchored at each item's SelectionRange.Start (the identifier itself,
+// narrower and more precise than Range, which spans the whole declaration).
+func locsFromCallHierarchyItems(wsRoot string, items []lsp.CallHierarchyItem) []codeindex.Loc {
+	out := make([]codeindex.Loc, 0, len(items))
+	for _, it := range items {
+		out = append(out, codeindex.Loc{
+			Path:     pathFromURI(it.URI, wsRoot),
+			Position: codeindex.Position{Line: it.SelectionRange.Start.Line, Character: it.SelectionRange.Start.Character},
+		})
+	}
+	return out
+}
+
+// resolverFor adapts codestore.Store.SymbolAt (which can fail) to
+// codeindex.Resolver (which can't): the first SymbolAt error is captured
+// into *error and every resolve call after that short-circuits to
+// unresolved, so the caller can check the pointer once after converting all
+// locations instead of threading an error return through every relations.go
+// helper.
+func resolverFor(s *codestore.Store) (codeindex.Resolver, *error) {
+	var firstErr error
+	resolve := func(path string, line int) (string, bool) {
+		if firstErr != nil {
+			return "", false
+		}
+		key, ok, err := s.SymbolAt(path, line)
+		if err != nil {
+			firstErr = err
+			return "", false
+		}
+		return key, ok
+	}
+	return resolve, &firstErr
+}
+
+// codeExpandTarget is one line of `code expand` output: either a resolved
+// indexed symbol's declaration metadata, or (Resolved == false) the bare
+// path/position of a location that didn't resolve to one -- never a
+// fabricated key.
+type codeExpandTarget struct {
+	Relation      string `json:"relation"`
+	Resolved      bool   `json:"resolved"`
+	Key           string `json:"key,omitempty"`
+	Kind          string `json:"kind,omitempty"`
+	QualifiedName string `json:"qualified_name,omitempty"`
+	Signature     string `json:"signature,omitempty"`
+	Path          string `json:"path"`
+	StartLine     int    `json:"start_line,omitempty"`
+	EndLine       int    `json:"end_line,omitempty"`
+	Line          int    `json:"line,omitempty"`      // unresolved only
+	Character     int    `json:"character,omitempty"` // unresolved only
+}
+
+// expandTargets builds one codeExpandTarget per relation, in order,
+// resolving each ToKey's declaration metadata via GetSymbol. Body is never
+// included -- see formatCodeSymbol's doc comment; `code get --body` is the
+// only way to read one.
+func expandTargets(s *codestore.Store, relations []codeindex.Relation) ([]codeExpandTarget, error) {
+	out := make([]codeExpandTarget, 0, len(relations))
+	for _, r := range relations {
+		if r.ToKey == "" {
+			out = append(out, codeExpandTarget{
+				Relation: r.Kind, Resolved: false,
+				Path: r.ToPath, Line: r.ToPosition.Line, Character: r.ToPosition.Character,
+			})
+			continue
+		}
+		sym, err := s.GetSymbol(r.ToKey)
+		if err != nil {
+			return nil, fmt.Errorf("expand: resolved key %s: %w", r.ToKey, err)
+		}
+		out = append(out, codeExpandTarget{
+			Relation: r.Kind, Resolved: true,
+			Key: sym.Key, Kind: sym.Kind, QualifiedName: sym.QualifiedName, Signature: sym.Signature,
+			Path: sym.Path, StartLine: sym.Range.Start.Line, EndLine: sym.Range.End.Line,
+		})
+	}
+	return out, nil
+}
+
+func formatCodeExpandTargets(w io.Writer, targets []codeExpandTarget, asJSON bool) error {
+	if asJSON {
+		return json.NewEncoder(w).Encode(targets)
+	}
+	for _, t := range targets {
+		if !t.Resolved {
+			fmt.Fprintf(w, "%s\tunresolved\t%s:%d\n", t.Relation, t.Path, t.Line)
+			continue
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s:%d-%d\n",
+			t.Relation, t.Key, t.Kind, t.QualifiedName, t.Signature, t.Path, t.StartLine, t.EndLine)
+	}
+	return nil
+}
+
+func cmdCodeExpand(args []string) int {
+	fs := newFlagSet("code expand")
+	db := codeDBFlag(fs)
+	symbolKey := fs.String("symbol", "", "stable symbol key (from `code search`)")
+	relation := fs.String("relation", "", "definition|references|callers|callees|tests")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if code, handled := parseArgs(fs, args); handled {
+		return code
+	}
+	feature, validRelation := codeExpandFeature[*relation]
+	if fs.NArg() != 0 || *symbolKey == "" || !validRelation {
+		return fail(fmt.Errorf("usage: ragrep code expand --symbol <stable-key> --relation definition|references|callers|callees|tests [--json]"))
+	}
+
+	wsRoot, err := workspaceRoot(*db)
+	if err != nil {
+		return fail(err)
+	}
+
+	s, err := openCodeStoreAt(*db)
+	if err != nil {
+		return fail(err)
+	}
+	defer s.Close()
+
+	sym, err := s.GetSymbol(*symbolKey)
+	if err == codestore.ErrNotFound {
+		fmt.Fprintln(os.Stderr, "not found")
+		return 2
+	}
+	if err != nil {
+		return fail(err)
+	}
+
+	cfg, err := config.Load(wsRoot)
+	if err != nil {
+		return fail(err)
+	}
+	serverCmd, err := cfg.ServerCommand(sym.Language)
+	if err != nil {
+		return fail(err)
+	}
+
+	client, initResult, err := startLanguageServer(serverCmd, wsRoot)
+	if err != nil {
+		return fail(err)
+	}
+	defer client.Close()
+
+	// Distinct from "no results": the server itself can't do this, so no
+	// query was even attempted.
+	if !client.Supports(feature) {
+		fmt.Fprintf(os.Stderr, "not supported by server %s\n", serverCmd)
+		return 1
+	}
+
+	serverName, serverVersion := serverIdentity(initResult)
+	resolve, resolveErr := resolverFor(s)
+	absPath := filepath.Join(wsRoot, filepath.FromSlash(sym.Path))
+	content, _ := os.ReadFile(absPath) // best-effort; declarationPosition falls back to sym.Range.Start if this fails or the name can't be found
+	pos := lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: fileURI(absPath)},
+		Position:     declarationPosition(content, sym),
+	}
+
+	ctx := context.Background()
+	var relations []codeindex.Relation
+	switch *relation {
+	case "definition":
+		locs, err := client.Definition(ctx, lsp.DefinitionParams(pos))
+		if err != nil {
+			return fail(err)
+		}
+		relations = codeindex.DefinitionRelations(sym.Key, locsFromLSP(wsRoot, locs), serverName, resolve)
+
+	case "references", "tests":
+		locs, err := client.References(ctx, lsp.ReferenceParams{
+			TextDocumentPositionParams: pos,
+			Context:                    lsp.ReferenceContext{IncludeDeclaration: false},
+		})
+		if err != nil {
+			return fail(err)
+		}
+		relations = codeindex.ReferenceRelations(sym.Key, locsFromLSP(wsRoot, locs), serverName, resolve)
+
+	case "callers", "callees":
+		items, err := client.PrepareCallHierarchy(ctx, lsp.CallHierarchyPrepareParams(pos))
+		if err != nil {
+			return fail(err)
+		}
+		if len(items) > 0 {
+			// 1 hop only: query the prepared item's calls exactly once, no
+			// further traversal from the results.
+			item := items[0]
+			if *relation == "callers" {
+				calls, err := client.IncomingCalls(ctx, lsp.CallHierarchyIncomingCallsParams{Item: item})
+				if err != nil {
+					return fail(err)
+				}
+				froms := make([]lsp.CallHierarchyItem, len(calls))
+				for i, c := range calls {
+					froms[i] = c.From
+				}
+				relations = codeindex.CallerRelations(sym.Key, locsFromCallHierarchyItems(wsRoot, froms), serverName, resolve)
+			} else {
+				calls, err := client.OutgoingCalls(ctx, lsp.CallHierarchyOutgoingCallsParams{Item: item})
+				if err != nil {
+					return fail(err)
+				}
+				tos := make([]lsp.CallHierarchyItem, len(calls))
+				for i, c := range calls {
+					tos[i] = c.To
+				}
+				relations = codeindex.CalleeRelations(sym.Key, locsFromCallHierarchyItems(wsRoot, tos), serverName, resolve)
+			}
+		}
+	}
+
+	if *resolveErr != nil {
+		return fail(*resolveErr)
+	}
+
+	runID, err := s.RecordIndexRun(sym.Path, gitRevision(wsRoot), sym.Language, serverName, serverVersion, codeModelID, time.Now())
+	if err != nil {
+		return fail(err)
+	}
+	if err := s.ReplaceRelations(runID, relations); err != nil {
+		return fail(err)
+	}
+
+	// The requested relation only, even though references/tests share one
+	// underlying LSP call and ReplaceRelations just saved both kinds.
+	wantKind := *relation
+	filtered := relations[:0:0]
+	for _, r := range relations {
+		if r.Kind == wantKind {
+			filtered = append(filtered, r)
+		}
+	}
+
+	if len(filtered) == 0 {
+		fmt.Fprintln(os.Stderr, "no results")
+		return 2
+	}
+
+	targets, err := expandTargets(s, filtered)
+	if err != nil {
+		return fail(err)
+	}
+	if err := formatCodeExpandTargets(os.Stdout, targets, *asJSON); err != nil {
 		return fail(err)
 	}
 	return 0

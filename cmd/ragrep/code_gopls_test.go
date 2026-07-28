@@ -52,12 +52,14 @@ func TestGoplsIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	src, err := os.ReadFile(filepath.Join("testdata", "code", "go", "sample.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "sample.go"), src, 0o644); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"sample.go", "sample_test.go"} {
+		src, err := os.ReadFile(filepath.Join("testdata", "code", "go", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, name), src, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module sample\n\ngo 1.21\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -126,6 +128,71 @@ func TestGoplsIntegration(t *testing.T) {
 	if !strings.Contains(getOut, "hello, ") {
 		t.Fatalf("code get --body output=%q, want the Greet method body", getOut)
 	}
+
+	// callers: SayHello calls Greet, so expanding Greet's callers must
+	// resolve to SayHello.
+	var callersCode int
+	callersOut := captureStdout(t, func() {
+		callersCode = run([]string{"code", "expand", "--db", db, "--symbol", greetKey, "--relation", "callers", "--json"})
+	})
+	if callersCode != 0 {
+		t.Fatalf("code expand --relation callers: exit=%d, output=%q", callersCode, callersOut)
+	}
+	callerTargets := decodeExpandTargets(t, callersOut)
+	if !anyExpandTargetMatches(callerTargets, func(tg codeExpandTarget) bool {
+		return tg.Resolved && strings.Contains(tg.QualifiedName, "SayHello")
+	}) {
+		t.Fatalf("code expand --relation callers output=%v, want a resolved target for SayHello", callerTargets)
+	}
+
+	// tests: TestGreet (in sample_test.go) references Greet, so that
+	// reference must be classified "tests", not "references" -- and expand
+	// with --relation tests must return it.
+	var testsCode int
+	testsOut := captureStdout(t, func() {
+		testsCode = run([]string{"code", "expand", "--db", db, "--symbol", greetKey, "--relation", "tests", "--json"})
+	})
+	if testsCode != 0 {
+		t.Fatalf("code expand --relation tests: exit=%d, output=%q", testsCode, testsOut)
+	}
+	testTargets := decodeExpandTargets(t, testsOut)
+	if !anyExpandTargetMatches(testTargets, func(tg codeExpandTarget) bool {
+		return strings.HasSuffix(tg.Path, "sample_test.go")
+	}) {
+		t.Fatalf("code expand --relation tests output=%v, want a target in sample_test.go", testTargets)
+	}
+
+	// definition: querying Greet's own declaration position must resolve
+	// back to an indexed symbol (never a fabricated key).
+	var defCode int
+	defOut := captureStdout(t, func() {
+		defCode = run([]string{"code", "expand", "--db", db, "--symbol", greetKey, "--relation", "definition", "--json"})
+	})
+	if defCode != 0 {
+		t.Fatalf("code expand --relation definition: exit=%d, output=%q", defCode, defOut)
+	}
+	defTargets := decodeExpandTargets(t, defOut)
+	if len(defTargets) == 0 {
+		t.Fatalf("code expand --relation definition returned no targets")
+	}
+}
+
+func decodeExpandTargets(t *testing.T, jsonOut string) []codeExpandTarget {
+	t.Helper()
+	var targets []codeExpandTarget
+	if err := json.Unmarshal([]byte(jsonOut), &targets); err != nil {
+		t.Fatalf("code expand --json output not valid JSON: %v (%q)", err, jsonOut)
+	}
+	return targets
+}
+
+func anyExpandTargetMatches(targets []codeExpandTarget, pred func(codeExpandTarget) bool) bool {
+	for _, tg := range targets {
+		if pred(tg) {
+			return true
+		}
+	}
+	return false
 }
 
 func assertIndexRunRecorded(t *testing.T, dbPath string) {

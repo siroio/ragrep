@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -313,7 +314,7 @@ func testSymbol() codeindex.Symbol {
 func TestFormatCodeSearchHits(t *testing.T) {
 	s := newTestCodeStore(t)
 	sym := testSymbol()
-	if _, err := s.UpsertSymbols(sym.Path, "filehash1", []codeindex.Symbol{sym}, fakeCodeEmbed); err != nil {
+	if _, err := s.UpsertSymbols(sym.Path, "filehash1", []codeindex.Symbol{sym}, 0, fakeCodeEmbed); err != nil {
 		t.Fatal(err)
 	}
 
@@ -483,6 +484,265 @@ func TestCmdIndexExcludesCodeExtensionsByDefault(t *testing.T) {
 	defer s.Close()
 	if _, err := s.GetDoc("main.go"); err == nil {
 		t.Fatal("main.go must not be in the document index by default")
+	}
+}
+
+// --- code expand ---
+
+func TestCmdCodeExpandUsageErrors(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "code.db")
+
+	if code := run([]string{"code", "expand", "--db", db, "--relation", "definition"}); code != 1 {
+		t.Fatalf("expand with no --symbol: exit=%d, want 1", code)
+	}
+	if code := run([]string{"code", "expand", "--db", db, "--symbol", "k"}); code != 1 {
+		t.Fatalf("expand with no --relation: exit=%d, want 1", code)
+	}
+	if code := run([]string{"code", "expand", "--db", db, "--symbol", "k", "--relation", "bogus"}); code != 1 {
+		t.Fatalf("expand with invalid --relation: exit=%d, want 1", code)
+	}
+	if code := run([]string{"code", "expand", "--db", db, "--symbol", "k", "--relation", "definition", "extra"}); code != 1 {
+		t.Fatalf("expand with extra positional arg: exit=%d, want 1", code)
+	}
+}
+
+func TestCmdCodeExpandNotFound(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "code.db")
+	s, err := codestore.Open(db, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+	code := run([]string{"code", "expand", "--db", db, "--symbol", "does-not-exist", "--relation", "definition"})
+	w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 2 {
+		t.Fatalf("expand missing symbol: exit=%d, want 2", code)
+	}
+	if !strings.Contains(buf.String(), "not found") {
+		t.Fatalf("stderr=%q, want not-found message", buf.String())
+	}
+}
+
+// expandTestSymbol inserts one indexed Go symbol directly (bypassing `code
+// index`, no language server needed) into root/.ragrep/code.db and returns
+// its stable key -- enough setup for expand tests that only care about
+// argument handling / server resolution up to (but not through) an actual
+// LSP query.
+func expandTestSymbol(t *testing.T, root string) (db, key string) {
+	t.Helper()
+	ragrepDir := filepath.Join(root, ".ragrep")
+	if err := os.MkdirAll(ragrepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db = filepath.Join(ragrepDir, "code.db")
+	s, err := codestore.Open(db, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	sym := codeindex.Symbol{
+		Key: "expand-target", Language: "go", Kind: "function",
+		Name: "main", QualifiedName: "main", Signature: "func main()",
+		Path: "main.go",
+		Range: codeindex.Range{
+			Start: codeindex.Position{Line: 2, Character: 0},
+			End:   codeindex.Position{Line: 2, Character: 14},
+		},
+		Body: "func main() {}",
+	}
+	sym.EmbeddingText = codeindex.RenderEmbeddingText(sym)
+	if _, err := s.UpsertSymbols(sym.Path, "hash1", []codeindex.Symbol{sym}, 0, fakeCodeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	return db, sym.Key
+}
+
+// An in-workspace symbol whose language has no registered server must fail
+// clearly, mirroring `code index`'s unregistered-server check -- and, same
+// as index, must never attempt to start anything.
+func TestCmdCodeExpandUnregisteredServer(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, key := expandTestSymbol(t, root)
+	// No .ragrep/config.json -- config.Load falls back to defaults, so no
+	// server is registered for "go".
+
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+	code := run([]string{"code", "expand", "--db", db, "--symbol", key, "--relation", "definition"})
+	w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 1 {
+		t.Fatalf("unregistered server: exit=%d, want 1", code)
+	}
+	if !strings.Contains(buf.String(), "no language server registered") {
+		t.Fatalf("stderr=%q, want unregistered-server message", buf.String())
+	}
+}
+
+// buildFakeLSPServerFromSrc compiles an arbitrary Go source into a
+// standalone executable in dir, the same way code_fakelsp_test.go's
+// buildFakeLSPServer does for its one fixed fakeLSPServerSrc -- duplicated
+// (rather than parameterizing that helper) since code_fakelsp_test.go is
+// out of scope for this task. Skips the test if the "go" toolchain isn't on
+// PATH.
+func buildFakeLSPServerFromSrc(t *testing.T, dir, name, src string) string {
+	t.Helper()
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go toolchain not on PATH; skipping fake-LSP-server test")
+	}
+
+	srcPath := filepath.Join(dir, name+".go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exePath := filepath.Join(dir, name+".exe")
+	cmd := exec.Command(goBin, "build", "-o", exePath, srcPath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("building fake LSP server %s: %v: %s", name, err, stderr.String())
+	}
+	return exePath
+}
+
+// fakeLSPServerAllCapsEmptySrc advertises every capability `code expand`
+// cares about and answers every request it drives (definition, references,
+// prepareCallHierarchy) with an empty result array -- for exercising the
+// "no results" path (as opposed to a capability-gate failure) without a
+// real language server.
+const fakeLSPServerAllCapsEmptySrc = `package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/textproto"
+	"os"
+	"strconv"
+)
+
+func main() {
+	tp := textproto.NewReader(bufio.NewReader(os.Stdin))
+	for {
+		hdr, err := tp.ReadMIMEHeader()
+		if err != nil {
+			return
+		}
+		n, err := strconv.Atoi(hdr.Get("Content-Length"))
+		if err != nil {
+			return
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(tp.R, body); err != nil {
+			return
+		}
+		var msg map[string]json.RawMessage
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return
+		}
+		idRaw, hasID := msg["id"]
+		if !hasID {
+			continue
+		}
+		var method string
+		if m, ok := msg["method"]; ok {
+			json.Unmarshal(m, &method)
+		}
+		result := "null"
+		switch method {
+		case "initialize":
+			result = ` + "`" + `{"capabilities":{"definitionProvider":true,"referencesProvider":true,"callHierarchyProvider":true}}` + "`" + `
+		case "textDocument/definition", "textDocument/references", "textDocument/prepareCallHierarchy":
+			result = "[]"
+		}
+		resp := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}", string(idRaw), result)
+		fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(resp), resp)
+	}
+}
+`
+
+// The server capability gate: a server that doesn't advertise the feature
+// `--relation` needs must be reported distinctly from a query that ran and
+// simply found nothing (see TestCmdCodeExpandNoResults) -- checked here
+// against a real (if minimal) LSP-speaking subprocess that only advertises
+// definitionProvider, requesting --relation callers (needs call hierarchy).
+func TestCmdCodeExpandCapabilityGate(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, key := expandTestSymbol(t, root)
+	exePath := buildFakeLSPServer(t, root)
+	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(exePath)+`"}}`)
+
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+	code := run([]string{"code", "expand", "--db", db, "--symbol", key, "--relation", "callers"})
+	w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 1 {
+		t.Fatalf("capability gate: exit=%d, want 1, stderr=%q", code, buf.String())
+	}
+	if !strings.Contains(buf.String(), "not supported by server") {
+		t.Fatalf("stderr=%q, want a distinct not-supported message", buf.String())
+	}
+}
+
+// A capability the server DOES advertise, whose query simply returns no
+// locations, must be reported differently from the capability gate above
+// (exit code and message both differ) -- proving expand distinguishes
+// "can't ask" from "asked, got nothing".
+func TestCmdCodeExpandNoResults(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, key := expandTestSymbol(t, root)
+	exePath := buildFakeLSPServerFromSrc(t, root, "fakelsp-allcaps-empty", fakeLSPServerAllCapsEmptySrc)
+	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(exePath)+`"}}`)
+
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+	code := run([]string{"code", "expand", "--db", db, "--symbol", key, "--relation", "references"})
+	w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+
+	if code != 2 {
+		t.Fatalf("no results: exit=%d, want 2, stderr=%q", code, buf.String())
+	}
+	if !strings.Contains(buf.String(), "no results") {
+		t.Fatalf("stderr=%q, want a no-results message", buf.String())
+	}
+	if strings.Contains(buf.String(), "not supported") {
+		t.Fatalf("stderr=%q, no-results must not read like a capability failure", buf.String())
 	}
 }
 
