@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -58,6 +59,17 @@ func dbFlag(fs *flag.FlagSet) *string {
 	return fs.String("db", filepath.Join(".rag", "index.db"), "index database path")
 }
 
+// newFlagSet builds a FlagSet that reports parse errors to the caller
+// (ContinueOnError) instead of exiting the process with flag's own exit code
+// 2 — that code collides with this CLI's "no hits / not found" contract.
+// Output is discarded because fail(err) below prints the message instead,
+// so a bad flag doesn't get printed twice.
+func newFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	return fs
+}
+
 func openStoreAt(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -66,9 +78,11 @@ func openStoreAt(path string) (*Store, error) {
 }
 
 func cmdInit(args []string) int {
-	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	fs := newFlagSet("init")
 	db := dbFlag(fs)
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fail(err)
+	}
 	dir, err := cacheDir()
 	if err != nil {
 		return fail(err)
@@ -105,9 +119,11 @@ func isTextFile(path string) bool {
 const maxFileSize = 10 << 20 // 10MB
 
 func cmdIndex(args []string) int {
-	fset := flag.NewFlagSet("index", flag.ExitOnError)
+	fset := newFlagSet("index")
 	db := dbFlag(fset)
-	fset.Parse(args)
+	if err := fset.Parse(args); err != nil {
+		return fail(err)
+	}
 	if fset.NArg() == 0 {
 		return fail(fmt.Errorf("usage: rag index <path>..."))
 	}
@@ -168,12 +184,14 @@ func cmdIndex(args []string) int {
 }
 
 func cmdSearch(args []string) int {
-	fs := flag.NewFlagSet("search", flag.ExitOnError)
+	fs := newFlagSet("search")
 	db := dbFlag(fs)
 	mode := fs.String("mode", "hybrid", "hybrid|vector|text")
 	k := fs.Int("k", 10, "max results")
 	asJSON := fs.Bool("json", false, "JSON output")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fail(err)
+	}
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: rag search <query>"))
 	}
@@ -229,16 +247,21 @@ func cmdSearch(args []string) int {
 }
 
 func cmdGet(args []string) int {
-	fs := flag.NewFlagSet("get", flag.ExitOnError)
+	fs := newFlagSet("get")
 	db := dbFlag(fs)
 	para := fs.Int("para", -1, "paragraph number (from search results)")
 	context := fs.Int("context", 0, "±N paragraphs around --para")
 	lines := fs.String("lines", "", "line range A-B")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fail(err)
+	}
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: rag get <path>"))
 	}
-	path := fs.Arg(0)
+	// Normalize like cmdIndex's filepath.ToSlash(path) at index time, so a
+	// Windows-style "docs\auth.md" argument still matches the "docs/auth.md"
+	// key stored in the DB.
+	path := filepath.ToSlash(fs.Arg(0))
 
 	s, err := openStoreAt(*db)
 	if err != nil {

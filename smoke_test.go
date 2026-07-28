@@ -45,4 +45,19 @@ func TestSmoke(t *testing.T) {
 	if code := run([]string{"get", "--db", db, "docs/missing.md"}); code != 2 {
 		t.Fatalf("get missing exit=%d, want 2", code)
 	}
+	// Windows-style separators in the get path arg must still resolve to the
+	// "docs/auth.md" key stored (with ToSlash) at index time.
+	if code := run([]string{"get", "--db", db, `docs\auth.md`}); code != 0 {
+		t.Fatalf("get backslash-path exit=%d, want 0", code)
+	}
+}
+
+// A malformed flag must fail with exit 1 (this CLI's generic error code), not
+// flag package's own exit 2 -- which would collide with the "no hits / not
+// found" contract. Doesn't need the model: flag parsing fails before the
+// embedder or DB are ever touched.
+func TestUnknownFlagExitsOne(t *testing.T) {
+	if code := run([]string{"search", "--bogusflag", "x"}); code != 1 {
+		t.Fatalf("unknown flag exit=%d, want 1", code)
+	}
 }
