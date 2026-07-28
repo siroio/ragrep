@@ -5,8 +5,12 @@
 
 - 埋め込みモデル: embeddinggemma-300m（quantized ONNX, 768次元）
 - インデックス: SQLite（デフォルトはcwdから親方向に最も近い `.ragrep/index.db` を自動発見。
-  `--db PATH` か環境変数 `RAGREP_DB` で明示指定でき、ワークスペース共有や切り替えに使える。
+  `--db PATH` か環境変数 `RAGREP_DB` で明示指定でき、ワークスペース切り替えに使える。
   優先順位: `--db` > `RAGREP_DB` > 祖先の `.ragrep/index.db` > cwd の `.ragrep/index.db`）
+  ワークスペースルートはDBパスから決まる（親ディレクトリ名が `.ragrep` ならその親、
+  それ以外はDBファイル自身のあるディレクトリ）ため、`RAGREP_DB` /`--db` で切り替え先の
+  ワークスペース自身の `.ragrep/index.db` を指す分には問題ないが、ワークスペース外の
+  共有場所を指すDBパスを使うと索引対象がルート外と判定され失敗する。
 - 対応プラットフォーム: windows/amd64, windows/arm64, linux/amd64, darwin/arm64
 
 ## Install / Build

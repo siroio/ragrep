@@ -103,6 +103,8 @@ ragrep search --tag design "query"
 - **Exit codes** follow the same contract as the rest of ragrep: 0 = success,
   1 = error (includes refusing to overwrite an existing file on `add`),
   2 = no hits / not found (`search`/`get`).
+- Paths outside the workspace root (the directory containing `.ragrep/`)
+  cannot be added or indexed — error, exit 1.
 
 ## Common Mistakes
 

@@ -34,7 +34,7 @@ ragrep index --prune docs/   # also drop deleted files from the index
 | Paragraph ± N context | `ragrep get --para 4 --context 2 docs/auth.md` |
 | Line range | `ragrep get --lines 12-18 docs/auth.md` |
 | Whole document | `ragrep get docs/auth.md` |
-| Alternate index | `--db PATH` or env `RAGREP_DB` (default `.ragrep/index.db`) |
+| Alternate index | `--db PATH` or env `RAGREP_DB` (default `.ragrep/index.db`); root derives from this path (parent named `.ragrep` → its parent, else the db file's own directory), so it must point at the workspace root or under `<ws>/.ragrep/`, not an external shared location |
 
 `-k N` limits results (default 10, all modes). `search --json` prints a JSON
 array of `{doc, para, lines, score, snippet}`. `--json` exists only on
