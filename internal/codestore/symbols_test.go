@@ -634,6 +634,145 @@ func TestSymbolAtResolvesEnclosingSymbol(t *testing.T) {
 	}
 }
 
+// --- LatestIndexRun: the read counterpart to RecordIndexRun, for a caller
+// (cmd/ragrep's `code pack`) that needs the index's current identity
+// without tracking a specific run id itself ---
+
+func TestLatestIndexRunReturnsErrNotFoundWhenEmpty(t *testing.T) {
+	s := openTestStore(t, 3)
+	_, err := s.LatestIndexRun()
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LatestIndexRun on empty index_runs: err=%v, want ErrNotFound", err)
+	}
+}
+
+func TestLatestIndexRunReturnsMostRecentRow(t *testing.T) {
+	s := openTestStore(t, 3)
+
+	when := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	if _, err := s.RecordIndexRun("pkg1", "rev1", "go", "gopls", "v1.0.0", "test-model", when); err != nil {
+		t.Fatalf("first RecordIndexRun: %v", err)
+	}
+	id2, err := s.RecordIndexRun("pkg2", "rev2", "go", "gopls", "v2.0.0", "test-model", when.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("second RecordIndexRun: %v", err)
+	}
+
+	run, err := s.LatestIndexRun()
+	if err != nil {
+		t.Fatalf("LatestIndexRun: %v", err)
+	}
+	if run.ID != id2 || run.Scope != "pkg2" || run.Revision != "rev2" || run.ServerVersion != "v2.0.0" {
+		t.Fatalf("LatestIndexRun = %+v, want the most recently recorded run (id=%d, scope=pkg2, rev2, v2.0.0)", run, id2)
+	}
+}
+
+// --- FindByQualifiedName: coderetrieval.SymbolFinder's store-backed
+// implementation, for re-resolving a manifest entry whose stable key no
+// longer exists ---
+
+func TestFindByQualifiedNameMatchesOnQualifiedNameAndPath(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	k1 := sym("k1", "ParseConfig", "ParseConfig", "", "func ParseConfig() {}")
+	fe.register(k1, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	matches, err := s.FindByQualifiedName("ParseConfig", "pkg/file.go")
+	if err != nil {
+		t.Fatalf("FindByQualifiedName: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Key != "k1" {
+		t.Fatalf("FindByQualifiedName(ParseConfig, pkg/file.go) = %+v, want single match k1", matches)
+	}
+
+	// Same qualified name, different path: must not match.
+	none, err := s.FindByQualifiedName("ParseConfig", "other/file.go")
+	if err != nil {
+		t.Fatalf("FindByQualifiedName (wrong path): %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("FindByQualifiedName with wrong path = %+v, want no matches", none)
+	}
+}
+
+// --- RelationsFrom: read counterpart to ReplaceRelations, satisfying
+// coderetrieval.RelationGetter for `code pack`'s 1-hop relation staging ---
+
+func TestRelationsFromReturnsOnlyFromKeysEdges(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	k1 := sym("k1", "Target", "Target", "", "func Target() {}")
+	k2 := sym("k2", "Other", "Other", "", "func Other() {}")
+	fe.register(k1, []float32{1, 0, 0})
+	fe.register(k2, []float32{0, 1, 0})
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1, k2}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	if err := s.ReplaceRelations(1, "k1", []string{"calls"}, []codeindex.Relation{
+		{FromKey: "k1", ToKey: "k2", Kind: "calls", Source: "static"},
+	}); err != nil {
+		t.Fatalf("ReplaceRelations: %v", err)
+	}
+	if err := s.ReplaceRelations(1, "k2", []string{"calls"}, []codeindex.Relation{
+		{FromKey: "k2", ToKey: "k1", Kind: "calls", Source: "static"},
+	}); err != nil {
+		t.Fatalf("ReplaceRelations (k2): %v", err)
+	}
+
+	got, err := s.RelationsFrom("k1")
+	if err != nil {
+		t.Fatalf("RelationsFrom: %v", err)
+	}
+	if len(got) != 1 || got[0].ToKey != "k2" || got[0].Kind != "calls" {
+		t.Fatalf("RelationsFrom(k1) = %+v, want one relation k1->k2", got)
+	}
+
+	none, err := s.RelationsFrom("does-not-exist")
+	if err != nil {
+		t.Fatalf("RelationsFrom (missing key): %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("RelationsFrom(does-not-exist) = %+v, want empty", none)
+	}
+}
+
+// --- SymbolFileHash: the file_hash recorded for a symbol's row, for
+// building a coderetrieval.SymbolRef without re-reading the file from disk
+// ---
+
+func TestSymbolFileHashReturnsStoredHash(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	k1 := sym("k1", "ParseConfig", "ParseConfig", "", "func ParseConfig() {}")
+	fe.register(k1, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-xyz", []codeindex.Symbol{k1}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	hash, err := s.SymbolFileHash("k1")
+	if err != nil {
+		t.Fatalf("SymbolFileHash: %v", err)
+	}
+	if hash != "filehash-xyz" {
+		t.Fatalf("SymbolFileHash(k1) = %q, want %q", hash, "filehash-xyz")
+	}
+}
+
+func TestSymbolFileHashNotFound(t *testing.T) {
+	s := openTestStore(t, 3)
+	_, err := s.SymbolFileHash("does-not-exist")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SymbolFileHash on missing key: err=%v, want ErrNotFound", err)
+	}
+}
+
 // SymbolAt must pick the innermost (smallest-span) enclosing symbol when
 // ranges overlap, not just any match -- otherwise a reference inside a
 // method would resolve to a loosely-overlapping outer symbol instead of the

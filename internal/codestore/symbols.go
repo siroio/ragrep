@@ -350,6 +350,108 @@ func (s *Store) RecordIndexRun(scope, revision, language, serverName, serverVers
 	return res.LastInsertId()
 }
 
+// IndexRun is one recorded index_runs row (see RecordIndexRun).
+type IndexRun struct {
+	ID            int64
+	Scope         string
+	Revision      string
+	Language      string
+	ServerName    string
+	ServerVersion string
+	ModelID       string
+	CreatedAt     string
+}
+
+// LatestIndexRun returns the most recently recorded index_runs row (highest
+// id), for a caller that needs the index's current identity
+// (revision/server/model -- e.g. `code pack`'s manifest header) without
+// tracking a specific run id of its own. ErrNotFound when no run has been
+// recorded yet.
+func (s *Store) LatestIndexRun() (IndexRun, error) {
+	var r IndexRun
+	err := s.db.QueryRow(`
+		SELECT id, scope, revision, language, server_name, server_version, model_id, created_at
+		FROM index_runs ORDER BY id DESC LIMIT 1`).Scan(
+		&r.ID, &r.Scope, &r.Revision, &r.Language, &r.ServerName, &r.ServerVersion, &r.ModelID, &r.CreatedAt)
+	if err == sql.ErrNoRows {
+		return IndexRun{}, ErrNotFound
+	}
+	if err != nil {
+		return IndexRun{}, err
+	}
+	return r, nil
+}
+
+// FindByQualifiedName returns every stored symbol at path whose
+// qualified_name exactly matches qualifiedName -- the store-backed
+// implementation of coderetrieval.SymbolFinder, used to re-resolve a
+// manifest entry whose stable key no longer exists (see
+// coderetrieval.ResolveRef).
+func (s *Store) FindByQualifiedName(qualifiedName, path string) ([]codeindex.Symbol, error) {
+	rows, err := s.db.Query(`
+		SELECT key, language, kind, name, qualified_name, signature, documentation, container,
+			path, start_line, start_character, end_line, end_character, body, body_hash
+		FROM symbols WHERE qualified_name=? AND path=?`, qualifiedName, path)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []codeindex.Symbol
+	for rows.Next() {
+		var sym codeindex.Symbol
+		if err := rows.Scan(&sym.Key, &sym.Language, &sym.Kind, &sym.Name, &sym.QualifiedName, &sym.Signature, &sym.Documentation, &sym.Container,
+			&sym.Path, &sym.Range.Start.Line, &sym.Range.Start.Character, &sym.Range.End.Line, &sym.Range.End.Character,
+			&sym.Body, &sym.BodyHash); err != nil {
+			return nil, err
+		}
+		sym.EmbeddingText = codeindex.RenderEmbeddingText(sym)
+		out = append(out, sym)
+	}
+	return out, rows.Err()
+}
+
+// RelationsFrom returns every stored symbol_edges row originating at
+// fromKey (one hop) -- the read counterpart to ReplaceRelations, satisfying
+// coderetrieval.RelationGetter when assembling a context pack (`code
+// pack`). ToPath/ToPosition are always zero on the returned values:
+// symbol_edges only ever persists edges that already resolved to an
+// indexed ToKey (see codeindex.Relation's own doc comment on those fields).
+func (s *Store) RelationsFrom(fromKey string) ([]codeindex.Relation, error) {
+	rows, err := s.db.Query(`SELECT from_key, to_key, kind, source FROM symbol_edges WHERE from_key=?`, fromKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []codeindex.Relation
+	for rows.Next() {
+		var r codeindex.Relation
+		if err := rows.Scan(&r.FromKey, &r.ToKey, &r.Kind, &r.Source); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SymbolFileHash returns the file_hash recorded for key's symbol row -- the
+// hash of the file's content as of the index run that last wrote this row,
+// the same content the row's Body reflects. Building a
+// coderetrieval.SymbolRef from this (rather than re-reading and re-hashing
+// the file from disk) keeps a manifest's recorded hash consistent with what
+// the store actually served, even if the file has since changed again on
+// disk without being reindexed. ErrNotFound when key isn't indexed,
+// mirroring GetSymbol.
+func (s *Store) SymbolFileHash(key string) (string, error) {
+	var hash string
+	err := s.db.QueryRow(`SELECT file_hash FROM symbols WHERE key=?`, key).Scan(&hash)
+	if err == sql.ErrNoRows {
+		return "", ErrNotFound
+	}
+	return hash, err
+}
+
 // SymbolAt returns the key of the indexed symbol at path whose Range
 // contains line (start_line <= line <= end_line) -- the resolution
 // primitive codeindex.Resolver needs to turn an LSP location into a stable
