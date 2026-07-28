@@ -1,0 +1,92 @@
+package main
+
+import (
+	"path/filepath"
+	"testing"
+)
+
+// fakeEmbed returns a fixed-dimension deterministic vector (no ONNX needed).
+func fakeEmbed(text string) ([]float32, error) {
+	v := make([]float32, 384)
+	for i, r := range text {
+		v[i%384] += float32(r % 13)
+	}
+	return v, nil
+}
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	s, err := openStore(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func TestUpsertAndTextSearch(t *testing.T) {
+	s := newTestStore(t)
+	content := "認証エラーの一覧。\nERR_AUTH_104 はトークン期限切れ。\n\nネットワーク設定について。"
+	changed, err := s.UpsertDoc("docs/auth.md", content, 100, fakeEmbed)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+
+	// Same content again -> no change
+	changed, err = s.UpsertDoc("docs/auth.md", content, 200, fakeEmbed)
+	if err != nil || changed {
+		t.Fatalf("re-upsert: changed=%v err=%v", changed, err)
+	}
+
+	hits, err := s.SearchText("ERR_AUTH_104", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Doc != "docs/auth.md" || hits[0].Para != 0 || hits[0].Lines != "1-2" {
+		t.Fatalf("unexpected hits: %+v", hits)
+	}
+
+	// Updated content replaces old paragraphs
+	_, err = s.UpsertDoc("docs/auth.md", "全部書き換えた。", 300, fakeEmbed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits, _ = s.SearchText("ERR_AUTH_104", 10)
+	if len(hits) != 0 {
+		t.Fatalf("stale hits after update: %+v", hits)
+	}
+}
+
+func TestGet(t *testing.T) {
+	s := newTestStore(t)
+	content := "p0\n\np1\n\np2\n\np3"
+	if _, err := s.UpsertDoc("a.txt", content, 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := s.GetDoc("a.txt")
+	if err != nil || doc != content {
+		t.Fatalf("GetDoc: %q err=%v", doc, err)
+	}
+	if _, err := s.GetDoc("missing.txt"); err != errNotFound {
+		t.Fatalf("want errNotFound, got %v", err)
+	}
+
+	got, err := s.GetParas("a.txt", 1, 0)
+	if err != nil || got != "p1" {
+		t.Fatalf("GetParas(1,0)=%q err=%v", got, err)
+	}
+	// context expansion: ±1 paragraph, joined with blank line
+	got, err = s.GetParas("a.txt", 1, 1)
+	if err != nil || got != "p0\n\np1\n\np2" {
+		t.Fatalf("GetParas(1,1)=%q err=%v", got, err)
+	}
+	// context clamps at document edges
+	got, err = s.GetParas("a.txt", 0, 5)
+	if err != nil || got != "p0\n\np1\n\np2\n\np3" {
+		t.Fatalf("GetParas(0,5)=%q err=%v", got, err)
+	}
+	if _, err := s.GetParas("a.txt", 99, 0); err != errNotFound {
+		t.Fatalf("want errNotFound, got %v", err)
+	}
+}
