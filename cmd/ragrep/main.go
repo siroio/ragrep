@@ -21,11 +21,11 @@ const usage = `ragrep - adaptive retrieval unit search CLI
 
 Usage:
   ragrep init                              create DB, download model assets
-  ragrep index <path>...                   index text files (recursive)
+  ragrep index <path>... [--prune] [--include-code]   index text files (recursive)
   ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--tag t]...
   ragrep get <path> [--para N] [--context N] [--lines A-B]
   ragrep add [--tag t]... <path>            (reads content from stdin)
-  ragrep code index|search|get ...         code symbol indexing/search (see 'ragrep code -h')
+  ragrep code index|search|get|expand|pack|verify ...  code symbol indexing/search (see 'ragrep code -h')
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
@@ -139,12 +139,20 @@ func newFlagSet(name string) *flag.FlagSet {
 // Any other parse error goes through fail(). handled is true when the caller
 // should return code immediately instead of continuing.
 func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
+	return parseArgsUsage(fs, args, usage)
+}
+
+// parseArgsUsage is parseArgs, printing usageText instead of the top-level
+// document-index usage on -h/--help -- cmd/ragrep's code.go uses this with
+// codeUsage so `ragrep code <sub> -h` prints the `code` subcommand help, not
+// the unrelated top-level one.
+func parseArgsUsage(fs *flag.FlagSet, args []string, usageText string) (code int, handled bool) {
 	err := fs.Parse(args)
 	if err == nil {
 		return 0, false
 	}
 	if err == flag.ErrHelp {
-		fmt.Fprint(os.Stderr, usage)
+		fmt.Fprint(os.Stderr, usageText)
 		return 0, true
 	}
 	return fail(err), true

@@ -39,6 +39,30 @@ func TestCmdCodeHelpExitsZero(t *testing.T) {
 	}
 }
 
+// `ragrep code <sub> -h` must print codeUsage (the `code` subcommand help),
+// not the top-level document-index usage -- a bare `-h` mid-subcommand used
+// to fall through to parseArgs' hardcoded top-level usage string.
+func TestCmdCodeSubcommandHelpPrintsCodeUsage(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "code.db")
+	for _, sub := range []string{"index", "search", "get", "expand", "pack", "verify"} {
+		r, w, _ := os.Pipe()
+		old := os.Stderr
+		os.Stderr = w
+		code := run([]string{"code", sub, "--db", db, "-h"})
+		w.Close()
+		os.Stderr = old
+		var buf bytes.Buffer
+		buf.ReadFrom(r)
+
+		if code != 0 {
+			t.Fatalf("code %s -h: exit=%d, want 0, stderr=%q", sub, code, buf.String())
+		}
+		if !strings.Contains(buf.String(), "uses code.db, never the document index.db") {
+			t.Fatalf("code %s -h stderr=%q, want codeUsage (not the top-level document-index usage)", sub, buf.String())
+		}
+	}
+}
+
 func TestCmdCodeIndexUsageErrors(t *testing.T) {
 	db := filepath.Join(t.TempDir(), ".ragrep", "code.db")
 
@@ -1232,6 +1256,9 @@ func TestCmdCodePackUsageErrors(t *testing.T) {
 		"--select", "a", "--select", "b", "--select", "c", "--select", "d"}); code != 1 {
 		t.Fatalf("pack with 4 --select keys: exit=%d, want 1", code)
 	}
+	if code := run([]string{"code", "pack", "--db", db, "--query", "q", "extra-positional-arg"}); code != 1 {
+		t.Fatalf("pack with a stray positional arg: exit=%d, want 1", code)
+	}
 }
 
 // runCodePack is `code pack`'s core logic minus the ONNX embedding call --
@@ -1338,6 +1365,11 @@ func TestCmdCodeVerifyUsageErrors(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "code.db")
 	if code := run([]string{"code", "verify", "--db", db}); code != 1 {
 		t.Fatalf("verify with no --manifest: exit=%d, want 1", code)
+	}
+	_, _, manifest := codeVerifyWorkspace(t)
+	manifestPath := writeManifestFile(t, manifest)
+	if code := run([]string{"code", "verify", "--db", db, "--manifest", manifestPath, "extra-positional-arg"}); code != 1 {
+		t.Fatalf("verify with a stray positional arg: exit=%d, want 1", code)
 	}
 }
 

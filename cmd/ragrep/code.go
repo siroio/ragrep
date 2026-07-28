@@ -295,7 +295,7 @@ func cmdCodeIndex(args []string) int {
 	fs := newFlagSet("code index")
 	db := codeDBFlag(fs)
 	language := fs.String("language", "", "language server registration key (e.g. go)")
-	if code, handled := parseArgs(fs, args); handled {
+	if code, handled := parseArgsUsage(fs, args, codeUsage); handled {
 		return code
 	}
 	if *language == "" || fs.NArg() == 0 {
@@ -506,7 +506,7 @@ func cmdCodeSearch(args []string) int {
 	db := codeDBFlag(fs)
 	k := fs.Int("k", 10, "max results")
 	asJSON := fs.Bool("json", false, "JSON output")
-	if code, handled := parseArgs(fs, args); handled {
+	if code, handled := parseArgsUsage(fs, args, codeUsage); handled {
 		return code
 	}
 	if fs.NArg() != 1 {
@@ -600,7 +600,7 @@ func cmdCodeGet(args []string) int {
 	symbolKey := fs.String("symbol", "", "stable symbol key (from `code search`)")
 	body := fs.Bool("body", false, "include the symbol's body text")
 	asJSON := fs.Bool("json", false, "JSON output")
-	if code, handled := parseArgs(fs, args); handled {
+	if code, handled := parseArgsUsage(fs, args, codeUsage); handled {
 		return code
 	}
 	if fs.NArg() != 0 || *symbolKey == "" {
@@ -864,7 +864,7 @@ func cmdCodeExpand(args []string) int {
 	symbolKey := fs.String("symbol", "", "stable symbol key (from `code search`)")
 	relation := fs.String("relation", "", "definition|references|callers|callees|tests")
 	asJSON := fs.Bool("json", false, "JSON output")
-	if code, handled := parseArgs(fs, args); handled {
+	if code, handled := parseArgsUsage(fs, args, codeUsage); handled {
 		return code
 	}
 	feature, validRelation := codeExpandFeature[*relation]
@@ -1140,10 +1140,10 @@ func cmdCodePack(args []string) int {
 	asJSON := fs.Bool("json", false, "JSON output")
 	var selected strFlags
 	fs.Var(&selected, "select", "symbol key to include the full body for (repeatable, 1-3)")
-	if code, handled := parseArgs(fs, args); handled {
+	if code, handled := parseArgsUsage(fs, args, codeUsage); handled {
 		return code
 	}
-	if *query == "" {
+	if *query == "" || fs.NArg() != 0 {
 		return fail(fmt.Errorf("usage: ragrep code pack --query <q> [--select KEY]... [--budget N] [--json]"))
 	}
 	if len(selected) > 3 {
@@ -1304,10 +1304,10 @@ func cmdCodeVerify(args []string) int {
 	db := codeDBFlag(fs)
 	manifestPath := fs.String("manifest", "", "manifest JSON file (from `code pack`)")
 	asJSON := fs.Bool("json", false, "JSON output")
-	if code, handled := parseArgs(fs, args); handled {
+	if code, handled := parseArgsUsage(fs, args, codeUsage); handled {
 		return code
 	}
-	if *manifestPath == "" {
+	if *manifestPath == "" || fs.NArg() != 0 {
 		return fail(fmt.Errorf("usage: ragrep code verify --manifest <file> [--json]"))
 	}
 
