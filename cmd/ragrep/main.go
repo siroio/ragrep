@@ -25,6 +25,7 @@ Usage:
   ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--tag t]...
   ragrep get <path> [--para N] [--context N] [--lines A-B]
   ragrep add [--tag t]... <path>            (reads content from stdin)
+  ragrep code index|search|get ...         code symbol indexing/search (see 'ragrep code -h')
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
@@ -72,6 +73,8 @@ func run(args []string) int {
 		return cmdGet(rest)
 	case "add":
 		return cmdAdd(rest)
+	case "code":
+		return cmdCode(rest)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return 1
@@ -241,6 +244,14 @@ func isTextFile(path string) bool {
 
 const maxFileSize = 10 << 20 // 10MB
 
+// codeExtensions are file extensions the document `index` command excludes
+// by default -- source code belongs in the code index (`ragrep code index`),
+// not the document index. --include-code disables this exclusion.
+var codeExtensions = map[string]bool{
+	".go": true, ".py": true, ".js": true, ".ts": true, ".java": true,
+	".c": true, ".cpp": true, ".h": true, ".rs": true,
+}
+
 // pruneDecision interprets an os.Stat error for --prune: a file that's gone
 // (fs.ErrNotExist) should be pruned; any other stat error (permission
 // denied, transient I/O, AV lock, ...) must abort the run rather than be
@@ -259,6 +270,7 @@ func cmdIndex(args []string) int {
 	fset := newFlagSet("index")
 	db := dbFlag(fset)
 	prune := fset.Bool("prune", false, "remove indexed docs under the given roots that no longer exist on disk")
+	includeCode := fset.Bool("include-code", false, "don't exclude common source code extensions (.go, .py, ...) from the document index")
 	if code, handled := parseArgs(fset, args); handled {
 		return code
 	}
@@ -298,7 +310,7 @@ func cmdIndex(args []string) int {
 	}
 	defer e.Close()
 
-	indexed, skipped := 0, 0
+	indexed, skipped, excluded := 0, 0, 0
 	for _, root := range fset.Args() {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -309,6 +321,10 @@ func cmdIndex(args []string) int {
 				if strings.HasPrefix(name, ".") && path != root {
 					return filepath.SkipDir
 				}
+				return nil
+			}
+			if !*includeCode && codeExtensions[strings.ToLower(filepath.Ext(name))] {
+				excluded++
 				return nil
 			}
 			info, err := d.Info()
@@ -370,9 +386,9 @@ func cmdIndex(args []string) int {
 			fmt.Println("pruned", p)
 			pruned++
 		}
-		fmt.Printf("done: %d indexed, %d skipped, %d pruned\n", indexed, skipped, pruned)
+		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code), %d pruned\n", indexed, skipped, excluded, pruned)
 	} else {
-		fmt.Printf("done: %d indexed, %d skipped\n", indexed, skipped)
+		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code)\n", indexed, skipped, excluded)
 	}
 	return 0
 }
