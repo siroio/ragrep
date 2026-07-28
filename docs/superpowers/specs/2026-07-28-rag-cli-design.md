@@ -24,9 +24,9 @@ Planner（取得単位の判断）と回答生成は呼び出し側のLLMエー�
 | 言語 | Go 1.23+ | シングルバイナリ配布・クロスコンパイル容易 |
 | SQLite | `github.com/ncruces/go-sqlite3` | Pure Go（WASM/wazero）でCGo不要。FTS5同梱 |
 | ベクトル検索 | `sqlite-vec`（`github.com/asg017/sqlite-vec-go-bindings/ncruces`） | FTS5と同一DBファイルに同居。専用ベクトルDB不要 |
-| 埋め込み推論 | ONNX Runtime（`github.com/yalue/onnxruntime_go`） | onnxruntime.dllを`go:embed`し初回起動時にキャッシュへ展開。配布は実質1ファイル |
-| 埋め込みモデル | `intfloat/multilingual-e5-small`（ONNX, 384次元） | 日本語対応・約100MB。初回`init`時にHugging FaceからDLしキャッシュ |
-| トークナイザ | モデル同梱の`tokenizer.json`をGoで読み込み | 実装時にPure Go実装を検証。不可ならCGoフォールバック |
+| 埋め込み推論 | ONNX Runtime（`github.com/yalue/onnxruntime_go`） | 共有ライブラリは`rag init`時にGitHub ReleasesからDLしキャッシュ（go:embed不要でビルド単純化）。配布は単一バイナリ |
+| 埋め込みモデル | `multilingual-e5-small`（quantized ONNX, 384次元） | 日本語対応・約120MB。初回`init`時にHugging FaceからDLしキャッシュ |
+| トークナイザ | `github.com/eliben/go-sentencepiece`（Pure Go） | XLM-Rの`sentencepiece.bpe.model`を読み込み、fairseqオフセット(+1)でHF語彙IDへ変換 |
 | CLI | 標準ライブラリ`flag` + サブコマンド分岐 | cobra等は不使用（YAGNI） |
 | 日本語全文検索 | FTS5 trigramトークナイザ | 形態素解析なしで日本語部分一致が可能 |
 
@@ -59,12 +59,13 @@ CREATE TABLE paragraphs (
   text       TEXT NOT NULL
 );
 
-CREATE VIRTUAL TABLE fts USING fts5(text, content=paragraphs, content_rowid=id, tokenize='trigram');
-CREATE VIRTUAL TABLE vec USING vec0(embedding float[384]);  -- rowid = paragraphs.id
+-- fts/vec とも rowid = paragraphs.id
+CREATE VIRTUAL TABLE fts USING fts5(text, tokenize='trigram');
+CREATE VIRTUAL TABLE vec USING vec0(embedding float[384]);
 ```
 
-埋め込み・FTSのインデックス単位は段落。長すぎる段落（>512トークン相当）は
-埋め込み時のみ内部分割し、最大スコアを採用する（保存は原文のまま）。
+埋め込み・FTSのインデックス単位は段落。長すぎる段落は埋め込み時に510トークンで
+切り詰める（FTSは全文を保持するためハイブリッド検索で後半もヒットする）。
 
 ## コマンド仕様
 
