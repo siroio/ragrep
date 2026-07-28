@@ -129,7 +129,7 @@ func TestUpsertSymbolsRemovesOrphanRowsAcrossAllIndexes(t *testing.T) {
 		t.Fatalf("lookup k1 id: %v", err)
 	}
 
-	if err := s.ReplaceRelations(1, []codeindex.Relation{
+	if err := s.ReplaceRelations(1, "k1", []string{"calls"}, []codeindex.Relation{
 		{FromKey: "k1", ToKey: "k2", Kind: "calls", Source: "static"},
 	}); err != nil {
 		t.Fatalf("ReplaceRelations: %v", err)
@@ -434,52 +434,84 @@ func TestGetSymbolReturnsErrNotFound(t *testing.T) {
 	}
 }
 
-func TestReplaceRelationsReplacesOnlyMatchingFromKeys(t *testing.T) {
+// ReplaceRelations must scope its delete to (fromKey, kind), not just
+// fromKey: this is what makes repeated `code expand` calls for the same
+// symbol but different relations accumulate a relation graph instead of
+// each call wiping out every other kind the symbol had saved. Mirrors the
+// coordinator-requested regression scenario directly: a references expand
+// (saving both "references" and "tests" -- they share one LSP query, see
+// codeindex.ReferenceRelations) followed by a callers expand must leave the
+// references/tests edges intact; a later references expand that now finds
+// nothing must still clear the old references/tests edges (kinds are
+// passed explicitly, not inferred from an empty batch) without touching
+// callers, or another symbol's edges.
+func TestReplaceRelationsScopesDeleteToFromKeyAndKinds(t *testing.T) {
 	s := openTestStore(t, 3)
 	fe := newFakeEmbedder(t)
 
-	k1 := sym("k1", "CallerOne", "CallerOne", "", "func CallerOne() {}")
-	k2 := sym("k2", "CallerTwo", "CallerTwo", "", "func CallerTwo() {}")
+	k1 := sym("k1", "Target", "Target", "", "func Target() {}")
+	k2 := sym("k2", "Other", "Other", "", "func Other() {}")
+	k3 := sym("k3", "Third", "Third", "", "func Third() {}")
 	fe.register(k1, []float32{1, 0, 0})
 	fe.register(k2, []float32{0, 1, 0})
-	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1, k2}, 0, fe.embed); err != nil {
+	fe.register(k3, []float32{0, 0, 1})
+	if _, err := s.UpsertSymbols("pkg/file.go", "filehash-1", []codeindex.Symbol{k1, k2, k3}, 0, fe.embed); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	if err := s.ReplaceRelations(1, []codeindex.Relation{
-		{FromKey: "k1", ToKey: "k2", Kind: "calls", Source: "static"},
-		{FromKey: "k2", ToKey: "k1", Kind: "calls", Source: "static"},
+	// A references expand: saves both "references" and "tests" as one
+	// group.
+	if err := s.ReplaceRelations(1, "k1", []string{"references", "tests"}, []codeindex.Relation{
+		{FromKey: "k1", ToKey: "k2", Kind: "references", Source: "gopls"},
+		{FromKey: "k1", ToKey: "k3", Kind: "tests", Source: "gopls"},
 	}); err != nil {
-		t.Fatalf("first ReplaceRelations: %v", err)
+		t.Fatalf("references expand: %v", err)
+	}
+	// An unrelated symbol's edge, to prove from_key scoping still holds
+	// throughout.
+	if err := s.ReplaceRelations(1, "k2", []string{"references", "tests"}, []codeindex.Relation{
+		{FromKey: "k2", ToKey: "k1", Kind: "references", Source: "gopls"},
+	}); err != nil {
+		t.Fatalf("k2 references expand: %v", err)
 	}
 
-	// Replace only k1's edges with a different target; k2's edge (from_key
-	// not mentioned here) must survive untouched.
-	if err := s.ReplaceRelations(2, []codeindex.Relation{
-		{FromKey: "k1", ToKey: "k2", Kind: "imports", Source: "static"},
+	// A callers expand for the same symbol (k1): must not touch k1's
+	// references/tests edges saved above, since "callers" is a disjoint
+	// kind group.
+	if err := s.ReplaceRelations(2, "k1", []string{"callers"}, []codeindex.Relation{
+		{FromKey: "k1", ToKey: "k3", Kind: "callers", Source: "gopls"},
 	}); err != nil {
-		t.Fatalf("second ReplaceRelations: %v", err)
+		t.Fatalf("callers expand: %v", err)
 	}
 
-	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM symbol_edges WHERE from_key='k1' AND kind='calls'`).Scan(&n); err != nil {
-		t.Fatal(err)
+	assertEdgeCount := func(fromKey, kind string, want int) {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM symbol_edges WHERE from_key=? AND kind=?`, fromKey, kind).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Errorf("symbol_edges(from_key=%q, kind=%q) count = %d, want %d", fromKey, kind, n, want)
+		}
 	}
-	if n != 0 {
-		t.Errorf("old k1 'calls' edge still present after replace")
+
+	assertEdgeCount("k1", "references", 1)
+	assertEdgeCount("k1", "tests", 1)
+	assertEdgeCount("k1", "callers", 1)
+	assertEdgeCount("k2", "references", 1) // untouched by k1's callers expand
+
+	// A later references expand for k1 that now finds nothing (e.g. the
+	// reference was deleted from source) must still clear the stale
+	// references/tests edges -- kinds is passed explicitly, so an empty
+	// relations slice still deletes -- and must leave k1's callers edge and
+	// k2's edge alone.
+	if err := s.ReplaceRelations(3, "k1", []string{"references", "tests"}, nil); err != nil {
+		t.Fatalf("empty references re-expand: %v", err)
 	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM symbol_edges WHERE from_key='k1' AND kind='imports'`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Errorf("new k1 'imports' edge missing")
-	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM symbol_edges WHERE from_key='k2'`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Errorf("untouched k2 edge was removed, want it to survive (from_key not mentioned in second call)")
-	}
+	assertEdgeCount("k1", "references", 0)
+	assertEdgeCount("k1", "tests", 0)
+	assertEdgeCount("k1", "callers", 1)
+	assertEdgeCount("k2", "references", 1)
 }
 
 // --- RecordIndexRun: the sole write path for index_runs (replaces the

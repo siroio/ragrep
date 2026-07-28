@@ -64,6 +64,14 @@ func ReferenceRelations(fromKey string, locs []Loc, source string, resolve Resol
 // CallerRelations converts callHierarchy/incomingCalls results -- already
 // reduced by the caller to each call's "from" location, one hop only, no
 // further traversal -- into "callers" relations.
+//
+// Deliberately does NOT reclassify a _test.go caller as "tests" the way
+// ReferenceRelations does: the spec's tests-relation wording is specific to
+// references ("a reference found in a _test.go file"), not to callers/
+// callees in general -- a test file calling a function is already fully
+// described by "callers", and folding it into "tests" too would blur two
+// different questions ("what exercises this" vs. "what calls this"). Don't
+// "fix" this to match ReferenceRelations; it's intentional.
 func CallerRelations(fromKey string, callers []Loc, source string, resolve Resolver) []Relation {
 	out := make([]Relation, 0, len(callers))
 	for _, loc := range callers {
@@ -75,6 +83,10 @@ func CallerRelations(fromKey string, callers []Loc, source string, resolve Resol
 // CalleeRelations converts callHierarchy/outgoingCalls results -- already
 // reduced by the caller to each call's "to" location, one hop only, no
 // further traversal -- into "callees" relations.
+//
+// Same deliberate asymmetry as CallerRelations: a callee in a _test.go file
+// (e.g. a helper only test code calls) stays "callees", never reclassified
+// to "tests" -- see CallerRelations' doc comment.
 func CalleeRelations(fromKey string, callees []Loc, source string, resolve Resolver) []Relation {
 	out := make([]Relation, 0, len(callees))
 	for _, loc := range callees {

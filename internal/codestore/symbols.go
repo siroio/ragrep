@@ -275,37 +275,49 @@ func (s *Store) GetSymbol(key string) (codeindex.Symbol, error) {
 	return sym, nil
 }
 
-// ReplaceRelations replaces the edges originating from every from_key
-// mentioned in relations: all existing symbol_edges rows with a matching
-// from_key are deleted first, then every relation is inserted. Edges whose
-// from_key isn't mentioned in relations are left untouched — this is a
-// "replace this key's outgoing edges" operation, not "replace this run's
-// edges" or "replace all edges", so a caller that wants to clear a symbol's
-// edges entirely must still pass it in relations (with an empty slice that
-// still names the key, or by omitting deletion of keys with zero relations
-// — callers that stop emitting relations for a from_key must still pass
-// that key with zero entries if they want its old edges cleared; simplest
-// path is to always resubmit every from_key a run currently knows about).
-func (s *Store) ReplaceRelations(runID int64, relations []codeindex.Relation) error {
+// ReplaceRelations replaces fromKey's edges of exactly the given kinds:
+// every existing symbol_edges row matching (from_key=fromKey AND kind IN
+// kinds) is deleted first, then every relation in relations is inserted.
+// This is scoped by (fromKey, kind), not "replace all of fromKey's edges" —
+// a caller that only just queried one relation kind (e.g. `code expand
+// --relation callers`) must not wipe out a DIFFERENT kind's edges from an
+// earlier call (e.g. previously-saved references/tests) that this call
+// simply didn't touch.
+//
+// kinds must be passed explicitly rather than inferred from relations'
+// own Kind values: the caller must still clear a kind's stale edges even
+// when this batch produced zero relations of that kind (e.g. a second
+// `--relation references` query that now finds nothing must still drop the
+// old references/tests edges, not leave them stranded with no way to ever
+// be cleared). Every relations[i].Kind is expected to be one of kinds, and
+// every relations[i].FromKey is expected to equal fromKey — both are the
+// caller's responsibility, not validated here.
+//
+// The references/tests pairing: cmd/ragrep's `code expand` treats
+// "references" and "tests" as one replacement group (both come from a
+// single textDocument/references query — see
+// codeindex.ReferenceRelations), passing kinds=["references","tests"]
+// together regardless of which of the two the user asked for; "callers",
+// "callees", and "definition" are each their own one-kind group.
+func (s *Store) ReplaceRelations(runID int64, fromKey string, kinds []string, relations []codeindex.Relation) error {
+	if len(kinds) == 0 {
+		return nil
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	fromKeys := map[string]struct{}{}
-	for _, r := range relations {
-		fromKeys[r.FromKey] = struct{}{}
+	args := make([]any, 0, len(kinds)+1)
+	args = append(args, fromKey)
+	for _, k := range kinds {
+		args = append(args, k)
 	}
-	if len(fromKeys) > 0 {
-		keys := make([]any, 0, len(fromKeys))
-		for k := range fromKeys {
-			keys = append(keys, k)
-		}
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
-		if _, err := tx.Exec(`DELETE FROM symbol_edges WHERE from_key IN (`+placeholders+`)`, keys...); err != nil {
-			return err
-		}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(kinds)), ",")
+	if _, err := tx.Exec(`DELETE FROM symbol_edges WHERE from_key=? AND kind IN (`+placeholders+`)`, args...); err != nil {
+		return err
 	}
 
 	for _, r := range relations {

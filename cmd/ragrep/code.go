@@ -544,6 +544,26 @@ var codeExpandFeature = map[string]string{
 	"callees":    lsp.FeatureCallHierarchy,
 }
 
+// codeExpandReplaceGroup maps a --relation value to the full set of
+// symbol_edges kinds that ONE query for it can produce -- and therefore the
+// kinds codestore.ReplaceRelations must clear together, so it deletes stale
+// edges from a symbol's own earlier expand calls without also deleting a
+// DIFFERENT kind's edges from a different expand call it didn't just touch.
+// "references" and "tests" are always one group: both come from a single
+// textDocument/references query (see codeindex.ReferenceRelations), so
+// `--relation references` and `--relation tests` must each clear (and can
+// each produce) both kinds -- otherwise a `references` expand that finds
+// zero non-test hits would leave a stale "tests" edge from an earlier run
+// stranded forever, and vice versa. "definition", "callers", "callees" are
+// each their own one-kind group.
+var codeExpandReplaceGroup = map[string][]string{
+	"definition": {"definition"},
+	"references": {"references", "tests"},
+	"tests":      {"references", "tests"},
+	"callers":    {"callers"},
+	"callees":    {"callees"},
+}
+
 // declarationPosition locates sym's own name token within its declaration,
 // scanning the source lines sym.Range covers for the first whole-word
 // occurrence of the last dot-separated segment of sym.Name (gopls reports a
@@ -831,6 +851,15 @@ func cmdCodeExpand(args []string) int {
 			return fail(err)
 		}
 		if len(items) > 0 {
+			// prepareCallHierarchy can return multiple candidate items when a
+			// position is ambiguous; deliberately taking just the first
+			// (items[0]) rather than querying every candidate keeps this to
+			// one call each of Incoming/OutgoingCalls. In practice this
+			// position always names exactly one indexed symbol's own
+			// declaration (see declarationPosition), so ambiguity isn't
+			// expected to bite -- revisit if a language server ever returns
+			// more than one candidate here for a real symbol.
+			//
 			// 1 hop only: query the prepared item's calls exactly once, no
 			// further traversal from the results.
 			item := items[0]
@@ -866,7 +895,7 @@ func cmdCodeExpand(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	if err := s.ReplaceRelations(runID, relations); err != nil {
+	if err := s.ReplaceRelations(runID, sym.Key, codeExpandReplaceGroup[*relation], relations); err != nil {
 		return fail(err)
 	}
 
