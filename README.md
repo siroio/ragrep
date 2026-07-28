@@ -38,7 +38,7 @@ ragrep index --prune docs/                    # 削除済みファイルもイ�
 ragrep search --json "認証エラー"              # ハイブリッド検索（段落単位でヒット）
 ragrep search --mode text -k 5 "ERR_AUTH"     # 全文検索のみ（モデル不要で速い）
 ragrep search --tag design "認証エラー"        # tagで絞り込み（複数指定でAND、全モード対応）
-echo "本文" | ragrep add notes/foo.md --tag design --tag api  # 新規文書をstdinから追加＋即索引
+echo "本文" | ragrep add --tag design --tag api notes/foo.md  # 新規文書をstdinから追加＋即索引
 ragrep get docs/auth.md                       # Document全体
 ragrep get --para 4 --context 2 docs/auth.md  # 段落4±2（Adaptive Expansion）
 ragrep get --lines 12-18 docs/auth.md         # 行範囲
@@ -66,7 +66,7 @@ ragrepを使うための手順書で、スキルディレクトリへコピー�
 |---|---|
 | `skills/searching-with-ragrep/` | 検索→取得→コンテキスト拡張のワークフロー |
 | `skills/setting-up-ragrep/` | ビルド・init・インデックス運用・トラブルシュート |
-| `skills/adding-documents-with-ragrep/` | `ragrep add`によるtag付き新規文書の追加・更新 |
+| `skills/adding-documents-with-ragrep/` | `ragrep add`によるtag付き新規文書の追加 |
 
 コピー先:
 

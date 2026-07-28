@@ -44,7 +44,7 @@ for filtering purposes.
 
 | Task | Command |
 |---|---|
-| Add a new document, tagged (stdin body) | `ragrep add notes/foo.md --tag design --tag api` (see below) |
+| Add a new document, tagged (stdin body) | `ragrep add --tag design --tag api notes/foo.md` (see below) |
 | Add a new document, no tags (stdin body) | `ragrep add notes/foo.md` (see below) |
 | Update an existing document | edit the file, then `ragrep index notes/foo.md` |
 | Search filtered by tag | `ragrep search --tag design "query"` |
@@ -53,7 +53,7 @@ for filtering purposes.
 ## Adding a new document
 
 ```
-echo "body text" | ragrep add notes/foo.md --tag design --tag api
+echo "body text" | ragrep add --tag design --tag api notes/foo.md
 ```
 
 - The document body comes from stdin, not a flag or positional arg.
@@ -61,6 +61,8 @@ echo "body text" | ragrep add notes/foo.md --tag design --tag api
   block when the piped body has **no** frontmatter of its own. If the body
   already starts with a `---` frontmatter block, `--tag` is ignored and
   whatever tags are already in that block are what gets indexed.
+- Tag values must not contain commas or `]` — both are part of the inline
+  `tags: [a, b]` syntax and would corrupt the parsed list.
 - `ragrep add` refuses to overwrite a file that already exists at `<path>` —
   it is for creating new documents only.
 - The file is written and indexed as part of the same command; there is no
@@ -91,10 +93,13 @@ ragrep search --tag design "query"
 
 ## Rules
 
-- **Flags go BEFORE positional args** on `search`: `ragrep search --tag design "q"`,
-  never `ragrep search "q" --tag design`. On `add`, the path is the sole
-  positional and comes right after the subcommand, with `--tag` flags
-  following it: `ragrep add notes/foo.md --tag design --tag api`.
+- **Flags go BEFORE positional args**, same as every other ragrep subcommand:
+  `ragrep search --tag design "q"`, never `ragrep search "q" --tag design`.
+  On `add`, all `--tag` flags come before the path, which is the sole
+  positional: `ragrep add --tag design --tag api notes/foo.md`. Go's flag
+  parser stops at the first non-flag argument, so `ragrep add notes/foo.md
+  --tag design` parses `--tag` as a second positional arg, not a flag, and
+  fails.
 - **Exit codes** follow the same contract as the rest of ragrep: 0 = success,
   1 = error (includes refusing to overwrite an existing file on `add`),
   2 = no hits / not found (`search`/`get`).
@@ -103,6 +108,7 @@ ragrep search --tag design "query"
 
 | Mistake | Fix |
 |---|---|
+| Putting `--tag` after the path (`ragrep add notes/foo.md --tag design`) | Flags go before the path: `ragrep add --tag design notes/foo.md` — Go's flag parser stops at the first positional arg |
 | Expecting `--tag` to add tags to a body that already has frontmatter | It won't — edit the existing `tags:` block by hand instead |
 | Using `ragrep add` to update a file | It refuses existing paths; edit + `ragrep index <path>` instead |
 | Forgetting the body is read from stdin | Pipe or redirect it in (see fenced example above) |
