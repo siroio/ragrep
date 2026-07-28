@@ -51,11 +51,15 @@ array of `{doc, para, lines, score, snippet}`. `--json` exists only on
 
 - **Flags go BEFORE positional args**: `ragrep search --json "q"`, never
   `ragrep search "q" --json`.
-- Paths are stored as absolute slash paths, and the default `--db` walks up
-  to the nearest ancestor `.ragrep/index.db` — so commands work from any
-  subdirectory, and relative, `./x`, and absolute arguments all resolve to
-  the same key. DBs indexed before this change must be reindexed (keys
-  changed from as-typed to absolute).
+- Paths are stored as slash-separated keys relative to the workspace root
+  (the directory containing `.ragrep/`; the root itself is `.`), and the
+  default `--db` walks up to the nearest ancestor `.ragrep/index.db` — so
+  commands work from any subdirectory, and `get` resolves its path argument
+  as a stored key verbatim first (so a search hit's `doc` value works from
+  any cwd), then relative to cwd — relative, `./x`, backslash, and absolute
+  arguments all resolve to the same key. A workspace can be moved, renamed,
+  or copied wholesale and its index stays valid. Paths outside the
+  workspace root cannot be indexed or added (error, exit 1).
 - **Exit codes**: 0 = success, 1 = error, 2 = no hits / not found.
   Exit 2 is a normal outcome, not a failure — broaden the query, try
   `--mode text` for exact identifiers, or check the path form.
@@ -70,7 +74,7 @@ array of `{doc, para, lines, score, snippet}`. `--json` exists only on
 | Mistake | Fix |
 |---|---|
 | Flags after the query | Put all flags before positional args |
-| Exit 2 on a DB indexed before path normalization | Re-run `ragrep index` (keys are now absolute) |
+| Error: DB uses the old absolute-key format | Delete `.ragrep/` (or the index db) and re-run `ragrep index` — no auto-migration |
 | Treating exit 2 as an error | It means "no hits"; rephrase or switch mode |
 | Exit 2 on content you know exists | Index may be stale; re-run `ragrep index <path>` |
 | Fetching whole documents first | Start with `--para`, expand only as needed |
