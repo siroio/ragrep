@@ -145,6 +145,25 @@ func TestGoplsIntegration(t *testing.T) {
 		t.Fatalf("code expand --relation callers output=%v, want a resolved target for SayHello", callerTargets)
 	}
 
+	// references: SayHello calls Greet TWICE (see sample.go) -- both calls
+	// resolve to the same enclosing symbol (SayHello), so this must not
+	// crash with a symbol_edges UNIQUE constraint violation (the duplicate
+	// resolved relations must be deduped before being persisted -- see
+	// codeindex.DedupResolvedRelations) and must still succeed end-to-end.
+	var referencesCode int
+	referencesOut := captureStdout(t, func() {
+		referencesCode = run([]string{"code", "expand", "--db", db, "--symbol", greetKey, "--relation", "references", "--json"})
+	})
+	if referencesCode != 0 {
+		t.Fatalf("code expand --relation references: exit=%d, output=%q", referencesCode, referencesOut)
+	}
+	referencesTargets := decodeExpandTargets(t, referencesOut)
+	if !anyExpandTargetMatches(referencesTargets, func(tg codeExpandTarget) bool {
+		return tg.Resolved && strings.Contains(tg.QualifiedName, "SayHello")
+	}) {
+		t.Fatalf("code expand --relation references output=%v, want a resolved target for SayHello", referencesTargets)
+	}
+
 	// tests: TestGreet (in sample_test.go) references Greet, so that
 	// reference must be classified "tests", not "references" -- and expand
 	// with --relation tests must return it.

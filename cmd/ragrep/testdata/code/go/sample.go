@@ -23,7 +23,13 @@ func NewGreeter(name string) Greeter {
 }
 
 // SayHello calls Greet -- the fixture's one real caller, for exercising
-// `code expand --relation callers` / `--relation callees`.
+// `code expand --relation callers` / `--relation callees`. It calls Greet
+// TWICE, deliberately: a symbol referenced twice from the same enclosing
+// symbol used to crash `code expand --relation references|tests` with a
+// symbol_edges UNIQUE constraint violation (duplicate resolved relations
+// weren't deduped before being persisted) -- see
+// codeindex.DedupResolvedRelations.
 func SayHello(g Greeter) string {
-	return g.Greet()
+	msg := g.Greet()
+	return msg + " " + g.Greet()
 }
