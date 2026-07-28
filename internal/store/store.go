@@ -332,6 +332,16 @@ func (s *Store) SearchHybrid(query string, qvec []float32, k int, tags []string)
 	return s.hitsByParaIDs(ids, scores)
 }
 
+// FirstPath returns the path key of any one indexed document ("" if none).
+func (s *Store) FirstPath() (string, error) {
+	var p string
+	err := s.db.QueryRow(`SELECT path FROM documents LIMIT 1`).Scan(&p)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return p, err
+}
+
 // ListPaths returns the stored path of every indexed document.
 func (s *Store) ListPaths() ([]string, error) {
 	rows, err := s.db.Query(`SELECT path FROM documents`)

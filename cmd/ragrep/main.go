@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -134,11 +135,57 @@ func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
 	return fail(err), true
 }
 
-func openStoreAt(path string) (*store.Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+// workspaceRoot derives the workspace root from a --db path: the normal
+// shape is <root>/.ragrep/index.db, so the root is that directory's
+// grandparent; for any other db path (e.g. an explicit --db elsewhere) the
+// root is just the db's own parent directory. Doc keys are stored relative
+// to this root (see normPath), so the whole workspace can be moved, renamed,
+// or copied without invalidating the index.
+func workspaceRoot(dbPath string) (string, error) {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Dir(abs)
+	if filepath.Base(dir) == ".ragrep" {
+		return filepath.Dir(dir), nil
+	}
+	return dir, nil
+}
+
+// looksAbsKey reports whether k has the shape of a key from the old
+// (pre-relative) absolute-path key format: a leading "/" (POSIX-style) or a
+// Windows drive-letter prefix such as "C:/". Root-relative keys (this
+// version's format) never start this way.
+func looksAbsKey(k string) bool {
+	if strings.HasPrefix(k, "/") {
+		return true
+	}
+	if len(k) >= 3 && k[2] == '/' && k[1] == ':' {
+		c := k[0]
+		return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+	}
+	return false
+}
+
+func openStoreAt(dbPath string) (*store.Store, error) {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, err
 	}
-	return store.Open(path)
+	s, err := store.Open(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	first, err := s.FirstPath()
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	if looksAbsKey(first) {
+		s.Close()
+		return nil, fmt.Errorf("old absolute-path key format; delete .ragrep/ (or the index db) and re-run ragrep index")
+	}
+	return s, nil
 }
 
 func cmdInit(args []string) int {
@@ -206,6 +253,10 @@ func cmdIndex(args []string) int {
 	if fset.NArg() == 0 {
 		return fail(fmt.Errorf("usage: ragrep index <path>..."))
 	}
+	wsRoot, err := workspaceRoot(*db)
+	if err != nil {
+		return fail(err)
+	}
 	s, err := openStoreAt(*db)
 	if err != nil {
 		return fail(err)
@@ -243,7 +294,7 @@ func cmdIndex(args []string) int {
 			if err != nil {
 				return err
 			}
-			rel, err := normPath(path)
+			rel, err := normPath(path, wsRoot)
 			if err != nil {
 				return err
 			}
@@ -265,7 +316,7 @@ func cmdIndex(args []string) int {
 	if *prune {
 		roots := make([]string, len(fset.Args()))
 		for i, r := range fset.Args() {
-			root, err := normPath(r)
+			root, err := normPath(r, wsRoot)
 			if err != nil {
 				return fail(err)
 			}
@@ -278,7 +329,7 @@ func cmdIndex(args []string) int {
 		for _, p := range paths {
 			underRoot := false
 			for _, root := range roots {
-				if p == root || strings.HasPrefix(p, root+"/") {
+				if root == "." || p == root || strings.HasPrefix(p, root+"/") {
 					underRoot = true
 					break
 				}
@@ -286,7 +337,7 @@ func cmdIndex(args []string) int {
 			if !underRoot {
 				continue
 			}
-			_, statErr := os.Stat(filepath.FromSlash(p))
+			_, statErr := os.Stat(filepath.Join(wsRoot, filepath.FromSlash(p)))
 			doPrune, err := pruneDecision(statErr)
 			if err != nil {
 				return fail(err)
@@ -383,17 +434,27 @@ func cmdSearch(args []string) int {
 	return 0
 }
 
-// normPath converts p to the canonical DB key form: absolute, slash-separated.
-// One canonical form means index/get/prune agree no matter what cwd or path
-// style (relative, ./x, absolute) the user passes.
+// normPath converts p to the canonical DB key form: root-relative,
+// slash-separated. One canonical form means index/get/prune agree no matter
+// what cwd or path style (relative, ./x, absolute) the user passes, and
+// keys stay valid if the whole workspace is moved, renamed, or copied
+// elsewhere -- only position relative to root matters. p outside root
+// (including a Rel failure, e.g. a different drive on Windows) is an error.
 // ponytail: no case-folding or symlink resolution; on Windows "D:" vs "d:"
 // still mismatch — add EqualFold/EvalSymlinks here if that ever bites.
-func normPath(p string) (string, error) {
-	a, err := filepath.Abs(p)
+func normPath(p, root string) (string, error) {
+	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", err
 	}
-	return filepath.ToSlash(a), nil
+	rel, err := filepath.Rel(root, abs)
+	if err == nil {
+		rel = filepath.ToSlash(rel)
+	}
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("%s is outside the workspace root %s (indexable paths must live under the workspace)", p, root)
+	}
+	return rel, nil
 }
 
 func cmdGet(args []string) int {
@@ -408,9 +469,8 @@ func cmdGet(args []string) int {
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: ragrep get <path>"))
 	}
-	// Normalize the arg to the canonical absolute slash form used as DB keys,
-	// so relative, ./x, and absolute arguments all match the stored key.
-	path, err := normPath(fs.Arg(0))
+	arg := fs.Arg(0)
+	wsRoot, err := workspaceRoot(*db)
 	if err != nil {
 		return fail(err)
 	}
@@ -421,7 +481,19 @@ func cmdGet(args []string) int {
 	}
 	defer s.Close()
 
-	out, err := getContent(s, path, *lines, *para, *context)
+	// Resolution order: try the arg verbatim (cleaned/slashed) first, since
+	// that's the exact root-relative key search results print -- it must
+	// match regardless of cwd. Only on ErrNotFound do we fall back to
+	// resolving the arg as a cwd-relative or absolute path against the
+	// workspace root (a normPath failure, i.e. outside the workspace, leaves
+	// the original not-found result in place).
+	key := path.Clean(filepath.ToSlash(arg))
+	out, err := getContent(s, key, *lines, *para, *context)
+	if err == store.ErrNotFound {
+		if normKey, nerr := normPath(arg, wsRoot); nerr == nil {
+			out, err = getContent(s, normKey, *lines, *para, *context)
+		}
+	}
 	if err == store.ErrNotFound {
 		fmt.Fprintln(os.Stderr, "not found")
 		return 2
@@ -492,6 +564,10 @@ func cmdAdd(args []string) int {
 	if _, err := os.Stat(path); err == nil {
 		return fail(fmt.Errorf("%s already exists; edit it and run `ragrep index` instead", path))
 	}
+	wsRoot, err := workspaceRoot(*db)
+	if err != nil {
+		return fail(err)
+	}
 
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -509,7 +585,7 @@ func cmdAdd(args []string) int {
 		return fail(err)
 	}
 
-	key, err := normPath(path)
+	key, err := normPath(path, wsRoot)
 	if err != nil {
 		return fail(err)
 	}

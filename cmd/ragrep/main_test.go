@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/siroio/ragrep/internal/store"
@@ -233,25 +237,212 @@ func TestCmdAddFlagOrdering(t *testing.T) {
 	}
 }
 
-// All path argument styles normalize to one canonical absolute slash key.
-func TestNormPath(t *testing.T) {
-	t.Chdir(t.TempDir())
-	cwd, err := os.Getwd()
+// workspaceRoot derives the workspace root from --db: a ".ragrep/index.db"
+// shaped path roots at the grandparent (the workspace dir containing
+// .ragrep/), any other db path roots at its own parent directory.
+func TestWorkspaceRoot(t *testing.T) {
+	tmp, err := filepath.Abs(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	want, err := normPath("docs/foo.md")
+	ragrepDB := filepath.Join(tmp, ".ragrep", "index.db")
+	root, err := workspaceRoot(ragrepDB)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, in := range []string{"./docs/foo.md", filepath.Join(cwd, "docs", "foo.md"), want} {
-		got, err := normPath(in)
-		if err != nil {
-			t.Fatal(err)
+	if root != tmp {
+		t.Fatalf(".ragrep/index.db shaped db: root=%q, want grandparent %q", root, tmp)
+	}
+
+	plainDB := filepath.Join(tmp, "sub", "plain.db")
+	wantSub := filepath.Join(tmp, "sub")
+	root, err = workspaceRoot(plainDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root != wantSub {
+		t.Fatalf("plain db: root=%q, want parent %q", root, wantSub)
+	}
+}
+
+// All in-workspace path argument styles (relative, ./x, absolute) normalize
+// to one canonical root-relative slash key; the root itself normalizes to
+// ".", and anything outside the root is rejected with an explicit error.
+func TestNormPath(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "docs/foo.md"
+
+	got, err := normPath(filepath.Join(root, "docs", "foo.md"), root)
+	if err != nil || got != want {
+		t.Fatalf("absolute-in-root: got %q err=%v, want %q", got, err, want)
+	}
+
+	t.Chdir(root)
+	for _, in := range []string{"docs/foo.md", "./docs/foo.md"} {
+		got, err := normPath(in, root)
+		if err != nil || got != want {
+			t.Fatalf("normPath(%q, root) = %q err=%v, want %q", in, got, err, want)
 		}
-		if got != want {
-			t.Fatalf("normPath(%q) = %q, want %q", in, got, want)
+	}
+
+	got, err = normPath(root, root)
+	if err != nil || got != "." {
+		t.Fatalf("normPath(root, root) = %q err=%v, want \".\"", got, err)
+	}
+
+	outside := filepath.Dir(root) // root's own parent: definitely outside root
+	_, err = normPath(outside, root)
+	wantErr := fmt.Sprintf("%s is outside the workspace root %s (indexable paths must live under the workspace)", outside, root)
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("normPath(outside, root) err=%v, want %q", err, wantErr)
+	}
+}
+
+// looksAbsKey detects the old (pre-relative) key format: a leading "/" or a
+// Windows drive-letter prefix like "C:/". Root-relative keys never look like
+// this, so it doubles as the guard predicate for the old-DB check.
+func TestLooksAbsKey(t *testing.T) {
+	cases := map[string]bool{
+		"/u/x.md":   true,
+		"C:/u/x.md": true,
+		"docs/x.md": false,
+		".":         false,
+	}
+	for k, want := range cases {
+		if got := looksAbsKey(k); got != want {
+			t.Fatalf("looksAbsKey(%q)=%v, want %v", k, got, want)
 		}
+	}
+}
+
+// A DB carrying old absolute-form keys must be rejected up front with an
+// explicit migration message (exit 1), not silently misbehave under the new
+// root-relative key scheme.
+func TestOldKeyGuard(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "index.db")
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("/abs/old/key.md", "content", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	code := run([]string{"search", "--db", db, "--mode", "text", "q"})
+	w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1", code)
+	}
+	if !strings.Contains(buf.String(), "old absolute-path key format") {
+		t.Fatalf("stderr=%q, want guard message", buf.String())
+	}
+}
+
+// cmdGet resolves a path argument three ways against the same document: the
+// verbatim (root-relative) key as printed by search, a cwd-relative path,
+// and an absolute path -- regardless of which subdirectory the command runs
+// from.
+func TestGetFallback(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(root, ".ragrep", "index.db")
+	if err := os.MkdirAll(filepath.Dir(db), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("docs/auth.md", "auth content", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	sub := filepath.Join(root, "docs")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
+
+	if code := run([]string{"get", "--db", db, "docs/auth.md"}); code != 0 {
+		t.Fatalf("verbatim root-relative key: exit=%d, want 0", code)
+	}
+	if code := run([]string{"get", "--db", db, "./auth.md"}); code != 0 {
+		t.Fatalf("cwd-relative path: exit=%d, want 0", code)
+	}
+	if code := run([]string{"get", "--db", db, filepath.Join(sub, "auth.md")}); code != 0 {
+		t.Fatalf("absolute path: exit=%d, want 0", code)
+	}
+}
+
+// --prune's existence check must be resolved against the workspace root, not
+// the process's cwd: running from a sibling directory of "docs" must still
+// prune the doc that's actually gone and keep the one that's actually there.
+func TestPruneRootJoinStat(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := filepath.Join(root, "docs")
+	if err := os.MkdirAll(docs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(docs, "keep.md"), []byte("keep content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(root, "other")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	db := filepath.Join(root, ".ragrep", "index.db")
+	if err := os.MkdirAll(filepath.Dir(db), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("docs/gone.md", "gone content", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("docs/keep.md", "keep content", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	t.Chdir(other)
+
+	if code := run([]string{"index", "--prune", "--db", db, "../docs"}); code != 0 {
+		t.Fatalf("index --prune exit=%d", code)
+	}
+
+	s2, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if _, err := s2.GetDoc("docs/gone.md"); err != store.ErrNotFound {
+		t.Fatalf("gone.md: want pruned (ErrNotFound), got %v", err)
+	}
+	if _, err := s2.GetDoc("docs/keep.md"); err != nil {
+		t.Fatalf("keep.md: want kept, got %v", err)
 	}
 }

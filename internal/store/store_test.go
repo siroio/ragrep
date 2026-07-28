@@ -140,6 +140,22 @@ func TestGet(t *testing.T) {
 	}
 }
 
+func TestFirstPath(t *testing.T) {
+	s := newTestStore(t)
+	p, err := s.FirstPath()
+	if err != nil || p != "" {
+		t.Fatalf("empty store: got %q err=%v, want \"\",nil", p, err)
+	}
+
+	if _, err := s.UpsertDoc("docs/a.md", "content", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	p, err = s.FirstPath()
+	if err != nil || p != "docs/a.md" {
+		t.Fatalf("got %q err=%v, want docs/a.md", p, err)
+	}
+}
+
 func TestDeleteDoc(t *testing.T) {
 	s := newTestStore(t)
 	if _, err := s.UpsertDoc("a.txt", "alpha content UNIQUEAAA111", 1, fakeEmbed); err != nil {
