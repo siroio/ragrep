@@ -263,10 +263,32 @@ func serverIdentity(initResult *lsp.InitializeResult) (name, version string) {
 	if initResult != nil && initResult.ServerInfo != nil {
 		name = initResult.ServerInfo.Name
 		if initResult.ServerInfo.Version != "" {
-			version = initResult.ServerInfo.Version
+			version = truncateServerVersion(initResult.ServerInfo.Version)
 		}
 	}
 	return name, version
+}
+
+// maxServerVersionLen caps truncateServerVersion's output. Generous for any
+// real semantic-version-ish string, tiny next to the multi-KB build-info
+// blob it guards against (see truncateServerVersion).
+const maxServerVersionLen = 120
+
+// truncateServerVersion trims a server-reported version string down to
+// something fit for a single index_runs/manifest field: gopls's
+// serverInfo.version is a multi-line build-info blob (module path, main
+// version, further "    dep version h1:hash" lines) rather than a short
+// version string -- stored verbatim it's ~2.7KB duplicated into every
+// index_runs row and every manifest. Only the first line is kept, further
+// capped at maxServerVersionLen characters.
+func truncateServerVersion(v string) string {
+	if i := strings.IndexAny(v, "\r\n"); i >= 0 {
+		v = v[:i]
+	}
+	if len(v) > maxServerVersionLen {
+		v = v[:maxServerVersionLen]
+	}
+	return v
 }
 
 func cmdCodeIndex(args []string) int {
