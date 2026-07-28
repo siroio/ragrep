@@ -24,7 +24,7 @@ Usage:
   ragrep get <path> [--para N] [--context N] [--lines A-B]
 
 Flags common to all commands:
-  --db PATH    index database (default .ragrep/index.db)
+  --db PATH    index database (default $RAGREP_DB, else .ragrep/index.db)
 
 Exit codes: 0 success, 1 error, 2 no hits / not found
 `
@@ -74,7 +74,11 @@ func run(args []string) int {
 }
 
 func dbFlag(fs *flag.FlagSet) *string {
-	return fs.String("db", filepath.Join(".ragrep", "index.db"), "index database path")
+	def := os.Getenv("RAGREP_DB")
+	if def == "" {
+		def = filepath.Join(".ragrep", "index.db")
+	}
+	return fs.String("db", def, "index database path")
 }
 
 // newFlagSet builds a FlagSet that reports parse errors to the caller

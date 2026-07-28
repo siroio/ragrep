@@ -99,3 +99,25 @@ func TestProtect(t *testing.T) {
 		t.Fatalf("no panic: got %d, want 2", code)
 	}
 }
+
+// RAGREP_DB overrides the default --db path; an explicit --db still wins.
+func TestDBFlagEnvDefault(t *testing.T) {
+	t.Setenv("RAGREP_DB", filepath.Join("some", "shared.db"))
+	fs := newFlagSet("x")
+	db := dbFlag(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if *db != filepath.Join("some", "shared.db") {
+		t.Fatalf("db=%q, want env default", *db)
+	}
+
+	fs2 := newFlagSet("x")
+	db2 := dbFlag(fs2)
+	if err := fs2.Parse([]string{"--db", "explicit.db"}); err != nil {
+		t.Fatal(err)
+	}
+	if *db2 != "explicit.db" {
+		t.Fatalf("db=%q, want explicit.db", *db2)
+	}
+}

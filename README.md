@@ -4,7 +4,7 @@
 ハイブリッド検索（ベクトル + 全文）と Adaptive Context Expansion による取得を提供する。
 
 - 埋め込みモデル: embeddinggemma-300m（quantized ONNX, 768次元）
-- インデックス: SQLite（`.ragrep/index.db`）
+- インデックス: SQLite（`.ragrep/index.db`。`--db PATH` か環境変数 `RAGREP_DB` で変更可。ワークスペース共有や切り替えに使える）
 - 対応プラットフォーム: windows/amd64, windows/arm64, linux/amd64, darwin/arm64
 
 ## Install / Build
