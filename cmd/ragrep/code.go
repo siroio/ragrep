@@ -343,7 +343,20 @@ func cmdCodeIndex(args []string) int {
 	}
 
 	if len(files) == 0 {
-		fmt.Println("done: 0 indexed (0 files scanned)")
+		// Still prune: every file that used to be under one of these roots
+		// may have been deleted, including the last one -- that must not
+		// require the server or embedding model either (see
+		// TestCmdCodeIndexZeroFilesSkipsServerAndModel).
+		s, err := openCodeStoreAt(*db)
+		if err != nil {
+			return fail(err)
+		}
+		defer s.Close()
+		pruned, err := pruneCodeSymbols(s, relRoots, nil)
+		if err != nil {
+			return fail(err)
+		}
+		fmt.Printf("done: 0 indexed (0 files scanned, %d pruned)\n", pruned)
 		return 0
 	}
 
@@ -387,12 +400,14 @@ func cmdCodeIndex(args []string) int {
 	defer e.Close()
 
 	indexed := 0
+	seen := make(map[string]bool, len(files))
 	ctx := context.Background()
 	for _, f := range files {
 		rel, err := normPath(f, wsRoot)
 		if err != nil {
 			return fail(err)
 		}
+		seen[rel] = true
 		content, err := os.ReadFile(f)
 		if err != nil {
 			return fail(err)
@@ -417,8 +432,52 @@ func cmdCodeIndex(args []string) int {
 		}
 	}
 
-	fmt.Printf("done: %d indexed (%d files scanned)\n", indexed, len(files))
+	pruned, err := pruneCodeSymbols(s, relRoots, seen)
+	if err != nil {
+		return fail(err)
+	}
+
+	fmt.Printf("done: %d indexed (%d files scanned, %d pruned)\n", indexed, len(files), pruned)
 	return 0
+}
+
+// pruneCodeSymbols removes every stored symbol whose path is under one of
+// relRoots but wasn't seen this run (seen holds the workspace-relative
+// paths this run's discoverCodeFiles walk actually found, same convention
+// as relRoots) -- `code index`'s default pruning pass for files that were
+// deleted, or moved out of an indexed root, since the last index. Returns
+// the number of distinct paths pruned; each is also printed, mirroring the
+// doc index's own --prune output.
+func pruneCodeSymbols(s *codestore.Store, relRoots []string, seen map[string]bool) (int, error) {
+	allPaths, err := s.ListPaths()
+	if err != nil {
+		return 0, err
+	}
+	pruned := 0
+	for _, p := range allPaths {
+		if seen[p] || !pathUnderAnyRoot(p, relRoots) {
+			continue
+		}
+		if err := s.DeleteSymbolsForPath(p); err != nil {
+			return pruned, err
+		}
+		fmt.Println("pruned", p)
+		pruned++
+	}
+	return pruned, nil
+}
+
+// pathUnderAnyRoot reports whether p (a workspace-relative path) falls under
+// any of roots (also workspace-relative), mirroring cmdIndex's own --prune
+// containment check: root == "." matches everything, otherwise p must equal
+// root or start with "root/".
+func pathUnderAnyRoot(p string, roots []string) bool {
+	for _, root := range roots {
+		if root == "." || p == root || strings.HasPrefix(p, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // formatCodeSearchHits writes hits as either one line per hit (key, kind,

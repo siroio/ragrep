@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -963,6 +965,147 @@ func TestCmdCodeExpandDedupsRelationsAndSkipsUnresolved(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("persisted references edges from target-key to caller-key = %d, want 1 (deduped)", count)
 	}
+}
+
+// fakeLSPServerDocumentSymbolSrc advertises documentSymbolProvider and
+// answers every textDocument/documentSymbol request with the same one-symbol
+// fixture (a "Foo" function at lines 1-3), regardless of which file was
+// asked about -- Symbol.Key still differs per file since it embeds Path, so
+// this is enough to exercise `code index`'s full per-file
+// upsert/prune pipeline without a real language server.
+const fakeLSPServerDocumentSymbolSrc = `package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/textproto"
+	"os"
+	"strconv"
+)
+
+func main() {
+	tp := textproto.NewReader(bufio.NewReader(os.Stdin))
+	for {
+		hdr, err := tp.ReadMIMEHeader()
+		if err != nil {
+			return
+		}
+		n, err := strconv.Atoi(hdr.Get("Content-Length"))
+		if err != nil {
+			return
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(tp.R, body); err != nil {
+			return
+		}
+		var msg map[string]json.RawMessage
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return
+		}
+		idRaw, hasID := msg["id"]
+		if !hasID {
+			continue
+		}
+		var method string
+		if m, ok := msg["method"]; ok {
+			json.Unmarshal(m, &method)
+		}
+		result := "null"
+		switch method {
+		case "initialize":
+			result = ` + "`" + `{"capabilities":{"documentSymbolProvider":true}}` + "`" + `
+		case "textDocument/documentSymbol":
+			result = ` + "`" + `[{"name":"Foo","detail":"func Foo()","kind":12,"range":{"start":{"line":1,"character":0},"end":{"line":3,"character":1}},"selectionRange":{"start":{"line":1,"character":5},"end":{"line":1,"character":8}},"children":[]}]` + "`" + `
+		}
+		resp := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}", string(idRaw), result)
+		fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(resp), resp)
+	}
+}
+`
+
+// `code index` must remove symbols (and their fts/vec/edges rows -- see
+// codestore.DeleteSymbolsForPath) for files that were indexed before but are
+// no longer discovered under the indexed root, by default, without a flag --
+// mirroring the document index's --prune but always on, since a code index
+// with stale symbols silently returning wrong search/expand results is worse
+// than the cost of an extra ListPaths query.
+func TestCmdCodeIndexPrunesDeletedFiles(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileSrc := "package p\n\nfunc Foo() {\n\n}\n"
+	aPath := filepath.Join(root, "a.go")
+	bPath := filepath.Join(root, "b.go")
+	if err := os.WriteFile(aPath, []byte(fileSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, []byte(fileSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Built outside root: root is what `code index` walks, and a stray .go
+	// source file for the fake server itself would get discovered/indexed
+	// too.
+	exePath := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-docsym", fakeLSPServerDocumentSymbolSrc)
+	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(exePath)+`"}}`)
+	db := filepath.Join(root, ".ragrep", "code.db")
+
+	runIndex := func() (code int, out string) {
+		r, w, _ := os.Pipe()
+		old := os.Stdout
+		os.Stdout = w
+		code = run([]string{"code", "index", "--db", db, "--language", "go", root})
+		w.Close()
+		os.Stdout = old
+		var buf bytes.Buffer
+		buf.ReadFrom(r)
+		return code, buf.String()
+	}
+
+	code1, out1 := runIndex()
+	if code1 != 0 {
+		t.Fatalf("first index: exit=%d, output=%q", code1, out1)
+	}
+	if !strings.Contains(out1, "indexed a.go") || !strings.Contains(out1, "indexed b.go") {
+		t.Fatalf("first index output=%q, want both a.go and b.go reported indexed", out1)
+	}
+
+	assertPaths := func(want ...string) {
+		t.Helper()
+		s, err := codestore.Open(db, codeModelID, codeEmbedDim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		got, err := s.ListPaths()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ListPaths() = %v, want %v", got, want)
+		}
+	}
+	assertPaths("a.go", "b.go")
+
+	if err := os.Remove(bPath); err != nil {
+		t.Fatal(err)
+	}
+
+	code2, out2 := runIndex()
+	if code2 != 0 {
+		t.Fatalf("second index (after deleting b.go): exit=%d, output=%q", code2, out2)
+	}
+	if !strings.Contains(out2, "1 pruned") {
+		t.Fatalf("second index output=%q, want it to report 1 pruned", out2)
+	}
+	if strings.Contains(out2, "indexed a.go") {
+		t.Fatalf("second index output=%q, a.go is unchanged and must not be re-reported as indexed", out2)
+	}
+	assertPaths("a.go")
 }
 
 // --include-code disables the default code-extension exclusion.
