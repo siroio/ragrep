@@ -62,12 +62,28 @@ func dbFlag(fs *flag.FlagSet) *string {
 // newFlagSet builds a FlagSet that reports parse errors to the caller
 // (ContinueOnError) instead of exiting the process with flag's own exit code
 // 2 — that code collides with this CLI's "no hits / not found" contract.
-// Output is discarded because fail(err) below prints the message instead,
-// so a bad flag doesn't get printed twice.
+// Output is discarded because parseArgs below prints instead, so a bad flag
+// (or -h) doesn't get printed twice.
 func newFlagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	return fs
+}
+
+// parseArgs parses args into fs. -h/--help prints usage and reports exit 0
+// (flag.ErrHelp would otherwise read as a generic parse failure → exit 1).
+// Any other parse error goes through fail(). handled is true when the caller
+// should return code immediately instead of continuing.
+func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
+	err := fs.Parse(args)
+	if err == nil {
+		return 0, false
+	}
+	if err == flag.ErrHelp {
+		fmt.Fprint(os.Stderr, usage)
+		return 0, true
+	}
+	return fail(err), true
 }
 
 func openStoreAt(path string) (*Store, error) {
@@ -80,8 +96,8 @@ func openStoreAt(path string) (*Store, error) {
 func cmdInit(args []string) int {
 	fs := newFlagSet("init")
 	db := dbFlag(fs)
-	if err := fs.Parse(args); err != nil {
-		return fail(err)
+	if code, handled := parseArgs(fs, args); handled {
+		return code
 	}
 	dir, err := cacheDir()
 	if err != nil {
@@ -121,8 +137,8 @@ const maxFileSize = 10 << 20 // 10MB
 func cmdIndex(args []string) int {
 	fset := newFlagSet("index")
 	db := dbFlag(fset)
-	if err := fset.Parse(args); err != nil {
-		return fail(err)
+	if code, handled := parseArgs(fset, args); handled {
+		return code
 	}
 	if fset.NArg() == 0 {
 		return fail(fmt.Errorf("usage: rag index <path>..."))
@@ -189,8 +205,8 @@ func cmdSearch(args []string) int {
 	mode := fs.String("mode", "hybrid", "hybrid|vector|text")
 	k := fs.Int("k", 10, "max results")
 	asJSON := fs.Bool("json", false, "JSON output")
-	if err := fs.Parse(args); err != nil {
-		return fail(err)
+	if code, handled := parseArgs(fs, args); handled {
+		return code
 	}
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: rag search <query>"))
@@ -252,8 +268,8 @@ func cmdGet(args []string) int {
 	para := fs.Int("para", -1, "paragraph number (from search results)")
 	context := fs.Int("context", 0, "±N paragraphs around --para")
 	lines := fs.String("lines", "", "line range A-B")
-	if err := fs.Parse(args); err != nil {
-		return fail(err)
+	if code, handled := parseArgs(fs, args); handled {
+		return code
 	}
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: rag get <path>"))

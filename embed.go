@@ -17,8 +17,10 @@ import (
 )
 
 const (
-	ortVersion   = "1.26.0" // must match onnxruntime_go's compiled ORT_API_VERSION
-	repoBase     = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main/"
+	ortVersion = "1.26.0" // must match onnxruntime_go's compiled ORT_API_VERSION
+	// Pinned to a commit sha (not "main") so the download can't silently
+	// change contents out from under a cached, unverified file.
+	repoBase     = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/5090578d9565bb06545b4552f76e6bc2c93e4a66/"
 	modelURL     = repoBase + "onnx/model_quantized.onnx"
 	modelDataURL = repoBase + "onnx/model_quantized.onnx_data"
 	spmURL       = repoBase + "tokenizer.model"
@@ -256,7 +258,10 @@ func (e *Embedder) Embed(text string) ([]float32, error) {
 	if err := e.sess.Run([]ort.Value{idT, maskT}, outputs); err != nil {
 		return nil, err
 	}
-	out := outputs[0].(*ort.Tensor[float32])
+	out, ok := outputs[0].(*ort.Tensor[float32])
+	if !ok {
+		return nil, fmt.Errorf("unexpected output tensor type %T", outputs[0])
+	}
 	defer out.Destroy()
 
 	// The exported graph's "sentence_embedding" output is already mean-pooled

@@ -308,6 +308,9 @@ func (s *Store) GetParas(relPath string, seq, context int) (string, error) {
 		parts = append(parts, t)
 		found = true
 	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
 	if !found {
 		return "", errNotFound
 	}

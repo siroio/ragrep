@@ -9,7 +9,7 @@
 
 ## Usage
 
-    rag init                     # モデル・ランタイムをDL（初回のみ、~200MB）
+    rag init                     # モデル・ランタイムをDL（初回のみ、~310MB）
     rag index docs/              # テキストファイルをインデックス
     rag search --json "認証エラー"          # ハイブリッド検索（段落単位でヒット）
     rag search --mode text -k 5 "ERR_AUTH"  # 全文検索のみ
@@ -17,7 +17,9 @@
     rag get --para 4 --context 2 docs/auth.md  # 段落4±2（Adaptive Expansion）
     rag get --lines 12-18 docs/auth.md       # 行範囲
 
-フラグは位置引数より前に置く。終了コード: 0=成功 / 1=エラー / 2=ヒットなし。
+フラグは位置引数より前に置く。終了コード: 0=成功 / 1=エラー / 2=ヒットなし・get未検出。
+
+`rag index` と `rag get` は常に同じカレントディレクトリから相対パスで実行すること。ドキュメントキーは入力したパスをそのまま使うため、`rag index docs` と `rag index D:\...\docs` は別々のキーになる。
 
 ## LLMエージェントからの利用
 

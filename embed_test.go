@@ -68,7 +68,7 @@ func TestEmbedSimilarityOrdering(t *testing.T) {
 // This doubles as the download path's integration test.
 func TestEnsureAssets(t *testing.T) {
 	if os.Getenv("RAG_DOWNLOAD") != "1" {
-		t.Skip("set RAG_DOWNLOAD=1 to download ~300MB of model assets")
+		t.Skip("set RAG_DOWNLOAD=1 to download ~310MB of model assets")
 	}
 	dir, err := cacheDir()
 	if err != nil {
