@@ -137,6 +137,33 @@ func TestCallerAndCalleeRelationsAreOneHop(t *testing.T) {
 	}
 }
 
+// DedupResolvedRelations must (a) drop every unresolved relation (ToKey ==
+// "") -- symbol_edges has no columns for ToPath/ToPosition, so these must
+// never reach codestore.ReplaceRelations -- and (b) collapse duplicate
+// resolved relations (same FromKey/ToKey/Kind/Source) down to one, first
+// occurrence wins: an LSP query naturally returns one location per
+// reference/call site, so a symbol referenced twice from the same enclosing
+// symbol produces two Relations that would otherwise collide on
+// symbol_edges' UNIQUE(from_key, to_key, kind, source) constraint.
+func TestDedupResolvedRelationsFiltersUnresolvedAndDedups(t *testing.T) {
+	in := []Relation{
+		{FromKey: "f", ToKey: "a", Kind: "references", Source: "gopls"},
+		{FromKey: "f", ToKey: "a", Kind: "references", Source: "gopls"}, // exact duplicate
+		{FromKey: "f", Kind: "references", Source: "gopls", ToPath: "ext.go", ToPosition: Position{Line: 1}}, // unresolved
+		{FromKey: "f", ToKey: "b", Kind: "references", Source: "gopls"},
+		{FromKey: "f", ToKey: "a", Kind: "callers", Source: "gopls"}, // same ToKey, different kind: not a duplicate
+	}
+	want := []Relation{
+		{FromKey: "f", ToKey: "a", Kind: "references", Source: "gopls"},
+		{FromKey: "f", ToKey: "b", Kind: "references", Source: "gopls"},
+		{FromKey: "f", ToKey: "a", Kind: "callers", Source: "gopls"},
+	}
+	got := DedupResolvedRelations(in)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DedupResolvedRelations() = %#v, want %#v", got, want)
+	}
+}
+
 func TestRelationHelpersPreserveInputOrder(t *testing.T) {
 	resolve := resolverFromMap(map[string]string{
 		"a.go:1": "k1",

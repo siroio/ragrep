@@ -80,6 +80,30 @@ func CallerRelations(fromKey string, callers []Loc, source string, resolve Resol
 	return out
 }
 
+// DedupResolvedRelations filters relations down to the ones a caller (e.g.
+// cmd/ragrep's `code expand`) should actually persist via
+// codestore.ReplaceRelations: unresolved relations (ToKey == "") are dropped
+// entirely -- symbol_edges has no columns for ToPath/ToPosition, see
+// Relation's own doc comment -- and exact duplicates (same FromKey, ToKey,
+// Kind, and Source) collapse to one, first occurrence wins. This matters
+// because symbol_edges has a UNIQUE(from_key, to_key, kind, source)
+// constraint but an LSP query returns one location per reference/call site:
+// a symbol referenced or called twice from the same enclosing symbol
+// produces two Relations that resolve to the identical edge, which would
+// otherwise fail that constraint. Order among survivors is preserved.
+func DedupResolvedRelations(relations []Relation) []Relation {
+	out := make([]Relation, 0, len(relations))
+	seen := make(map[Relation]bool, len(relations))
+	for _, r := range relations {
+		if r.ToKey == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	return out
+}
+
 // CalleeRelations converts callHierarchy/outgoingCalls results -- already
 // reduced by the caller to each call's "to" location, one hop only, no
 // further traversal -- into "callees" relations.
