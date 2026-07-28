@@ -44,8 +44,8 @@ for filtering purposes.
 
 | Task | Command |
 |---|---|
-| Add a new document, tagged | `echo "body text" | ragrep add notes/foo.md --tag design --tag api` |
-| Add a new document, no tags | `echo "body text" | ragrep add notes/foo.md` |
+| Add a new document, tagged (stdin body) | `ragrep add notes/foo.md --tag design --tag api` (see below) |
+| Add a new document, no tags (stdin body) | `ragrep add notes/foo.md` (see below) |
 | Update an existing document | edit the file, then `ragrep index notes/foo.md` |
 | Search filtered by tag | `ragrep search --tag design "query"` |
 | Search filtered by two tags (AND) | `ragrep search --tag design --tag api "query"` |
@@ -105,5 +105,5 @@ ragrep search --tag design "query"
 |---|---|
 | Expecting `--tag` to add tags to a body that already has frontmatter | It won't — edit the existing `tags:` block by hand instead |
 | Using `ragrep add` to update a file | It refuses existing paths; edit + `ragrep index <path>` instead |
-| Forgetting the body is read from stdin | Pipe or redirect it in: `echo "..." | ragrep add path` |
+| Forgetting the body is read from stdin | Pipe or redirect it in (see fenced example above) |
 | Expecting `--tag design --tag api` to be an OR | It's an AND — every named tag must be present |

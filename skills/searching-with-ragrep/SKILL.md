@@ -29,7 +29,7 @@ ragrep index --prune docs/   # also drop deleted files from the index
 | Full-text only (fast, no model) | `ragrep search --mode text -k 5 "ERR_AUTH"` |
 | Vector only | `ragrep search --mode vector "concept"` |
 | Filter by tag (repeat = AND) | `ragrep search --tag design --json "q"` |
-| Add a new tagged document | `echo "..." | ragrep add notes/foo.md --tag design` |
+| Add a new tagged document (stdin body) | `ragrep add notes/foo.md --tag design` |
 | Get paragraph N | `ragrep get --para 4 docs/auth.md` |
 | Paragraph ± N context | `ragrep get --para 4 --context 2 docs/auth.md` |
 | Line range | `ragrep get --lines 12-18 docs/auth.md` |
