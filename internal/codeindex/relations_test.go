@@ -148,7 +148,7 @@ func TestCallerAndCalleeRelationsAreOneHop(t *testing.T) {
 func TestDedupResolvedRelationsFiltersUnresolvedAndDedups(t *testing.T) {
 	in := []Relation{
 		{FromKey: "f", ToKey: "a", Kind: "references", Source: "gopls"},
-		{FromKey: "f", ToKey: "a", Kind: "references", Source: "gopls"}, // exact duplicate
+		{FromKey: "f", ToKey: "a", Kind: "references", Source: "gopls"},                                      // exact duplicate
 		{FromKey: "f", Kind: "references", Source: "gopls", ToPath: "ext.go", ToPosition: Position{Line: 1}}, // unresolved
 		{FromKey: "f", ToKey: "b", Kind: "references", Source: "gopls"},
 		{FromKey: "f", ToKey: "a", Kind: "callers", Source: "gopls"}, // same ToKey, different kind: not a duplicate
