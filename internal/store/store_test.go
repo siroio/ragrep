@@ -187,3 +187,34 @@ func TestDeleteDoc(t *testing.T) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
+
+func TestSearchTextMultiWordOutOfOrder(t *testing.T) {
+	s := newTestStore(t)
+	content := "the config file is parsed at startup"
+	if _, err := s.UpsertDoc("a.txt", content, 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := s.SearchText("parse config", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Doc != "a.txt" {
+		t.Fatalf("unexpected hits: %+v", hits)
+	}
+}
+
+func TestFtsQuery(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`parse config`, `"parse" OR "config"`},
+		{`hello`, `"hello"`},
+		{`say "hi"`, `"say" OR """hi"""`},
+		{``, `""`},
+		{`   `, `""`},
+	}
+	for _, c := range cases {
+		if got := ftsQuery(c.in); got != c.want {
+			t.Errorf("ftsQuery(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

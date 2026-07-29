@@ -548,10 +548,19 @@ func (s *Store) SymbolAt(path string, line int) (key string, ok bool, err error)
 	return key, ok, nil
 }
 
-// ftsQuery wraps query as a quoted FTS5 phrase so operators/quotes in it
-// can't break MATCH syntax (mirrors internal/store's ftsQuery).
+// ftsQuery turns the user query into an FTS5 MATCH expression: each
+// whitespace-separated word becomes a quoted phrase (so operators/quotes
+// cannot break the syntax), joined with OR so bm25 ranks paragraphs
+// matching more words higher (mirrors internal/store's ftsQuery).
 func ftsQuery(query string) string {
-	return `"` + strings.ReplaceAll(query, `"`, `""`) + `"`
+	words := strings.Fields(query)
+	if len(words) == 0 {
+		return `""`
+	}
+	for i, w := range words {
+		words[i] = `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+	}
+	return strings.Join(words, " OR ")
 }
 
 func (s *Store) searchSymbolsTextIDs(query string, k int) ([]int64, error) {

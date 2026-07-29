@@ -160,10 +160,19 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 	return true, tx.Commit()
 }
 
-// ftsQuery wraps the user query as a quoted FTS5 phrase so that
-// operators/quotes in the query cannot break the MATCH syntax.
+// ftsQuery turns the user query into an FTS5 MATCH expression: each
+// whitespace-separated word becomes a quoted phrase (so operators/quotes
+// cannot break the syntax), joined with OR so bm25 ranks paragraphs
+// matching more words higher.
 func ftsQuery(q string) string {
-	return `"` + strings.ReplaceAll(q, `"`, `""`) + `"`
+	words := strings.Fields(q)
+	if len(words) == 0 {
+		return `""`
+	}
+	for i, w := range words {
+		words[i] = `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+	}
+	return strings.Join(words, " OR ")
 }
 
 func snippet(text string) string {

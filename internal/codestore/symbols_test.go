@@ -915,3 +915,18 @@ func TestSymbolAtPicksInnermostOnOverlap(t *testing.T) {
 		t.Fatalf("SymbolAt(5) = (%q, %v), want (outer, true)", key, ok)
 	}
 }
+
+func TestFtsQuery(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`parse config`, `"parse" OR "config"`},
+		{`hello`, `"hello"`},
+		{`say "hi"`, `"say" OR """hi"""`},
+		{``, `""`},
+		{`   `, `""`},
+	}
+	for _, c := range cases {
+		if got := ftsQuery(c.in); got != c.want {
+			t.Errorf("ftsQuery(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
