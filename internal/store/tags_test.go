@@ -194,6 +194,22 @@ func TestUpsertDocMergesAutoTags(t *testing.T) {
 			t.Fatalf("tag=%v: %+v", tags, hits)
 		}
 	}
+
+	// Frontmatter tag "md" collides with the auto tag derived from the
+	// ".md" extension: dedup must still land it in the tag set exactly
+	// once, so tag search neither errors nor double-counts it.
+	if _, err := s.UpsertDoc("docs/y.md", "---\ntags: [md]\n---\n\nbody keyword2 here.", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	for _, tags := range [][]string{{"md"}, {"docs", "md"}} {
+		hits, err := s.SearchText("keyword2", 10, tags)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) != 1 || hits[0].Doc != "docs/y.md" {
+			t.Fatalf("collided tag=%v: %+v", tags, hits)
+		}
+	}
 }
 
 // TestFrontmatterNoBlankLineExcluded reproduces frontmatter fusing with the
