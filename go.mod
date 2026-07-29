@@ -6,7 +6,7 @@ require (
 	github.com/asg017/sqlite-vec-go-bindings v0.1.6
 	github.com/eliben/go-sentencepiece v0.7.0
 	github.com/ncruces/go-sqlite3 v0.19.0
-	github.com/yalue/onnxruntime_go v1.31.0
+	github.com/yalue/onnxruntime_go v1.27.0
 )
 
 require (

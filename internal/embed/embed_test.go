@@ -14,11 +14,11 @@ func testEmbedder(t *testing.T) *Embedder {
 	if err != nil {
 		t.Fatal(err)
 	}
-	asset, err := ortAssetFor(runtime.GOOS, runtime.GOARCH)
+	assets, err := ortAssetsFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f := missingAsset(dir, asset); f != "" {
+	if f := missingAsset(dir, assets); f != "" {
 		t.Skipf("%s not cached; run 'ragrep init' to enable this test", f)
 	}
 	e, err := New(dir)
@@ -42,7 +42,10 @@ func TestEmbedProperties(t *testing.T) {
 	for _, x := range v {
 		norm += float64(x) * float64(x)
 	}
-	if math.Abs(norm-1.0) > 1e-3 {
+	// Inverted comparison so NaN (always-false comparisons) fails too: an
+	// fp16 overflow on the GPU path once turned every dimension NaN and the
+	// old `> 1e-3` check passed vacuously.
+	if !(math.Abs(norm-1.0) < 1e-3) {
 		t.Fatalf("not L2-normalized: %f", norm)
 	}
 }
@@ -59,8 +62,39 @@ func TestEmbedSimilarityOrdering(t *testing.T) {
 		}
 		return s
 	}
-	if cos(q, rel) <= cos(q, irrel) {
+	// Inverted comparison so NaN embeddings fail instead of passing vacuously.
+	if !(cos(q, rel) > cos(q, irrel)) {
 		t.Fatalf("similarity ordering wrong: rel=%f irrel=%f", cos(q, rel), cos(q, irrel))
+	}
+}
+
+func TestOrtAssetsFor(t *testing.T) {
+	win, err := ortAssetsFor("windows", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(win) != 2 || win[0].lib != "onnxruntime.dll" || win[1].lib != "DirectML.dll" {
+		t.Fatalf("windows assets = %+v", win)
+	}
+	if want := "runtimes/win-x64/native/onnxruntime.dll"; win[0].inner != want {
+		t.Fatalf("inner = %q, want %q", win[0].inner, want)
+	}
+	linux, err := ortAssetsFor("linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(linux) != 1 || linux[0].lib != "libonnxruntime.so" {
+		t.Fatalf("linux assets = %+v", linux)
+	}
+	mac, err := ortAssetsFor("darwin", "arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mac) != 1 || mac[0].lib != "libonnxruntime.dylib" {
+		t.Fatalf("darwin assets = %+v", mac)
+	}
+	if _, err := ortAssetsFor("plan9", "386"); err == nil {
+		t.Fatal("expected error for unsupported platform")
 	}
 }
 
@@ -68,7 +102,7 @@ func TestEmbedSimilarityOrdering(t *testing.T) {
 // This doubles as the download path's integration test.
 func TestEnsureAssets(t *testing.T) {
 	if os.Getenv("RAG_DOWNLOAD") != "1" {
-		t.Skip("set RAG_DOWNLOAD=1 to download ~310MB of model assets")
+		t.Skip("set RAG_DOWNLOAD=1 to download model assets (~1.4GB on Windows/fp32, ~310MB elsewhere)")
 	}
 	dir, err := CacheDir()
 	if err != nil {

@@ -15,7 +15,7 @@ func TestSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "model_quantized.onnx")); err != nil {
+	if !embed.ModelCached(dir) {
 		t.Skip("model not cached; run 'ragrep init' to enable this test")
 	}
 

@@ -17,21 +17,52 @@ import (
 )
 
 const (
-	ortVersion = "1.26.0" // must match onnxruntime_go's compiled ORT_API_VERSION
+	// must match onnxruntime_go's compiled ORT_API_VERSION (v1.27.0 = API 24);
+	// also the last ORT version Microsoft shipped a DirectML build for.
+	ortVersion = "1.24.4"
+	dmlVersion = "1.15.4" // Microsoft.AI.DirectML version the ORT DirectML nuspec pins
 	// Pinned to a commit sha (not "main") so the download can't silently
 	// change contents out from under a cached, unverified file.
-	repoBase     = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/5090578d9565bb06545b4552f76e6bc2c93e4a66/"
-	modelURL     = repoBase + "onnx/model_quantized.onnx"
-	modelDataURL = repoBase + "onnx/model_quantized.onnx_data"
-	spmURL       = repoBase + "tokenizer.model"
-	maxTokens    = 1022 // ponytail: truncate long paragraphs (context 2048); FTS still covers the tail
+	repoBase = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/5090578d9565bb06545b4552f76e6bc2c93e4a66/"
+	spmURL   = repoBase + "tokenizer.model"
+	spmFile  = "tokenizer.model"
 
-	modelFile     = "model_quantized.onnx"
-	modelDataFile = "model_quantized.onnx_data" // external weights; name is baked into modelFile's graph, must not be renamed
-	spmFile       = "tokenizer.model"
+	maxTokens = 1022 // ponytail: truncate long paragraphs (context 2048); FTS still covers the tail
 
 	bosID = 2
 	eosID = 1
+)
+
+// useDirectML: Windows runs inference on the GPU via the DirectML execution
+// provider. The int8-quantized model's ops aren't GPU-executable there, so
+// Windows uses the fp32 model (NOT fp16: Gemma activations overflow fp16's
+// range, and DML — unlike the CPU EP, which upcasts internally — executes
+// true fp16, yielding all-NaN embeddings). Other platforms keep the smaller
+// quantized model on CPU. Changing modelFile changes embedding values — bump
+// store.HashContent's version prefix so existing indexes re-embed.
+var useDirectML = runtime.GOOS == "windows"
+
+func modelName() string {
+	if useDirectML {
+		return "model.onnx"
+	}
+	return "model_quantized.onnx"
+}
+
+// ModelCached reports whether every asset New needs is already cached in dir.
+func ModelCached(dir string) bool {
+	assets, err := ortAssetsFor(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return false
+	}
+	return missingAsset(dir, assets) == ""
+}
+
+var (
+	modelFile     = modelName()
+	modelDataFile = modelFile + "_data" // external weights; name is baked into modelFile's graph, must not be renamed
+	modelURL      = repoBase + "onnx/" + modelFile
+	modelDataURL  = repoBase + "onnx/" + modelDataFile
 )
 
 // embedDim is the embeddinggemma-300m output dimension (matches the
@@ -41,21 +72,36 @@ const embedDim = 768
 
 type ortAsset struct{ url, inner, lib string }
 
-func ortAssetFor(goos, goarch string) (ortAsset, error) {
+func nupkgURL(pkg, ver string) string {
+	return "https://api.nuget.org/v3-flatcontainer/" + pkg + "/" + ver + "/" + pkg + "." + ver + ".nupkg"
+}
+
+// ortAssetsFor returns the archives to fetch and the shared libraries to
+// extract from them. The first entry is always the ONNX runtime library
+// itself. Windows uses the DirectML-enabled runtime from NuGet (the GitHub
+// release builds are CPU-only) plus its DirectML.dll dependency; other
+// platforms use the CPU build from GitHub releases.
+func ortAssetsFor(goos, goarch string) ([]ortAsset, error) {
 	base := "https://github.com/microsoft/onnxruntime/releases/download/v" + ortVersion + "/"
-	m := map[string]ortAsset{
-		"windows/amd64": {base + "onnxruntime-win-x64-" + ortVersion + ".zip",
-			"onnxruntime-win-x64-" + ortVersion + "/lib/onnxruntime.dll", "onnxruntime.dll"},
-		"windows/arm64": {base + "onnxruntime-win-arm64-" + ortVersion + ".zip",
-			"onnxruntime-win-arm64-" + ortVersion + "/lib/onnxruntime.dll", "onnxruntime.dll"},
-		"linux/amd64": {base + "onnxruntime-linux-x64-" + ortVersion + ".tgz",
-			"onnxruntime-linux-x64-" + ortVersion + "/lib/libonnxruntime.so." + ortVersion, "libonnxruntime.so"},
-		"darwin/arm64": {base + "onnxruntime-osx-arm64-" + ortVersion + ".tgz",
-			"onnxruntime-osx-arm64-" + ortVersion + "/lib/libonnxruntime." + ortVersion + ".dylib", "libonnxruntime.dylib"},
+	dmlAssets := func(rid, dmlArch string) []ortAsset {
+		return []ortAsset{
+			{nupkgURL("microsoft.ml.onnxruntime.directml", ortVersion),
+				"runtimes/" + rid + "/native/onnxruntime.dll", "onnxruntime.dll"},
+			{nupkgURL("microsoft.ai.directml", dmlVersion),
+				"bin/" + dmlArch + "-win/DirectML.dll", "DirectML.dll"},
+		}
+	}
+	m := map[string][]ortAsset{
+		"windows/amd64": dmlAssets("win-x64", "x64"),
+		"windows/arm64": dmlAssets("win-arm64", "arm64"),
+		"linux/amd64": {{base + "onnxruntime-linux-x64-" + ortVersion + ".tgz",
+			"onnxruntime-linux-x64-" + ortVersion + "/lib/libonnxruntime.so." + ortVersion, "libonnxruntime.so"}},
+		"darwin/arm64": {{base + "onnxruntime-osx-arm64-" + ortVersion + ".tgz",
+			"onnxruntime-osx-arm64-" + ortVersion + "/lib/libonnxruntime." + ortVersion + ".dylib", "libonnxruntime.dylib"}},
 	}
 	a, ok := m[goos+"/"+goarch]
 	if !ok {
-		return ortAsset{}, fmt.Errorf("unsupported platform %s/%s", goos, goarch)
+		return nil, fmt.Errorf("unsupported platform %s/%s", goos, goarch)
 	}
 	return a, nil
 }
@@ -98,10 +144,22 @@ func download(url, dest string) error {
 	return os.Rename(tmp, dest)
 }
 
+// libDir returns the versioned subdirectory holding the extracted runtime
+// libraries. Versioning the path (not just the filename) means bumping
+// ortVersion can never silently reuse a stale library extracted from an
+// older release — and DirectML.dll keeps its exact name, which the Windows
+// loader requires.
+func libDir(dir string) string {
+	return filepath.Join(dir, "ort-"+ortVersion)
+}
+
 // extractOrtLib downloads the onnxruntime release archive and extracts the
-// shared library named by asset.inner into dir as asset.lib.
+// shared library named by asset.inner into libDir(dir) as asset.lib.
 func extractOrtLib(dir string, asset ortAsset) error {
-	dest := filepath.Join(dir, asset.lib)
+	if err := os.MkdirAll(libDir(dir), 0o755); err != nil {
+		return err
+	}
+	dest := filepath.Join(libDir(dir), asset.lib)
 	if _, err := os.Stat(dest); err == nil {
 		return nil
 	}
@@ -126,7 +184,7 @@ func extractOrtLib(dir string, asset ortAsset) error {
 		return os.Rename(tmp, dest)
 	}
 
-	if filepath.Ext(archive) == ".zip" {
+	if ext := filepath.Ext(archive); ext == ".zip" || ext == ".nupkg" {
 		zr, err := zip.OpenReader(archive)
 		if err != nil {
 			return err
@@ -172,12 +230,14 @@ func extractOrtLib(dir string, asset ortAsset) error {
 // EnsureAssets downloads (if not already cached in dir) the ONNX runtime
 // shared library, the embedding model, and the tokenizer.
 func EnsureAssets(dir string) error {
-	asset, err := ortAssetFor(runtime.GOOS, runtime.GOARCH)
+	assets, err := ortAssetsFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return err
 	}
-	if err := extractOrtLib(dir, asset); err != nil {
-		return err
+	for _, asset := range assets {
+		if err := extractOrtLib(dir, asset); err != nil {
+			return err
+		}
 	}
 	if err := download(modelURL, filepath.Join(dir, modelFile)); err != nil {
 		return err
@@ -196,10 +256,15 @@ type Embedder struct {
 // missingAsset returns the name of the first required asset file not found
 // in dir, or "" if all are present. Shared by New (to error out) and
 // tests (to decide skip vs. run) so the two checks can't drift apart.
-func missingAsset(dir string, asset ortAsset) string {
-	for _, f := range []string{asset.lib, modelFile, modelDataFile, spmFile} {
+func missingAsset(dir string, assets []ortAsset) string {
+	for _, f := range []string{modelFile, modelDataFile, spmFile} {
 		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
 			return f
+		}
+	}
+	for _, a := range assets {
+		if _, err := os.Stat(filepath.Join(libDir(dir), a.lib)); err != nil {
+			return a.lib
 		}
 	}
 	return ""
@@ -208,14 +273,19 @@ func missingAsset(dir string, asset ortAsset) string {
 // New creates an Embedder using the ONNX runtime, model, and tokenizer
 // cached in dir (see EnsureAssets).
 func New(dir string) (*Embedder, error) {
-	asset, err := ortAssetFor(runtime.GOOS, runtime.GOARCH)
+	assets, err := ortAssetsFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return nil, err
 	}
-	if f := missingAsset(dir, asset); f != "" {
+	if f := missingAsset(dir, assets); f != "" {
 		return nil, fmt.Errorf("missing %s: run 'ragrep init' first", f)
 	}
-	ort.SetSharedLibraryPath(filepath.Join(dir, asset.lib))
+	ort.SetSharedLibraryPath(filepath.Join(libDir(dir), assets[0].lib))
+	if useDirectML {
+		// onnxruntime.dll resolves DirectML.dll through the standard DLL
+		// search, which doesn't include the lib dir; PATH is searched last.
+		os.Setenv("PATH", libDir(dir)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
 	if err := ort.InitializeEnvironment(); err != nil {
 		return nil, err
 	}
@@ -224,13 +294,46 @@ func New(dir string) (*Embedder, error) {
 		ort.DestroyEnvironment()
 		return nil, err
 	}
-	sess, err := ort.NewDynamicAdvancedSession(filepath.Join(dir, modelFile),
-		[]string{"input_ids", "attention_mask"}, []string{"sentence_embedding"}, nil)
+	sess, err := newSession(filepath.Join(dir, modelFile))
 	if err != nil {
 		ort.DestroyEnvironment()
 		return nil, err
 	}
 	return &Embedder{proc: proc, sess: sess}, nil
+}
+
+func newSession(model string) (*ort.DynamicAdvancedSession, error) {
+	in := []string{"input_ids", "attention_mask"}
+	out := []string{"sentence_embedding"}
+	if useDirectML {
+		sess, err := newDMLSession(model, in, out)
+		if err == nil {
+			return sess, nil
+		}
+		fmt.Fprintf(os.Stderr, "ragrep: DirectML unavailable (%v); falling back to CPU\n", err)
+	}
+	return ort.NewDynamicAdvancedSession(model, in, out, nil)
+}
+
+func newDMLSession(model string, in, out []string) (*ort.DynamicAdvancedSession, error) {
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, err
+	}
+	defer opts.Destroy()
+	// The DirectML EP requires memory patterns to be disabled.
+	if err := opts.SetMemPattern(false); err != nil {
+		return nil, err
+	}
+	// All graph nodes run on the GPU; ORT's default core-count intra-op pool
+	// would only spin-wait and burn CPU alongside it.
+	if err := opts.SetIntraOpNumThreads(1); err != nil {
+		return nil, err
+	}
+	if err := opts.AppendExecutionProviderDirectML(0); err != nil {
+		return nil, err
+	}
+	return ort.NewDynamicAdvancedSession(model, in, out, opts)
 }
 
 func (e *Embedder) Close() {

@@ -80,12 +80,13 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 // HashContent returns the versioned content hash used for change detection.
-// "v3\x00" versions it: bumping the prefix forces every doc to re-index once
+// "v4\x00" versions it: bumping the prefix forces every doc to re-index once
 // on the next `index` run (v2 = frontmatter tags, so pre-tags DBs get
 // doc_tags populated; v3 = heading breadcrumbs are now part of the embed
-// text, so every doc must re-embed).
+// text, so every doc must re-embed; v4 = Windows switched to the fp32 model
+// on DirectML, so its embeddings changed).
 func HashContent(content string) string {
-	h := sha256.Sum256([]byte("v3\x00" + content))
+	h := sha256.Sum256([]byte("v4\x00" + content))
 	return hex.EncodeToString(h[:])
 }
 
