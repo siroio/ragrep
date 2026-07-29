@@ -86,3 +86,20 @@ func ParseTags(content string) []string {
 	}
 	return tags
 }
+
+// autoTags derives tags from a root-relative slash path: each directory
+// segment plus the file extension, lowercased.
+func autoTags(path string) []string {
+	var tags []string
+	segs := strings.Split(path, "/")
+	for _, s := range segs[:len(segs)-1] {
+		if s != "" {
+			tags = append(tags, strings.ToLower(s))
+		}
+	}
+	name := segs[len(segs)-1]
+	if i := strings.LastIndexByte(name, '.'); i > 0 && i+1 < len(name) {
+		tags = append(tags, strings.ToLower(name[i+1:]))
+	}
+	return tags
+}

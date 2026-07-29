@@ -176,7 +176,12 @@ func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash str
 		}
 	}
 
-	for _, tag := range ParseTags(content) {
+	seenTags := map[string]bool{}
+	for _, tag := range append(ParseTags(content), autoTags(relPath)...) {
+		if seenTags[tag] {
+			continue
+		}
+		seenTags[tag] = true
 		if _, err := tx.Exec(`INSERT INTO doc_tags(doc_id, tag) VALUES(?,?)`, docID, tag); err != nil {
 			return false, err
 		}

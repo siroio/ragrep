@@ -1,6 +1,7 @@
 package store
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -149,6 +150,49 @@ func TestFrontmatterSeqRenumbered(t *testing.T) {
 	got, err := s.GetParas("fm.md", 0, 0)
 	if err != nil || got != "本文パラグラフ。" {
 		t.Fatalf("GetParas(0,0)=%q err=%v", got, err)
+	}
+}
+
+// TestAutoTags checks autoTags derives tags from directory segments and
+// file extension, lowercased.
+func TestAutoTags(t *testing.T) {
+	cases := []struct {
+		path string
+		want []string
+	}{
+		{"docs/design/foo.pdf", []string{"docs", "design", "pdf"}},
+		{"README.md", []string{"md"}},
+		{"Docs/API.md", []string{"docs", "md"}}, // lowercased
+		{"noext", nil},
+		{".hidden", nil}, // leading dot is not an extension
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			got := autoTags(c.path)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("autoTags(%q) = %v, want %v", c.path, got, c.want)
+			}
+		})
+	}
+}
+
+// TestUpsertDocMergesAutoTags checks the tag-write site in
+// UpsertDocWithHash merges frontmatter tags with path/extension-derived
+// auto tags, deduped.
+func TestUpsertDocMergesAutoTags(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("docs/x.md", "---\ntags: [api]\n---\n\nbody keyword here.", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tags := range [][]string{{"api"}, {"docs"}, {"md"}, {"md", "api"}} {
+		hits, err := s.SearchText("keyword", 10, tags)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) != 1 || hits[0].Doc != "docs/x.md" {
+			t.Fatalf("tag=%v: %+v", tags, hits)
+		}
 	}
 }
 
