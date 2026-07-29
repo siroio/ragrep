@@ -98,6 +98,51 @@ func TestOrtAssetsFor(t *testing.T) {
 	}
 }
 
+// TestPaddingInvariance: the DML path pads inputs to bucket lengths; the
+// masked padding must not change the embedding. Compares the padded
+// (useDirectML) output against the unpadded CPU output of the same model —
+// these matched to ~4 decimals when padding was introduced.
+func TestPaddingInvariance(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("padding is only applied on the DirectML path")
+	}
+	text := "title: none | text: 認証エラーはトークンの期限切れで発生する"
+	dir, err := CacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assets, err := ortAssetsFor(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := missingAsset(dir, assets); f != "" {
+		t.Skipf("%s not cached; run 'ragrep init' to enable this test", f)
+	}
+	embedOnce := func() []float32 {
+		e, err := New(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		v, err := e.Embed(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	padded := embedOnce()
+	useDirectML = false
+	t.Cleanup(func() { useDirectML = true })
+	unpadded := embedOnce()
+	var cos float64
+	for i := range padded {
+		cos += float64(padded[i]) * float64(unpadded[i])
+	}
+	if !(cos > 0.999) {
+		t.Fatalf("padded vs unpadded cosine = %f", cos)
+	}
+}
+
 // TestEnsureAssets downloads assets when RAG_DOWNLOAD=1 is set.
 // This doubles as the download path's integration test.
 func TestEnsureAssets(t *testing.T) {

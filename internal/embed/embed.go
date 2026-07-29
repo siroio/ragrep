@@ -352,17 +352,31 @@ func (e *Embedder) Embed(text string) ([]float32, error) {
 	}
 	ids = append(ids, eosID)
 	n := len(ids)
-	mask := make([]int64, n)
-	for i := range mask {
+	// DirectML JIT-compiles kernels per input shape (~100ms per new sequence
+	// length), so varying-length paragraphs would recompile on almost every
+	// call. Pad to a few fixed bucket lengths instead; the zeroed attention
+	// mask makes the in-graph pooling ignore the padding.
+	padded := n
+	if useDirectML {
+		for _, b := range []int{64, 128, 256, 512, maxTokens + 2} {
+			if n <= b {
+				padded = b
+				break
+			}
+		}
+	}
+	ids = append(ids, make([]int64, padded-n)...)
+	mask := make([]int64, padded)
+	for i := range mask[:n] {
 		mask[i] = 1
 	}
 
-	idT, err := ort.NewTensor(ort.NewShape(1, int64(n)), ids)
+	idT, err := ort.NewTensor(ort.NewShape(1, int64(padded)), ids)
 	if err != nil {
 		return nil, err
 	}
 	defer idT.Destroy()
-	maskT, err := ort.NewTensor(ort.NewShape(1, int64(n)), mask)
+	maskT, err := ort.NewTensor(ort.NewShape(1, int64(padded)), mask)
 	if err != nil {
 		return nil, err
 	}
