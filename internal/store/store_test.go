@@ -220,6 +220,21 @@ func TestSearchHitHeading(t *testing.T) {
 	}
 }
 
+func TestSearchHitMtime(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("docs/auth.md", "retry with backoff", 1234, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := s.SearchText("retry", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Mtime != 1234 {
+		t.Fatalf("unexpected hits: %+v", hits)
+	}
+}
+
 func TestFtsQuery(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{`parse config`, `"parse" OR "config"`},

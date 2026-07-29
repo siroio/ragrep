@@ -27,6 +27,8 @@ type Hit struct {
 	Score   float64 `json:"score"`
 	Snippet string  `json:"snippet"`
 	Heading string  `json:"heading,omitempty"`
+	Mtime   int64   `json:"-"`
+	Stale   bool    `json:"stale,omitempty"`
 }
 
 type Store struct{ db *sql.DB }
@@ -221,9 +223,9 @@ func (s *Store) hitsByParaIDs(ids []int64, scores map[int64]float64) ([]Hit, err
 		var start, end int
 		var text string
 		err := s.db.QueryRow(`
-			SELECT d.path, p.seq, p.start_line, p.end_line, p.text, p.heading
+			SELECT d.path, p.seq, p.start_line, p.end_line, p.text, p.heading, d.mtime
 			FROM paragraphs p JOIN documents d ON d.id = p.doc_id
-			WHERE p.id=?`, id).Scan(&h.Doc, &h.Para, &start, &end, &text, &h.Heading)
+			WHERE p.id=?`, id).Scan(&h.Doc, &h.Para, &start, &end, &text, &h.Heading, &h.Mtime)
 		if err != nil {
 			return nil, err
 		}

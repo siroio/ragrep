@@ -467,18 +467,41 @@ func cmdSearch(args []string) int {
 		fmt.Fprintln(os.Stderr, "no hits")
 		return 2
 	}
+	if wsRoot, werr := workspaceRoot(*db); werr == nil {
+		if n := markStale(hits, wsRoot); n > 0 {
+			fmt.Fprintf(os.Stderr, "warning: %d hit(s) reference files modified since indexing; run 'ragrep index' to refresh\n", n)
+		}
+	}
 	if *asJSON {
 		json.NewEncoder(os.Stdout).Encode(hits)
 	} else {
 		for _, h := range hits {
+			stale := ""
+			if h.Stale {
+				stale = " [stale]"
+			}
 			hdr := ""
 			if h.Heading != "" {
 				hdr = " | " + h.Heading
 			}
-			fmt.Printf("%s#%d (lines %s, score %.4f)%s\n  %s\n", h.Doc, h.Para, h.Lines, h.Score, hdr, h.Snippet)
+			fmt.Printf("%s#%d (lines %s, score %.4f)%s%s\n  %s\n", h.Doc, h.Para, h.Lines, h.Score, stale, hdr, h.Snippet)
 		}
 	}
 	return 0
+}
+
+// markStale flags hits whose on-disk file is missing or has a different
+// mtime than the indexed one. Returns the number of stale hits.
+func markStale(hits []store.Hit, root string) int {
+	n := 0
+	for i := range hits {
+		fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(hits[i].Doc)))
+		if err != nil || fi.ModTime().Unix() != hits[i].Mtime {
+			hits[i].Stale = true
+			n++
+		}
+	}
+	return n
 }
 
 // normPath converts p to the canonical DB key form: root-relative,

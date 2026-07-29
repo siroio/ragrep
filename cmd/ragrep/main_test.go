@@ -593,3 +593,36 @@ func TestPruneRootJoinStat(t *testing.T) {
 		t.Fatalf("keep.md: want kept, got %v", err)
 	}
 }
+
+// markStale flags hits whose on-disk file is missing or whose mtime differs
+// from the indexed one; hits already matching the real file are left alone.
+func TestMarkStale(t *testing.T) {
+	tmpdir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpdir, "a.md"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(tmpdir, "a.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	realMtime := info.ModTime().Unix()
+
+	hits := []store.Hit{
+		{Doc: "a.md", Mtime: realMtime},
+		{Doc: "a.md", Mtime: realMtime - 10},
+		{Doc: "gone.md", Mtime: 1},
+	}
+	n := markStale(hits, tmpdir)
+	if n != 2 {
+		t.Fatalf("n=%d, want 2", n)
+	}
+	if hits[0].Stale {
+		t.Fatal("hits[0] (fresh) marked stale")
+	}
+	if !hits[1].Stale {
+		t.Fatal("hits[1] (changed mtime) not marked stale")
+	}
+	if !hits[2].Stale {
+		t.Fatal("hits[2] (missing file) not marked stale")
+	}
+}
