@@ -101,8 +101,18 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash string, embed EmbedFunc) (bool, error) {
 	var docID int64
 	var oldHash string
-	err := s.db.QueryRow(`SELECT id, hash FROM documents WHERE path=?`, relPath).Scan(&docID, &oldHash)
+	var oldMtime int64
+	err := s.db.QueryRow(`SELECT id, hash, mtime FROM documents WHERE path=?`, relPath).Scan(&docID, &oldHash, &oldMtime)
 	if err == nil && oldHash == hash {
+		if oldMtime != mtime {
+			// Content is unchanged but the on-disk mtime moved (git checkout,
+			// touch, re-save): refresh it so markStale doesn't flag this doc
+			// forever -- without this, `ragrep index` never sees a "change"
+			// to clear the stale flag.
+			if _, err := s.db.Exec(`UPDATE documents SET mtime=? WHERE id=?`, mtime, docID); err != nil {
+				return false, err
+			}
+		}
 		return false, nil
 	}
 	if err != nil && err != sql.ErrNoRows {
@@ -442,6 +452,16 @@ func (s *Store) DocHash(relPath string) (string, error) {
 		return "", nil
 	}
 	return hash, err
+}
+
+// TouchDoc refreshes relPath's stored mtime without touching content, hash,
+// or paragraphs. Used by index paths that skip re-processing an unchanged
+// file (e.g. the document-converter skip, which never calls
+// UpsertDocWithHash at all when the source hash matches) but must still
+// clear staleness once the on-disk mtime moves.
+func (s *Store) TouchDoc(relPath string, mtime int64) error {
+	_, err := s.db.Exec(`UPDATE documents SET mtime=? WHERE path=?`, mtime, relPath)
+	return err
 }
 
 func (s *Store) GetDoc(relPath string) (string, error) {

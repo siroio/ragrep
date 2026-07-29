@@ -376,7 +376,14 @@ func cmdIndex(args []string) int {
 				}
 				srcHash := store.HashContent(string(raw))
 				if old, _ := s.DocHash(rel); old == srcHash {
-					// unchanged source: skip without running the converter
+					// unchanged source: skip without running the converter,
+					// but refresh the stored mtime so a touched-but-unchanged
+					// file doesn't stay flagged stale forever.
+					if info, err := d.Info(); err == nil {
+						if err := s.TouchDoc(rel, info.ModTime().Unix()); err != nil {
+							return err
+						}
+					}
 					return nil
 				}
 				text, err := runConverter(argv, path)

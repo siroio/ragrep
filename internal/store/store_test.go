@@ -235,6 +235,53 @@ func TestSearchHitMtime(t *testing.T) {
 	}
 }
 
+// TestUpsertDocRefreshesMtimeOnHashMatch reproduces the stale-flag-never-
+// clears bug: touching a file (mtime changes, e.g. git checkout or a
+// re-save) without changing its content must still update the stored mtime,
+// or markStale flags the hit forever since `ragrep index` never sees a
+// change to clear it.
+func TestUpsertDocRefreshesMtimeOnHashMatch(t *testing.T) {
+	s := newTestStore(t)
+	content := "retry with backoff"
+	if _, err := s.UpsertDoc("docs/auth.md", content, 100, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := s.UpsertDoc("docs/auth.md", content, 200, fakeEmbed)
+	if err != nil || changed {
+		t.Fatalf("re-upsert identical content: changed=%v err=%v", changed, err)
+	}
+
+	hits, err := s.SearchText("retry", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Mtime != 200 {
+		t.Fatalf("expected refreshed Mtime=200, got %+v", hits)
+	}
+}
+
+// TestTouchDoc checks TouchDoc refreshes only the stored mtime by path,
+// leaving content/hash/paragraphs untouched. Used by the converter index
+// path to clear staleness on an unchanged source file without re-running
+// the (expensive) converter.
+func TestTouchDoc(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("docs/auth.md", "retry with backoff", 100, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchDoc("docs/auth.md", 999); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.SearchText("retry", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Mtime != 999 {
+		t.Fatalf("expected Mtime=999 after TouchDoc, got %+v", hits)
+	}
+}
+
 // DocHash exposes the stored content hash so callers (the converter index
 // path) can skip re-conversion when the source file hasn't changed, without
 // re-embedding.
