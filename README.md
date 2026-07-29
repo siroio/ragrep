@@ -109,6 +109,24 @@ ragrep code verify --manifest pack.json --json          # manifestの陳腐化�
   起動される。未登録の言語や存在しないコマンドはエラーになり、自動ダウンロード・
   インストールは一切行わない（セキュリティ上、明示的な設定が必須）。
 
+## 精度評価 (ragrep eval)
+
+`ragrep eval` はJSONL形式のクエリ→正解ドキュメントのペアを実行し、recall@kを測定する。
+検索設定（`--mode`・埋め込みモデル・チャンク分割など）を変更したときの精度比較に使う。
+
+```
+# cases.jsonl: 1行1ケース。"doc"は正解ドキュメントのキー、"para"は省略可
+# （省略時はドキュメント単位で正解、0を含む数値を指定すると段落単位で厳密一致）
+{"query": "認証エラーの対処法", "doc": "docs/auth.md", "para": 2}
+
+ragrep eval cases.jsonl --mode hybrid -k 10
+```
+
+- 出力はミスしたケースを1行ずつ表示した後、`recall@10: 0.667 (2/3)` のようなサマリを出す。
+- 終了コード: 0=ファイルが読めた（recallの値に関わらず）/ 1=ファイルが読めない・壊れている・
+  ケースが0件。
+- 20〜50件程度の厳選したクエリ→ドキュメントのペアがあれば設定の比較に十分。
+
 ## Agent Skills
 
 `skills/` に [Agent Skills](https://agentskills.io) 形式のスキルを同梱。

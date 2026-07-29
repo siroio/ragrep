@@ -27,6 +27,7 @@ Usage:
   ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--tag t]...
   ragrep get <path> [--para N] [--context N] [--lines A-B]
   ragrep add [--tag t]... <path>            (reads content from stdin)
+  ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
   ragrep code index|search|get|expand|pack|verify ...  code symbol indexing/search (see 'ragrep code -h')
 
 Flags common to all commands:
@@ -75,6 +76,8 @@ func run(args []string) int {
 		return cmdGet(rest)
 	case "add":
 		return cmdAdd(rest)
+	case "eval":
+		return cmdEval(rest)
 	case "code":
 		return cmdCode(rest)
 	default:
@@ -496,32 +499,7 @@ func cmdSearch(args []string) int {
 	}
 	defer s.Close()
 
-	var hits []store.Hit
-	switch *mode {
-	case "text":
-		hits, err = s.SearchText(query, *k, []string(tags))
-	case "vector", "hybrid":
-		dir, derr := embed.CacheDir()
-		if derr != nil {
-			return fail(derr)
-		}
-		e, eerr := embed.New(dir)
-		if eerr != nil {
-			return fail(eerr)
-		}
-		defer e.Close()
-		qv, verr := e.Embed("task: search result | query: " + query)
-		if verr != nil {
-			return fail(verr)
-		}
-		if *mode == "vector" {
-			hits, err = s.SearchVector(qv, *k, []string(tags))
-		} else {
-			hits, err = s.SearchHybrid(query, qv, *k, []string(tags))
-		}
-	default:
-		return fail(fmt.Errorf("unknown mode %q", *mode))
-	}
+	hits, err := runSearch(s, *mode, query, *k, []string(tags))
 	if err != nil {
 		return fail(err)
 	}
@@ -550,6 +528,39 @@ func cmdSearch(args []string) int {
 		}
 	}
 	return 0
+}
+
+// runSearch builds hits for query using mode, the same way cmdSearch does --
+// shared with cmdEval so both run the identical text/vector/hybrid calls.
+// vector/hybrid modes construct a fresh embedder per call, same as cmdSearch
+// always did (each CLI invocation only ever does one query); cmdEval calling
+// this in a loop means vector/hybrid eval reloads the model per case, which
+// is fine for the k-case eval sets this is meant for.
+func runSearch(s *store.Store, mode, query string, k int, tags []string) ([]store.Hit, error) {
+	switch mode {
+	case "text":
+		return s.SearchText(query, k, tags)
+	case "vector", "hybrid":
+		dir, err := embed.CacheDir()
+		if err != nil {
+			return nil, err
+		}
+		e, err := embed.New(dir)
+		if err != nil {
+			return nil, err
+		}
+		defer e.Close()
+		qv, err := e.Embed("task: search result | query: " + query)
+		if err != nil {
+			return nil, err
+		}
+		if mode == "vector" {
+			return s.SearchVector(qv, k, tags)
+		}
+		return s.SearchHybrid(query, qv, k, tags)
+	default:
+		return nil, fmt.Errorf("unknown mode %q", mode)
+	}
 }
 
 // markStale flags hits whose on-disk file is missing or has a different
