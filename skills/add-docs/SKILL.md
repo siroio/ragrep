@@ -1,5 +1,5 @@
 ---
-name: adding-documents-with-ragrep
+name: add-docs
 description: Use when adding a new document to a ragrep-indexed corpus or tagging documents for filtered retrieval - frontmatter `tags:`, `ragrep add`, `search --tag`. Triggers: "add a note to the docs", "tag this document", ドキュメント追加, タグ付け.
 ---
 
@@ -11,7 +11,7 @@ description: Use when adding a new document to a ragrep-indexed corpus or taggin
 body from stdin, writes it to the given path, and indexes it immediately —
 no separate `ragrep index` call needed. It refuses to touch a path that
 already exists. For editing an existing document, see Updating below. For
-the search side of tags, see the searching-with-ragrep skill.
+the search side of tags, see the search skill.
 
 ## Frontmatter tags
 

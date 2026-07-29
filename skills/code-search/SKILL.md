@@ -1,5 +1,5 @@
 ---
-name: searching-code-with-ragrep
+name: code-search
 description: Use when a task requires locating or verifying code symbols (functions, methods, types) in a repo that has a ragrep code index (.ragrep/code.db) and the needed symbols/files are not already named in the request - finding where something is implemented, tracing callers/callees/references, or checking whether a claim about the code still holds. Do not use when every file and symbol the task needs is already given, or for general programming-language questions unrelated to this codebase. Triggers: "where is X implemented", "what calls Y", "find the function that...", シンボル検索, 呼び出し元.
 ---
 
@@ -60,7 +60,7 @@ relations) in one call and emits a stale-detectable manifest for later
 
 ## Ordering
 
-- **spec → plan**: use `searching-with-ragrep` on the docs first to pin down
+- **spec → plan**: use the `search` skill on the docs first to pin down
   the requirement, then this skill to locate the code it touches.
 - **plan → implementation**: before reading code from a saved pack, run
   `ragrep code verify --manifest <file>` to re-resolve stable keys and catch
