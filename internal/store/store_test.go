@@ -204,6 +204,22 @@ func TestSearchTextMultiWordOutOfOrder(t *testing.T) {
 	}
 }
 
+func TestSearchHitHeading(t *testing.T) {
+	s := newTestStore(t)
+	content := "# Auth\n\n## Errors\n\nretry with backoff"
+	if _, err := s.UpsertDoc("docs/auth.md", content, 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := s.SearchText("retry", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Heading != "Auth > Errors" {
+		t.Fatalf("unexpected hits: %+v", hits)
+	}
+}
+
 func TestFtsQuery(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{`parse config`, `"parse" OR "config"`},

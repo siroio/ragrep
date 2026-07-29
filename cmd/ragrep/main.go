@@ -471,7 +471,11 @@ func cmdSearch(args []string) int {
 		json.NewEncoder(os.Stdout).Encode(hits)
 	} else {
 		for _, h := range hits {
-			fmt.Printf("%s#%d (lines %s, score %.4f)\n  %s\n", h.Doc, h.Para, h.Lines, h.Score, h.Snippet)
+			hdr := ""
+			if h.Heading != "" {
+				hdr = " | " + h.Heading
+			}
+			fmt.Printf("%s#%d (lines %s, score %.4f)%s\n  %s\n", h.Doc, h.Para, h.Lines, h.Score, hdr, h.Snippet)
 		}
 	}
 	return 0

@@ -28,6 +28,20 @@ func TestSplitParas(t *testing.T) {
 			{Seq: 1, StartLine: 3, EndLine: 3, Text: "b"},
 		}},
 		{"empty input", "", nil},
+		{"headings", "# Auth\n\nintro text\n\n## Errors\n\nhandling text", []Para{
+			{Seq: 0, StartLine: 1, EndLine: 1, Text: "# Auth", Heading: "Auth"},
+			{Seq: 1, StartLine: 3, EndLine: 3, Text: "intro text", Heading: "Auth"},
+			{Seq: 2, StartLine: 5, EndLine: 5, Text: "## Errors", Heading: "Auth > Errors"},
+			{Seq: 3, StartLine: 7, EndLine: 7, Text: "handling text", Heading: "Auth > Errors"},
+		}},
+		{"no headings", "a\n\nb", []Para{
+			{Seq: 0, StartLine: 1, EndLine: 1, Text: "a"},
+			{Seq: 1, StartLine: 3, EndLine: 3, Text: "b"},
+		}},
+		{"heading level jump", "# A\n\n### B", []Para{
+			{Seq: 0, StartLine: 1, EndLine: 1, Text: "# A", Heading: "A"},
+			{Seq: 1, StartLine: 3, EndLine: 3, Text: "### B", Heading: "A > B"},
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

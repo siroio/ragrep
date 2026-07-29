@@ -26,6 +26,7 @@ type Hit struct {
 	Lines   string  `json:"lines"`
 	Score   float64 `json:"score"`
 	Snippet string  `json:"snippet"`
+	Heading string  `json:"heading,omitempty"`
 }
 
 type Store struct{ db *sql.DB }
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS paragraphs(
   seq INTEGER NOT NULL,
   start_line INTEGER NOT NULL,
   end_line INTEGER NOT NULL,
-  text TEXT NOT NULL
+  text TEXT NOT NULL,
+  heading TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_para_doc ON paragraphs(doc_id, seq);
 CREATE TABLE IF NOT EXISTS doc_tags(
@@ -66,16 +68,21 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Migration for DBs created before the heading column existed; fails
+	// with "duplicate column" on already-migrated/fresh DBs (ignored), any
+	// real breakage surfaces on the next query.
+	db.Exec(`ALTER TABLE paragraphs ADD COLUMN heading TEXT NOT NULL DEFAULT ''`)
 	return &Store{db: db}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc) (bool, error) {
-	// "v2\x00" versions the change-detection hash: bumping it forces every
+	// "v3\x00" versions the change-detection hash: bumping it forces every
 	// doc to re-index once on the next `index` run (v2 = frontmatter tags,
-	// so pre-tags DBs get doc_tags populated without a manual rebuild).
-	h := sha256.Sum256([]byte("v2\x00" + content))
+	// so pre-tags DBs get doc_tags populated; v3 = heading breadcrumbs are
+	// now part of the embed text, so every doc must re-embed).
+	h := sha256.Sum256([]byte("v3\x00" + content))
 	hash := hex.EncodeToString(h[:])
 
 	var docID int64
@@ -129,8 +136,8 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 		paraSrc = blankLines(content, fmLines)
 	}
 	for _, p := range splitParas(paraSrc) {
-		res, err := tx.Exec(`INSERT INTO paragraphs(doc_id, seq, start_line, end_line, text) VALUES(?,?,?,?,?)`,
-			docID, p.Seq, p.StartLine, p.EndLine, p.Text)
+		res, err := tx.Exec(`INSERT INTO paragraphs(doc_id, seq, start_line, end_line, text, heading) VALUES(?,?,?,?,?,?)`,
+			docID, p.Seq, p.StartLine, p.EndLine, p.Text, p.Heading)
 		if err != nil {
 			return false, err
 		}
@@ -138,7 +145,11 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 		if _, err := tx.Exec(`INSERT INTO fts(rowid, text) VALUES(?,?)`, paraID, p.Text); err != nil {
 			return false, err
 		}
-		v, err := embed("title: none | text: " + p.Text)
+		title := p.Heading
+		if title == "" {
+			title = "none"
+		}
+		v, err := embed("title: " + title + " | text: " + p.Text)
 		if err != nil {
 			return false, fmt.Errorf("embed %s#%d: %w", relPath, p.Seq, err)
 		}
@@ -210,9 +221,9 @@ func (s *Store) hitsByParaIDs(ids []int64, scores map[int64]float64) ([]Hit, err
 		var start, end int
 		var text string
 		err := s.db.QueryRow(`
-			SELECT d.path, p.seq, p.start_line, p.end_line, p.text
+			SELECT d.path, p.seq, p.start_line, p.end_line, p.text, p.heading
 			FROM paragraphs p JOIN documents d ON d.id = p.doc_id
-			WHERE p.id=?`, id).Scan(&h.Doc, &h.Para, &start, &end, &text)
+			WHERE p.id=?`, id).Scan(&h.Doc, &h.Para, &start, &end, &text, &h.Heading)
 		if err != nil {
 			return nil, err
 		}
