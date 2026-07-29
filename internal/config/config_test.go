@@ -110,3 +110,35 @@ func TestServerCommand(t *testing.T) {
 		t.Fatal("ServerCommand(python): want error for unregistered language, got nil")
 	}
 }
+
+// ConverterFor returns the registered argv for a known extension, lowering
+// the given extension before lookup (the map keys themselves are stored
+// as-is), and nil for one that isn't registered.
+func TestConverterFor(t *testing.T) {
+	root := t.TempDir()
+	writeConfig(t, root, `{"converters": {".pdf": ["pdftotext", "{input}", "-"]}}`)
+
+	cfg, err := Load(root)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	want := []string{"pdftotext", "{input}", "-"}
+	got := cfg.ConverterFor(".pdf")
+	if len(got) != len(want) {
+		t.Fatalf("ConverterFor(.pdf)=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ConverterFor(.pdf)=%v, want %v", got, want)
+		}
+	}
+
+	if got := cfg.ConverterFor(".PDF"); len(got) != len(want) {
+		t.Fatalf("ConverterFor(.PDF)=%v, want case-insensitive match %v", got, want)
+	}
+
+	if got := cfg.ConverterFor(".docx"); got != nil {
+		t.Fatalf("ConverterFor(.docx)=%v, want nil", got)
+	}
+}

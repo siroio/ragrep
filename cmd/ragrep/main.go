@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -274,6 +276,23 @@ func pruneDecision(statErr error) (prune bool, err error) {
 	return false, statErr
 }
 
+// runConverter executes a registered converter argv, replacing "{input}"
+// in each argument with the source path, and returns its stdout.
+func runConverter(argv []string, input string) (string, error) {
+	args := make([]string, len(argv)-1)
+	for i, a := range argv[1:] {
+		args[i] = strings.ReplaceAll(a, "{input}", input)
+	}
+	var out bytes.Buffer
+	cmd := exec.Command(argv[0], args...)
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
 func cmdIndex(args []string) int {
 	fset := newFlagSet("index")
 	db := dbFlag(fset)
@@ -318,6 +337,12 @@ func cmdIndex(args []string) int {
 	}
 	defer e.Close()
 
+	cfg, err := config.Load(wsRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: loading config: %v\n", err)
+		cfg = config.Config{}
+	}
+
 	indexed, skipped, excluded := 0, 0, 0
 	for _, root := range fset.Args() {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -333,6 +358,43 @@ func cmdIndex(args []string) int {
 			}
 			if !*includeCode && codeExtensions[strings.ToLower(filepath.Ext(name))] {
 				excluded++
+				return nil
+			}
+			if argv := cfg.ConverterFor(strings.ToLower(filepath.Ext(name))); argv != nil {
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "warning: reading %s: %v\n", path, err)
+					skipped++
+					return nil
+				}
+				rel, err := normPath(path, wsRoot)
+				if err != nil {
+					return err
+				}
+				srcHash := store.HashContent(string(raw))
+				if old, _ := s.DocHash(rel); old == srcHash {
+					// unchanged source: skip without running the converter
+					return nil
+				}
+				text, err := runConverter(argv, path)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "warning: convert %s: %v\n", path, err)
+					skipped++
+					return nil // one bad file must not kill the whole index run
+				}
+				info, err := d.Info()
+				if err != nil {
+					return err
+				}
+				// upsert with the SOURCE hash so unchanged files skip conversion next run
+				changed, err := s.UpsertDocWithHash(rel, text, info.ModTime().Unix(), srcHash, e.Embed)
+				if err != nil {
+					return fmt.Errorf("%s: %w", rel, err)
+				}
+				if changed {
+					fmt.Println("indexed", rel)
+					indexed++
+				}
 				return nil
 			}
 			info, err := d.Info()

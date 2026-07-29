@@ -79,14 +79,26 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc) (bool, error) {
-	// "v3\x00" versions the change-detection hash: bumping it forces every
-	// doc to re-index once on the next `index` run (v2 = frontmatter tags,
-	// so pre-tags DBs get doc_tags populated; v3 = heading breadcrumbs are
-	// now part of the embed text, so every doc must re-embed).
+// HashContent returns the versioned content hash used for change detection.
+// "v3\x00" versions it: bumping the prefix forces every doc to re-index once
+// on the next `index` run (v2 = frontmatter tags, so pre-tags DBs get
+// doc_tags populated; v3 = heading breadcrumbs are now part of the embed
+// text, so every doc must re-embed).
+func HashContent(content string) string {
 	h := sha256.Sum256([]byte("v3\x00" + content))
-	hash := hex.EncodeToString(h[:])
+	return hex.EncodeToString(h[:])
+}
 
+// UpsertDoc indexes content under relPath, keyed by its own content hash.
+func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc) (bool, error) {
+	return s.UpsertDocWithHash(relPath, content, mtime, HashContent(content), embed)
+}
+
+// UpsertDocWithHash is UpsertDoc with a caller-supplied hash: used by the
+// document-converter index path, which hashes the ORIGINAL (pre-conversion)
+// file bytes so an unchanged source file skips re-running the converter, not
+// just re-embedding.
+func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash string, embed EmbedFunc) (bool, error) {
 	var docID int64
 	var oldHash string
 	err := s.db.QueryRow(`SELECT id, hash FROM documents WHERE path=?`, relPath).Scan(&docID, &oldHash)
@@ -414,6 +426,17 @@ func (s *Store) DeleteDoc(relPath string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// DocHash returns the stored content hash for relPath, or "" if the
+// document isn't indexed yet.
+func (s *Store) DocHash(relPath string) (string, error) {
+	var hash string
+	err := s.db.QueryRow(`SELECT hash FROM documents WHERE path=?`, relPath).Scan(&hash)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return hash, err
 }
 
 func (s *Store) GetDoc(relPath string) (string, error) {

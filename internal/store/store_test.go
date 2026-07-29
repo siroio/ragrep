@@ -235,6 +235,32 @@ func TestSearchHitMtime(t *testing.T) {
 	}
 }
 
+// DocHash exposes the stored content hash so callers (the converter index
+// path) can skip re-conversion when the source file hasn't changed, without
+// re-embedding.
+func TestDocHash(t *testing.T) {
+	s := newTestStore(t)
+
+	if h, err := s.DocHash("missing.txt"); err != nil || h != "" {
+		t.Fatalf("DocHash(missing)=%q err=%v, want \"\",nil", h, err)
+	}
+
+	changed, err := s.UpsertDocWithHash("a.txt", "body", 1, "h123", fakeEmbed)
+	if err != nil || !changed {
+		t.Fatalf("UpsertDocWithHash: changed=%v err=%v", changed, err)
+	}
+	if h, err := s.DocHash("a.txt"); err != nil || h != "h123" {
+		t.Fatalf("DocHash(a.txt)=%q err=%v, want h123,nil", h, err)
+	}
+
+	// Re-upsert with the same caller-supplied hash: no re-embed, reported as
+	// unchanged even though the content string itself differs.
+	changed, err = s.UpsertDocWithHash("a.txt", "different body", 2, "h123", fakeEmbed)
+	if err != nil || changed {
+		t.Fatalf("re-upsert same hash: changed=%v err=%v", changed, err)
+	}
+}
+
 func TestFtsQuery(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{`parse config`, `"parse" OR "config"`},

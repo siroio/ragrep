@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Defaults used when config.json is absent, or when it doesn't set a field.
@@ -20,9 +21,10 @@ const (
 // Config is the shape of .ragrep/config.json. All paths are interpreted
 // relative to the workspace root (the directory containing .ragrep/).
 type Config struct {
-	DB      string            `json:"db"`
-	CodeDB  string            `json:"code_db"`
-	Servers map[string]string `json:"servers"`
+	DB         string              `json:"db"`
+	CodeDB     string              `json:"code_db"`
+	Servers    map[string]string   `json:"servers"`
+	Converters map[string][]string `json:"converters"`
 }
 
 // Load reads .ragrep/config.json from root. A missing file is not an error:
@@ -63,4 +65,10 @@ func (c Config) ServerCommand(lang string) (string, error) {
 		return "", fmt.Errorf("no language server registered for %q (add it to .ragrep/config.json servers)", lang)
 	}
 	return cmd, nil
+}
+
+// ConverterFor returns the registered converter argv for an extension
+// (".pdf"), or nil. Lookup is case-insensitive on the extension.
+func (c Config) ConverterFor(ext string) []string {
+	return c.Converters[strings.ToLower(ext)]
 }

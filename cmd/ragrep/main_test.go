@@ -127,6 +127,39 @@ func TestDBFlagEnvDefault(t *testing.T) {
 	}
 }
 
+// TestHelperProcess is not a real test: it's the "converter" runConverter's
+// tests exec as a subprocess (the stdlib os/exec self-exec pattern), guarded
+// by GO_WANT_HELPER_PROCESS so a normal `go test` run doesn't execute its
+// body as a test.
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	fmt.Println("converted:" + filepath.Base(os.Args[len(os.Args)-1]))
+	os.Exit(0)
+}
+
+// runConverter must substitute {input} into the argv, run it, and return
+// stdout; env must reach the child (exec.Command inherits os.Environ() by
+// default) so GO_WANT_HELPER_PROCESS set here via t.Setenv is visible to the
+// self-exec'd TestHelperProcess above.
+func TestRunConverter(t *testing.T) {
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	argv := []string{os.Args[0], "-test.run=TestHelperProcess", "--", "{input}"}
+
+	out, err := runConverter(argv, filepath.Join("tmp", "report.pdf"))
+	if err != nil {
+		t.Fatalf("runConverter: %v", err)
+	}
+	if out != "converted:report.pdf\n" {
+		t.Fatalf("runConverter output=%q, want %q", out, "converted:report.pdf\n")
+	}
+
+	if _, err := runConverter([]string{"ragrep-no-such-converter-binary"}, "x"); err == nil {
+		t.Fatal("runConverter: want error for unknown binary, got nil")
+	}
+}
+
 // From a subdirectory, the default db path resolves to the nearest ancestor's
 // existing .ragrep/index.db; with none, it stays cwd-relative.
 func TestDefaultDBPathWalksUp(t *testing.T) {

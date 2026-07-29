@@ -66,6 +66,24 @@ ragrep get --lines 12-18 docs/auth.md         # 行範囲
   このブロックを自動付与する（既存ファイルへの上書きは拒否、更新はファイル編集＋
   `ragrep index <path>` の再実行で行う）。
 
+## ドキュメント変換 (converters)
+
+PDF/Office等、そのままではテキストとして読めない拡張子は `.ragrep/config.json` の
+`converters` に登録したコマンドの標準出力を索引本文として使う。
+
+```
+# .ragrep/config.json に拡張子ごとの変換コマンドを登録（{input} は元ファイルパスに置換）
+{"converters": {
+  ".pdf": ["pdftotext", "{input}", "-"],
+  ".docx": ["pandoc", "{input}", "-t", "plain"],
+  ".pptx": ["markitdown", "{input}"]
+}}
+```
+
+- 言語サーバーと同じ信頼モデルで、`converters` に明示登録した拡張子・コマンドのみ
+  実行される（未登録の拡張子は通常のバイナリ/テキスト判定にフォールバック）。
+  変換コマンドの標準出力がそのまま索引本文になる。
+
 ## コード検索 (ragrep code)
 
 `ragrep code` はコードシンボル（関数・メソッド・型）専用の索引・検索で、文書用の
