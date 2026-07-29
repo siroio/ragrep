@@ -299,13 +299,27 @@ func (s *Store) SearchText(query string, k int, tags []string) ([]Hit, error) {
 	return s.hitsByParaIDs(ids, scores)
 }
 
-// rrfMerge combines rankings with Reciprocal Rank Fusion (k=60).
-// Returns ids sorted by descending score (ties: ascending id) and the score map.
+// rrfTextWeight and rrfVecWeight weight the two candidate lists passed to
+// rrfMerge (lists[0]=text, lists[1]=vector; see SearchHybrid). Measured
+// across multilingual eval sets, vector recall far exceeds trigram-FTS
+// recall for natural-language queries, so text-side noise must not outrank
+// vector-side confidence. The 0.5/1.0 ratio is a coarse design constant,
+// deliberately not tuned finely (overfitting guard).
+const (
+	rrfTextWeight = 0.5
+	rrfVecWeight  = 1.0
+)
+
+// rrfMerge combines rankings with Reciprocal Rank Fusion (k=60), weighting
+// the text list (lists[0]) and vector list (lists[1]) per rrfTextWeight and
+// rrfVecWeight. Returns ids sorted by descending score (ties: ascending id)
+// and the score map.
 func rrfMerge(lists [][]int64) ([]int64, map[int64]float64) {
+	weights := [2]float64{rrfTextWeight, rrfVecWeight}
 	scores := map[int64]float64{}
-	for _, l := range lists {
+	for i, l := range lists {
 		for r, id := range l {
-			scores[id] += 1.0 / float64(60+r+1)
+			scores[id] += weights[i] / float64(60+r+1)
 		}
 	}
 	ids := make([]int64, 0, len(scores))
