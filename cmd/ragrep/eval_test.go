@@ -96,6 +96,25 @@ func TestEvalCaseParse(t *testing.T) {
 		t.Fatal("want error for malformed JSON line")
 	}
 
+	// A typo'd key ("dok" instead of "doc") parses fine as valid JSON but
+	// leaves Doc=="", which would otherwise become a silent guaranteed miss
+	// that understates recall instead of surfacing as a parse error.
+	missingDoc := filepath.Join(dir, "missing_doc.jsonl")
+	if err := os.WriteFile(missingDoc, []byte(`{"query":"x","dok":"a.md"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readEvalCases(missingDoc); err == nil || !strings.Contains(err.Error(), "line 1") {
+		t.Fatalf("readEvalCases(missing doc key) = %v, want a line-numbered error", err)
+	}
+
+	missingQuery := filepath.Join(dir, "missing_query.jsonl")
+	if err := os.WriteFile(missingQuery, []byte("\n"+`{"doc":"a.md"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readEvalCases(missingQuery); err == nil || !strings.Contains(err.Error(), "line 2") {
+		t.Fatalf("readEvalCases(missing query key) = %v, want a line-numbered error", err)
+	}
+
 	db := filepath.Join(t.TempDir(), "index.db")
 	if code := run([]string{"eval", "--db", db, "--mode", "text", bad}); code != 1 {
 		t.Fatalf("eval malformed file: exit=%d, want 1", code)

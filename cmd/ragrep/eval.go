@@ -32,7 +32,9 @@ func readEvalCases(path string) ([]evalCase, error) {
 
 	var cases []evalCase
 	sc := bufio.NewScanner(f)
+	lineNo := 0
 	for sc.Scan() {
+		lineNo++
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
@@ -40,6 +42,9 @@ func readEvalCases(path string) ([]evalCase, error) {
 		var c evalCase
 		if err := json.Unmarshal([]byte(line), &c); err != nil {
 			return nil, fmt.Errorf("parsing eval case %q: %w", line, err)
+		}
+		if c.Query == "" || c.Doc == "" {
+			return nil, fmt.Errorf("line %d: eval case missing required \"query\" or \"doc\" key: %q", lineNo, line)
 		}
 		cases = append(cases, c)
 	}
