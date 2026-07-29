@@ -95,19 +95,28 @@ ragrep code verify --manifest pack.json --json          # manifestの陳腐化�
 
 `skills/` に [Agent Skills](https://agentskills.io) 形式のスキルを同梱。
 エージェント（Claude Code / Codex / Copilot CLI / Gemini CLI等）がRetrieval Plannerとして
-ragrepを使うための手順書で、スキルディレクトリへコピーするだけで使える。
+ragrepを使うための手順書。
 
 | スキル | 内容 |
 |---|---|
-| `skills/searching-with-ragrep/` | 検索→取得→コンテキスト拡張のワークフロー |
-| `skills/setting-up-ragrep/` | ビルド・init・インデックス運用・トラブルシュート |
-| `skills/adding-documents-with-ragrep/` | `ragrep add`によるtag付き新規文書の追加 |
-| `skills/searching-code-with-ragrep/` | コードシンボル検索→LSP検証→段階的本文取得のワークフロー |
+| `skills/search/` | 検索→取得→コンテキスト拡張のワークフロー |
+| `skills/setup/` | ビルド・init・インデックス運用・トラブルシュート |
+| `skills/add-docs/` | `ragrep add`によるtag付き新規文書の追加 |
+| `skills/code-search/` | コードシンボル検索→LSP検証→段階的本文取得のワークフロー |
 
-コピー先:
+### インストール
 
-- Claude Code: `.claude/skills/`（プロジェクト）または `~/.claude/skills/`（全体）
-- Codex / Copilot CLI / Gemini CLI: `~/.agents/skills/`
+各エージェントのプラグイン機構で直接インストールできる
+（Claude Codeではスキル名が `ragrep:search` のように参照される）:
+
+| エージェント | コマンド |
+|---|---|
+| Claude Code | `/plugin marketplace add siroio/ragrep` → `/plugin install ragrep@ragrep` |
+| Gemini CLI | `gemini extensions install https://github.com/siroio/ragrep` |
+| GitHub Copilot CLI | `copilot plugin marketplace add siroio/ragrep` → `copilot plugin install ragrep@ragrep` |
+| Kimi Code | `/plugins install https://github.com/siroio/ragrep` |
+| Factory Droid | `droid plugin marketplace add https://github.com/siroio/ragrep` → `droid plugin install ragrep@ragrep` |
+| Codex / Cursor / その他 | `npx skills add siroio/ragrep`（[skills.sh](https://skills.sh)、対話的に選択） |
 
 基本ワークフロー（Adaptive Context Expansion）:
 

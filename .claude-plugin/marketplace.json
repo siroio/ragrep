@@ -1,0 +1,14 @@
+{
+  "name": "ragrep",
+  "description": "ragrep agent skills marketplace",
+  "owner": {
+    "name": "siroio"
+  },
+  "plugins": [
+    {
+      "name": "ragrep",
+      "source": "./",
+      "description": "Agent skills for ragrep: hybrid (vector + full-text) search over docs and code symbols"
+    }
+  ]
+}

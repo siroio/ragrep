@@ -1,0 +1,5 @@
+{
+  "name": "ragrep",
+  "version": "0.1.0",
+  "description": "Agent skills for ragrep: hybrid (vector + full-text) search over docs and code symbols"
+}

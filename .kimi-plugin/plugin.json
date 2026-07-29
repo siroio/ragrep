@@ -1,0 +1,12 @@
+{
+  "name": "ragrep",
+  "version": "0.1.0",
+  "description": "Agent skills for ragrep: hybrid (vector + full-text) search over docs and code symbols",
+  "author": {
+    "name": "siroio"
+  },
+  "homepage": "https://github.com/siroio/ragrep",
+  "license": "MIT",
+  "keywords": ["search", "rag", "retrieval", "skills", "code-search"],
+  "skills": "./skills/"
+}
