@@ -8,11 +8,46 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/siroio/ragrep/internal/store"
 )
+
+func TestNormalizeInterspersedArgs(t *testing.T) {
+	fs := newFlagSet("test")
+	fs.String("mode", "hybrid", "")
+	fs.Int("k", 10, "")
+	fs.Bool("json", false, "")
+	var tags strFlags
+	fs.Var(&tags, "tag", "")
+
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"flags first", []string{"--json", "-k", "5", "query"}, []string{"--json", "-k", "5", "query"}},
+		{"flags last", []string{"query", "--json", "-k", "5"}, []string{"--json", "-k", "5", "query"}},
+		{"mixed and repeated", []string{"a", "--tag", "x", "b", "--tag=y"}, []string{"--tag", "x", "--tag=y", "a", "b"}},
+		{"equals", []string{"query", "--mode=text"}, []string{"--mode=text", "query"}},
+		{"dash-prefixed value", []string{"query", "-k", "-1"}, []string{"-k", "-1", "query"}},
+		{"single dash positional", []string{"-", "--json"}, []string{"--json", "-"}},
+		{"terminator", []string{"query", "--json", "--", "-k", "literal"}, []string{"--json", "--", "query", "-k", "literal"}},
+		{"unknown flag retained", []string{"query", "--bogus"}, []string{"--bogus", "query"}},
+		{"missing value retained", []string{"query", "--mode"}, []string{"query", "--mode"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeInterspersedArgs(fs, tt.in)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 // fakeEmbed returns a fixed-dimension deterministic vector (no ONNX needed).
 // Duplicated from internal/store's test helper of the same name: that one is
