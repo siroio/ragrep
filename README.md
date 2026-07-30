@@ -80,34 +80,10 @@ PDF/Office等、そのままではテキストとして読めない拡張子は 
 }}
 ```
 
-- 言語サーバーと同じ信頼モデルで、`converters` に明示登録した拡張子・コマンドのみ
-  実行される（未登録の拡張子は通常のバイナリ/テキスト判定にフォールバック）。
+- `converters` に明示登録した拡張子・コマンドのみ実行される（未登録の拡張子は
+  通常のバイナリ/テキスト判定にフォールバック）。自動ダウンロード・インストールは
+  一切行わない（セキュリティ上、明示的な設定が必須）。
   変換コマンドの標準出力がそのまま索引本文になる。
-
-## コード検索 (ragrep code)
-
-`ragrep code` はコードシンボル（関数・メソッド・型）専用の索引・検索で、文書用の
-`index.db` とは別の `code.db` を使う（`--db PATH` か `.ragrep/config.json` の
-`code_db`、デフォルト `.ragrep/code.db`）。検索はハイブリッド（ベクトル+全文）
-による**候補生成**のみを行い、定義・参照・呼び出し元/先などの関係は言語サーバー
-（LSP）が実際に問い合わせて検証する。検索・pack結果は候補であり、LSP・ビルド・
-テストによる検証を経ていない前提で扱うこと。
-
-```
-# .ragrep/config.json に言語ごとの言語サーバーを登録（未登録の言語はエラー）
-{"servers": {"go": "gopls"}}
-
-ragrep code index --language go .                       # シンボルを索引（再帰、edit後は再実行）
-ragrep code search --json -k 5 "parse config"           # 候補検索（本文なし）
-ragrep code get --symbol <key> --body                   # 1シンボルの本文取得
-ragrep code expand --symbol <key> --relation references # LSPで参照関係を検証
-ragrep code pack --query "..." --select <key> --json    # 候補+本文+manifestを一括生成
-ragrep code verify --manifest pack.json --json          # manifestの陳腐化・再解決を確認
-```
-
-- 言語サーバーは `.ragrep/config.json` の `servers` に明示登録した実行コマンドのみ
-  起動される。未登録の言語や存在しないコマンドはエラーになり、自動ダウンロード・
-  インストールは一切行わない（セキュリティ上、明示的な設定が必須）。
 
 ## 精度評価 (ragrep eval)
 
@@ -138,7 +114,6 @@ ragrepを使うための手順書。
 | `skills/search/` | 検索→取得→コンテキスト拡張のワークフロー |
 | `skills/setup/` | ビルド・init・インデックス運用・トラブルシュート |
 | `skills/add-docs/` | `ragrep add`によるtag付き新規文書の追加 |
-| `skills/code-search/` | コードシンボル検索→LSP検証→段階的本文取得のワークフロー |
 
 ### インストール
 

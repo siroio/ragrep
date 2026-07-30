@@ -8,7 +8,7 @@
     {
       "name": "ragrep",
       "source": "./",
-      "description": "Agent skills for ragrep: hybrid (vector + full-text) search over docs and code symbols"
+      "description": "Agent skills for ragrep: hybrid (vector + full-text) search over docs"
     }
   ]
 }

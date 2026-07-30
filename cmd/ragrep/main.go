@@ -28,7 +28,6 @@ Usage:
   ragrep get <path> [--para N] [--context N] [--lines A-B]
   ragrep add [--tag t]... <path>            (reads content from stdin)
   ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
-  ragrep code index|search|get|expand|pack|verify ...  code symbol indexing/search (see 'ragrep code -h')
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
@@ -78,8 +77,6 @@ func run(args []string) int {
 		return cmdAdd(rest)
 	case "eval":
 		return cmdEval(rest)
-	case "code":
-		return cmdCode(rest)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return 1
@@ -144,20 +141,12 @@ func newFlagSet(name string) *flag.FlagSet {
 // Any other parse error goes through fail(). handled is true when the caller
 // should return code immediately instead of continuing.
 func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
-	return parseArgsUsage(fs, args, usage)
-}
-
-// parseArgsUsage is parseArgs, printing usageText instead of the top-level
-// document-index usage on -h/--help -- cmd/ragrep's code.go uses this with
-// codeUsage so `ragrep code <sub> -h` prints the `code` subcommand help, not
-// the unrelated top-level one.
-func parseArgsUsage(fs *flag.FlagSet, args []string, usageText string) (code int, handled bool) {
 	err := fs.Parse(args)
 	if err == nil {
 		return 0, false
 	}
 	if err == flag.ErrHelp {
-		fmt.Fprint(os.Stderr, usageText)
+		fmt.Fprint(os.Stderr, usage)
 		return 0, true
 	}
 	return fail(err), true
@@ -258,8 +247,8 @@ func isTextFile(path string) bool {
 const maxFileSize = 10 << 20 // 10MB
 
 // codeExtensions are file extensions the document `index` command excludes
-// by default -- source code belongs in the code index (`ragrep code index`),
-// not the document index. --include-code disables this exclusion.
+// by default -- source code pollutes document search results.
+// --include-code disables this exclusion.
 var codeExtensions = map[string]bool{
 	".go": true, ".py": true, ".js": true, ".ts": true, ".java": true,
 	".c": true, ".cpp": true, ".h": true, ".rs": true,

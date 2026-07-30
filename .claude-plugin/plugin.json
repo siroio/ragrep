@@ -1,6 +1,6 @@
 {
   "name": "ragrep",
-  "description": "Agent skills for ragrep: hybrid (vector + full-text) search over docs and code symbols",
+  "description": "Agent skills for ragrep: hybrid (vector + full-text) search over docs",
   "version": "0.1.0",
   "author": {
     "name": "siroio"
