@@ -183,7 +183,7 @@ func normalizeInterspersedArgs(fs *flag.FlagSet, args []string) []string {
 			continue
 		}
 		if i+1 == len(args) {
-			return append([]string(nil), args...)
+			return append([]string(nil), flags...)
 		}
 		i++
 		flags = append(flags, args[i])
@@ -208,7 +208,7 @@ func splitFlagArg(arg string) (name string, inlineValue, ok bool) {
 		name = name[:i]
 		inlineValue = true
 	}
-	return name, inlineValue, name != ""
+	return name, inlineValue, true
 }
 
 // workspaceRoot derives the workspace root from a --db path: the normal
