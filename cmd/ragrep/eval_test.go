@@ -45,7 +45,7 @@ func TestEvalRecall(t *testing.T) {
 	}
 	old := os.Stdout
 	os.Stdout = w
-	code := run([]string{"eval", "--db", dbPath, "--mode", "text", "-k", "10", evalPath})
+	code := run([]string{"eval", evalPath, "--db", dbPath, "--mode", "text", "-k", "10"})
 	w.Close()
 	os.Stdout = old
 	var buf bytes.Buffer

@@ -141,7 +141,7 @@ func newFlagSet(name string) *flag.FlagSet {
 // Any other parse error goes through fail(). handled is true when the caller
 // should return code immediately instead of continuing.
 func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
-	err := fs.Parse(args)
+	err := fs.Parse(normalizeInterspersedArgs(fs, args))
 	if err == nil {
 		return 0, false
 	}
