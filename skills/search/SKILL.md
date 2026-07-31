@@ -5,10 +5,10 @@ description: Use when answering or working requires exploring, cross-checking, o
 
 # Searching with ragrep
 
-資料の探索が必要なら、まず `ragrep search` を短い主要語句で使う。検索語の分け方、検索回数、本文取得や他の検索手段への切り替えは、資料の構造と未回答点に応じて判断する。
+If materials need exploring, first use `ragrep search` with a short query of the main terms. Choose query splitting, search count, text retrieval, and whether/when to switch to other search methods based on the material's structure and unanswered points.
 
-回答の主張には、その主張を直接確認できる資料・節を根拠として添える。
+Support each claim with the material or section that directly confirms it.
 
-検索結果や `stale: true` は候補であり、断定は現行本文で確認する。再索引やDB変更は、依頼または許可がある場合だけ行う。
+Treat results and `stale: true` as candidates; verify current text before asserting. Reindex or change the DB only when requested or authorized.
 
-資料に明記されたことと未確定のことを区別し、根拠のない補完をしない。未確認の点は、必要な場合だけ確認範囲を添えて示す。必要な根拠が揃ったら停止し、確認できない点は不明として示す。`AGENTS.md` と資料の `status` を優先する。
+Separate what materials explicitly state from what remains unresolved; do not fill gaps without evidence. For unverified points, state the checked scope only when needed. Stop when evidence suffices; mark unconfirmed points as unknown. Prioritize `AGENTS.md` and the material's `status`.
