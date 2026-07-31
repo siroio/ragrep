@@ -8,11 +8,46 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/siroio/ragrep/internal/store"
 )
+
+func TestNormalizeInterspersedArgs(t *testing.T) {
+	fs := newFlagSet("test")
+	fs.String("mode", "hybrid", "")
+	fs.Int("k", 10, "")
+	fs.Bool("json", false, "")
+	var tags strFlags
+	fs.Var(&tags, "tag", "")
+
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"flags first", []string{"--json", "-k", "5", "query"}, []string{"--json", "-k", "5", "query"}},
+		{"flags last", []string{"query", "--json", "-k", "5"}, []string{"--json", "-k", "5", "query"}},
+		{"mixed and repeated", []string{"a", "--tag", "x", "b", "--tag=y"}, []string{"--tag", "x", "--tag=y", "a", "b"}},
+		{"equals", []string{"query", "--mode=text"}, []string{"--mode=text", "query"}},
+		{"dash-prefixed value", []string{"query", "-k", "-1"}, []string{"-k", "-1", "query"}},
+		{"single dash positional", []string{"-", "--json"}, []string{"--json", "-"}},
+		{"terminator", []string{"query", "--json", "--", "-k", "literal"}, []string{"--json", "--", "query", "-k", "literal"}},
+		{"unknown flag retained", []string{"query", "--bogus"}, []string{"--bogus", "query"}},
+		{"missing value retained", []string{"query", "--mode"}, []string{"--mode"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeInterspersedArgs(fs, tt.in)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 // fakeEmbed returns a fixed-dimension deterministic vector (no ONNX needed).
 // Duplicated from internal/store's test helper of the same name: that one is
@@ -37,12 +72,151 @@ func newTestStore(t *testing.T) *store.Store {
 	return s
 }
 
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+func TestParseArgsAcceptsInterspersedFlags(t *testing.T) {
+	fs := newFlagSet("test")
+	mode := fs.String("mode", "hybrid", "")
+	k := fs.Int("k", 10, "")
+	asJSON := fs.Bool("json", false, "")
+	var tags strFlags
+	fs.Var(&tags, "tag", "")
+
+	code, handled := parseArgs(fs, []string{"first", "--json", "--tag", "a", "second", "-k", "5", "--mode=text", "--tag=b"})
+	if handled || code != 0 {
+		t.Fatalf("parseArgs: code=%d handled=%v, want 0,false", code, handled)
+	}
+	if got, want := fs.Args(), []string{"first", "second"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Args=%q, want %q", got, want)
+	}
+	if *mode != "text" || *k != 5 || !*asJSON {
+		t.Fatalf("mode=%q k=%d json=%v", *mode, *k, *asJSON)
+	}
+	if got, want := []string(tags), []string{"a", "b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("tags=%q, want %q", got, want)
+	}
+}
+
+func TestParseArgsRejectsMalformedOrIncompleteFlagsAfterPositionals(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"missing terminal value", []string{"query", "--mode"}},
+		{"empty long flag name", []string{"query", "--=x"}},
+		{"empty short flag name", []string{"query", "-=x"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newFlagSet("test")
+			fs.String("mode", "hybrid", "")
+
+			code, handled := parseArgs(fs, tt.args)
+			if code != 1 || !handled {
+				t.Fatalf("parseArgs(%q): code=%d handled=%v, want 1,true", tt.args, code, handled)
+			}
+		})
+	}
+}
+
 // -h/--help must print usage and exit 0, not read as a generic parse error
 // (exit 1). Doesn't need the model: parsing fails before the embedder or DB
 // are ever touched.
 func TestHelpExitsZero(t *testing.T) {
 	if code := run([]string{"search", "-h"}); code != 0 {
 		t.Fatalf("search -h exit=%d, want 0", code)
+	}
+	if code := run([]string{"search", "query", "-h"}); code != 0 {
+		t.Fatalf("search query -h exit=%d, want 0", code)
+	}
+}
+
+func TestGetAcceptsFlagsAfterPath(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("a.md", "alpha paragraph.", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	if code := run([]string{"get", "a.md", "--db", dbPath, "--para", "0"}); code != 0 {
+		t.Fatalf("get path --flags exit=%d, want 0", code)
+	}
+}
+
+func TestSearchAcceptsValueFlagsAfterQuery(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("a.md", "alpha query", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	if code := run([]string{"search", "query", "--db", dbPath, "--mode", "text", "-k", "1"}); code != 0 {
+		t.Fatalf("search query --db --mode -k exit=%d, want 0", code)
+	}
+}
+
+func TestIndexAcceptsMultiplePathsBeforeFlags(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, ".ragrep", "index.db")
+	first := filepath.Join(root, "first")
+	second := filepath.Join(root, "second")
+	for _, path := range []string{first, second} {
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if code := run([]string{"index", first, second, "--db", dbPath}); code != 0 {
+		t.Fatalf("index paths --db exit=%d, want 0", code)
+	}
+}
+
+func TestAddAcceptsFlagsAfterExistingPath(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "existing.md")
+	if err := os.WriteFile(path, []byte("already here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, ".ragrep", "index.db")
+
+	stderr := captureStderr(t, func() {
+		if code := run([]string{"add", path, "--db", dbPath, "--tag", "x"}); code != 1 {
+			t.Fatalf("add path --db --tag exit=%d, want 1", code)
+		}
+	})
+	if !strings.Contains(stderr, "already exists; edit it") {
+		t.Fatalf("add path --db --tag stderr=%q, want existing-file refusal", stderr)
 	}
 }
 

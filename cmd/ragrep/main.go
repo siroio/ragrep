@@ -141,7 +141,7 @@ func newFlagSet(name string) *flag.FlagSet {
 // Any other parse error goes through fail(). handled is true when the caller
 // should return code immediately instead of continuing.
 func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
-	err := fs.Parse(args)
+	err := fs.Parse(normalizeInterspersedArgs(fs, args))
 	if err == nil {
 		return 0, false
 	}
@@ -150,6 +150,65 @@ func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
 		return 0, true
 	}
 	return fail(err), true
+}
+
+type boolFlag interface {
+	IsBoolFlag() bool
+}
+
+func normalizeInterspersedArgs(fs *flag.FlagSet, args []string) []string {
+	flags := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			out := append(flags, "--")
+			out = append(out, positionals...)
+			return append(out, args[i+1:]...)
+		}
+
+		name, inlineValue, isFlag := splitFlagArg(arg)
+		if !isFlag {
+			positionals = append(positionals, arg)
+			continue
+		}
+
+		flags = append(flags, arg)
+		f := fs.Lookup(name)
+		if inlineValue || f == nil {
+			continue
+		}
+		if bf, ok := f.Value.(boolFlag); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if i+1 == len(args) {
+			return append([]string(nil), flags...)
+		}
+		i++
+		flags = append(flags, args[i])
+	}
+
+	return append(flags, positionals...)
+}
+
+func splitFlagArg(arg string) (name string, inlineValue, ok bool) {
+	if len(arg) < 2 || arg[0] != '-' || arg == "-" {
+		return "", false, false
+	}
+	n := 1
+	if len(arg) > 1 && arg[1] == '-' {
+		n = 2
+	}
+	if len(arg) == n {
+		return "", false, false
+	}
+	name = arg[n:]
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+		inlineValue = true
+	}
+	return name, inlineValue, true
 }
 
 // workspaceRoot derives the workspace root from a --db path: the normal
