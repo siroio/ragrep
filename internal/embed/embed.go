@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -115,6 +117,16 @@ func CacheDir() (string, error) {
 	}
 	dir := filepath.Join(base, "ragrep")
 	return dir, os.MkdirAll(dir, 0o755)
+}
+
+// Fingerprint identifies the embedding model used by a session endpoint.
+func Fingerprint(dir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, modelFile))
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func download(url, dest string) error {

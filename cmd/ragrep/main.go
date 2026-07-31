@@ -16,6 +16,7 @@ import (
 
 	"github.com/siroio/ragrep/internal/config"
 	"github.com/siroio/ragrep/internal/embed"
+	"github.com/siroio/ragrep/internal/session"
 	"github.com/siroio/ragrep/internal/store"
 )
 
@@ -24,10 +25,11 @@ const usage = `ragrep - adaptive retrieval unit search CLI
 Usage:
   ragrep init                              create DB, download model assets
   ragrep index <path>... [--prune] [--include-code]   index text files (recursive)
-  ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--tag t]...
-  ragrep get <path> [--para N] [--context N] [--lines A-B]
+  ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--tag t]... [--session PATH]
+  ragrep get <path> [--para N] [--context N] [--lines A-B] [--session PATH]
   ragrep add [--tag t]... <path>            (reads content from stdin)
   ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
+  ragrep serve --db PATH --endpoint PATH [--idle-timeout D]  serve a local session
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
@@ -77,6 +79,8 @@ func run(args []string) int {
 		return cmdAdd(rest)
 	case "eval":
 		return cmdEval(rest)
+	case "serve":
+		return cmdServe(rest)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return 1
@@ -538,6 +542,7 @@ func cmdSearch(args []string) int {
 	mode := fs.String("mode", "hybrid", "hybrid|vector|text")
 	k := fs.Int("k", 10, "max results")
 	asJSON := fs.Bool("json", false, "JSON output")
+	sessionEndpoint := fs.String("session", "", "path to a running session endpoint")
 	var tags strFlags
 	fs.Var(&tags, "tag", "filter to docs having this tag (repeatable, AND)")
 	if code, handled := parseArgs(fs, args); handled {
@@ -547,6 +552,9 @@ func cmdSearch(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep search <query>"))
 	}
 	query := fs.Arg(0)
+	if *sessionEndpoint != "" {
+		return cmdSearchSession(*sessionEndpoint, *db, *mode, query, *k, []string(tags), *asJSON)
+	}
 
 	s, err := openStoreAt(*db)
 	if err != nil {
@@ -558,16 +566,20 @@ func cmdSearch(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	return printSearchResults(hits, *db, *asJSON)
+}
+
+func printSearchResults(hits []store.Hit, db string, asJSON bool) int {
 	if len(hits) == 0 {
 		fmt.Fprintln(os.Stderr, "no hits")
 		return 2
 	}
-	if wsRoot, werr := workspaceRoot(*db); werr == nil {
+	if wsRoot, werr := workspaceRoot(db); werr == nil {
 		if n := markStale(hits, wsRoot); n > 0 {
 			fmt.Fprintf(os.Stderr, "warning: %d hit(s) reference files modified since indexing; run 'ragrep index' to refresh\n", n)
 		}
 	}
-	if *asJSON {
+	if asJSON {
 		json.NewEncoder(os.Stdout).Encode(hits)
 	} else {
 		for _, h := range hits {
@@ -666,6 +678,7 @@ func cmdGet(args []string) int {
 	para := fs.Int("para", -1, "paragraph number (from search results)")
 	context := fs.Int("context", 0, "±N paragraphs around --para")
 	lines := fs.String("lines", "", "line range A-B")
+	sessionEndpoint := fs.String("session", "", "path to a running session endpoint")
 	if code, handled := parseArgs(fs, args); handled {
 		return code
 	}
@@ -673,6 +686,9 @@ func cmdGet(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep get <path>"))
 	}
 	arg := fs.Arg(0)
+	if *sessionEndpoint != "" {
+		return cmdGetSession(*sessionEndpoint, *db, arg, *lines, *para, *context)
+	}
 	wsRoot, err := workspaceRoot(*db)
 	if err != nil {
 		return fail(err)
@@ -713,29 +729,7 @@ func cmdGet(args []string) int {
 // Split out of cmdGet because the brief's inline switch/break mixed err
 // scopes across cases in a way that didn't read cleanly as straight-line code.
 func getContent(s *store.Store, path, lines string, para, context int) (string, error) {
-	switch {
-	case lines != "":
-		var a, b int
-		if _, err := fmt.Sscanf(lines, "%d-%d", &a, &b); err != nil || a < 1 || b < a {
-			return "", fmt.Errorf("invalid --lines %q (want A-B)", lines)
-		}
-		doc, err := s.GetDoc(path)
-		if err != nil {
-			return "", err
-		}
-		ls := strings.Split(strings.ReplaceAll(doc, "\r\n", "\n"), "\n")
-		if a > len(ls) {
-			return "", store.ErrNotFound
-		}
-		if b > len(ls) {
-			b = len(ls)
-		}
-		return strings.Join(ls[a-1:b], "\n"), nil
-	case para >= 0:
-		return s.GetParas(path, para, context)
-	default:
-		return s.GetDoc(path)
-	}
+	return session.GetContent(s, path, lines, para, context)
 }
 
 // withFrontmatter prepends a tags frontmatter block unless content already
