@@ -21,14 +21,16 @@ const embedDim = 768
 type EmbedFunc func(text string) ([]float32, error)
 
 type Hit struct {
-	Doc     string  `json:"doc"`
-	Para    int     `json:"para"`
-	Lines   string  `json:"lines"`
-	Score   float64 `json:"score"`
-	Snippet string  `json:"snippet"`
-	Heading string  `json:"heading,omitempty"`
-	Mtime   int64   `json:"-"`
-	Stale   bool    `json:"stale,omitempty"`
+	Doc           string  `json:"doc"`
+	Para          int     `json:"para"`
+	Lines         string  `json:"lines"`
+	Score         float64 `json:"score"`
+	Snippet       string  `json:"snippet"`
+	Heading       string  `json:"heading,omitempty"`
+	Mtime         int64   `json:"-"`
+	Stale         bool    `json:"stale,omitempty"`
+	Body          string  `json:"body,omitempty"`
+	BodyTruncated bool    `json:"body_truncated,omitempty"`
 }
 
 type Store struct{ db *sql.DB }
@@ -394,6 +396,31 @@ func (s *Store) SearchHybrid(query string, qvec []float32, k int, tags []string)
 		ids = ids[:k]
 	}
 	return s.hitsByParaIDs(ids, scores)
+}
+
+// ExpandHitBodies fills the leading hits with their indexed paragraph text,
+// stopping once the aggregate rune budget is exhausted.
+func (s *Store) ExpandHitBodies(hits []Hit, top, budget int) ([]Hit, error) {
+	if top > len(hits) {
+		top = len(hits)
+	}
+	used := 0
+	for i := 0; i < top; i++ {
+		body, err := s.GetParas(hits[i].Doc, hits[i].Para, 0)
+		if err != nil {
+			return nil, err
+		}
+		runes := []rune(body)
+		remaining := budget - used
+		if len(runes) > remaining {
+			hits[i].Body = string(runes[:remaining])
+			hits[i].BodyTruncated = true
+			break
+		}
+		hits[i].Body = body
+		used += len(runes)
+	}
+	return hits, nil
 }
 
 // FirstPath returns the path key of any one indexed document ("" if none).
