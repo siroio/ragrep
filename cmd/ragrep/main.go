@@ -31,7 +31,7 @@ Usage:
   ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
   ragrep db list [--json]                   list configured document databases
 
-Flags common to all commands:
+Flags common to document commands (init/index/search/get/add/eval):
   --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
   --profile NAME document database profile from .ragrep/config.json
 
@@ -105,16 +105,22 @@ type dbSelection struct {
 // selected profile always uses the discovered workspace as its document root,
 // even when its database file lives elsewhere.
 func selectDB(fs *flag.FlagSet, db, profile string) (dbSelection, error) {
-	var explicitDB bool
+	var explicitDB, explicitProfile bool
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "db" {
+		switch f.Name {
+		case "db":
 			explicitDB = true
+		case "profile":
+			explicitProfile = true
 		}
 	})
-	if explicitDB && profile != "" {
+	if explicitDB && explicitProfile {
 		return dbSelection{}, fmt.Errorf("--db and --profile cannot be used together")
 	}
-	if explicitDB || (profile == "" && os.Getenv("RAGREP_DB") != "") {
+	if explicitProfile && profile == "" {
+		return dbSelection{}, fmt.Errorf("--profile requires a non-empty name")
+	}
+	if explicitDB || (!explicitProfile && os.Getenv("RAGREP_DB") != "") {
 		root, err := workspaceRoot(db)
 		if err != nil {
 			return dbSelection{}, err

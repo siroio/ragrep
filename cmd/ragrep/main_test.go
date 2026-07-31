@@ -227,6 +227,38 @@ func TestSearchRejectsProfileAndDBTogether(t *testing.T) {
 	}
 }
 
+func TestSearchRejectsExplicitEmptyProfile(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = run([]string{"search", "query", "--profile=", "--mode", "text"})
+	})
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--profile requires a non-empty name") {
+		t.Fatalf("stderr=%q, want empty-profile error", stderr)
+	}
+}
+
+func TestSearchRejectsExplicitDBWithEmptyProfile(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = run([]string{"search", "query", "--db", filepath.Join(root, "explicit.db"), "--profile=", "--mode", "text"})
+	})
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--db and --profile cannot be used together") {
+		t.Fatalf("stderr=%q, want selector conflict", stderr)
+	}
+}
+
 func TestSearchExplicitDBDoesNotReadUnrelatedInvalidConfig(t *testing.T) {
 	root := t.TempDir()
 	writeProfileConfig(t, root, `{"profiles":{"game":{"path":""}}}`)
