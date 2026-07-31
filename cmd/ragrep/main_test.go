@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -81,6 +82,30 @@ func captureStderr(t *testing.T, fn func()) string {
 	old := os.Stderr
 	os.Stderr = w
 	defer func() { os.Stderr = old }()
+
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
 
 	fn()
 	if err := w.Close(); err != nil {
@@ -183,6 +208,66 @@ func TestSearchAcceptsValueFlagsAfterQuery(t *testing.T) {
 
 	if code := run([]string{"search", "query", "--db", dbPath, "--mode", "text", "-k", "1"}); code != 0 {
 		t.Fatalf("search query --db --mode -k exit=%d, want 0", code)
+	}
+}
+
+func TestSearchJSONExpansion(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("a.md", "first target\n\nsecond target", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plain := captureStdout(t, func() {
+		if code := run([]string{"search", "--db", dbPath, "--mode", "text", "--json", "target"}); code != 0 {
+			t.Fatalf("default JSON search exit=%d, want 0", code)
+		}
+	})
+	if strings.Contains(plain, `"body"`) || strings.Contains(plain, `"body_truncated"`) {
+		t.Fatalf("default JSON changed field contract: %s", plain)
+	}
+
+	expanded := captureStdout(t, func() {
+		if code := run([]string{"search", "--db", dbPath, "--mode", "text", "--json", "--expand-top", "1", "--expand-budget", "100", "target"}); code != 0 {
+			t.Fatalf("expanded JSON search exit=%d, want 0", code)
+		}
+	})
+	var got []map[string]any
+	if err := json.Unmarshal([]byte(expanded), &got); err != nil {
+		t.Fatalf("expanded JSON = %q: %v", expanded, err)
+	}
+	if len(got) != 2 || got[0]["body"] != "first target" {
+		t.Fatalf("expanded JSON = %#v, want first indexed paragraph body", got)
+	}
+	if _, ok := got[1]["body"]; ok {
+		t.Fatalf("expanded JSON body for non-top hit = %#v, want omission", got[1])
+	}
+}
+
+func TestSearchExpansionRejectsInvalidCombinationsBeforeSearch(t *testing.T) {
+	tests := [][]string{
+		{"search", "--expand-top", "-1", "query"},
+		{"search", "--expand-budget", "-1", "query"},
+		{"search", "--expand-top", "1", "query"},
+		{"search", "--expand-budget", "1", "query"},
+		{"search", "--expand-top", "1", "--expand-budget", "10", "query"},
+	}
+	for _, args := range tests {
+		args = append(args[:1], append([]string{"--db", t.TempDir()}, args[1:]...)...)
+		stderr := captureStderr(t, func() {
+			if code := run(args); code != 1 {
+				t.Fatalf("run(%q) exit=%d, want 1", args, code)
+			}
+		})
+		if !strings.Contains(stderr, "expand") {
+			t.Fatalf("run(%q) stderr=%q, want expansion validation before opening the DB", args, stderr)
+		}
 	}
 }
 

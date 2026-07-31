@@ -193,6 +193,52 @@ func TestGet(t *testing.T) {
 	}
 }
 
+func TestExpandHitBodiesFillsOnlyTopHitsAndPreservesRankingFields(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("a.txt", "exact paragraph\n\nsecond paragraph\n\nthird paragraph", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	hits := []Hit{
+		{Doc: "a.txt", Para: 0, Score: 0.9, Heading: "First"},
+		{Doc: "a.txt", Para: 1, Score: 0.5, Heading: "Second"},
+		{Doc: "a.txt", Para: 2, Score: 0.1, Heading: "Third"},
+	}
+
+	got, err := s.ExpandHitBodies(hits, 2, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Body != "exact paragraph" || got[1].Body != "second paragraph" || got[2].Body != "" {
+		t.Fatalf("bodies = %#v, want only the first two indexed paragraphs", got)
+	}
+	for i, want := range hits {
+		if got[i].Doc != want.Doc || got[i].Para != want.Para || got[i].Score != want.Score || got[i].Heading != want.Heading {
+			t.Fatalf("hit %d changed ranking fields: got=%+v want=%+v", i, got[i], want)
+		}
+	}
+}
+
+func TestExpandHitBodiesUsesAggregateRuneBudgetAndMarksTruncation(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("a.txt", "あいう\n\n😀def", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ExpandHitBodies([]Hit{{Doc: "a.txt", Para: 0}, {Doc: "a.txt", Para: 1}}, 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Body != "あいう" || got[0].BodyTruncated {
+		t.Fatalf("first body = %+v, want full first paragraph", got[0])
+	}
+	if got[1].Body != "😀" || !got[1].BodyTruncated {
+		t.Fatalf("second body = %+v, want rune-safe truncation", got[1])
+	}
+	if used := len([]rune(got[0].Body)) + len([]rune(got[1].Body)); used != 4 {
+		t.Fatalf("used %d runes, want aggregate budget 4", used)
+	}
+}
+
 func TestFirstPath(t *testing.T) {
 	s := newTestStore(t)
 	p, err := s.FirstPath()
