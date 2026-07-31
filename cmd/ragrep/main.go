@@ -24,7 +24,7 @@ const usage = `ragrep - adaptive retrieval unit search CLI
 Usage:
   ragrep init                              create DB, download model assets
   ragrep index <path>... [--prune] [--include-code]   index text files (recursive)
-  ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--tag t]...
+  ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--expand-top N --expand-budget N] [--tag t]...
   ragrep get <path> [--para N] [--context N] [--lines A-B]
   ragrep add [--tag t]... <path>            (reads content from stdin)
   ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
@@ -538,6 +538,8 @@ func cmdSearch(args []string) int {
 	mode := fs.String("mode", "hybrid", "hybrid|vector|text")
 	k := fs.Int("k", 10, "max results")
 	asJSON := fs.Bool("json", false, "JSON output")
+	expandTop := fs.Int("expand-top", 0, "expand the top N JSON hits")
+	expandBudget := fs.Int("expand-budget", 0, "aggregate rune budget for expanded hit bodies")
 	var tags strFlags
 	fs.Var(&tags, "tag", "filter to docs having this tag (repeatable, AND)")
 	if code, handled := parseArgs(fs, args); handled {
@@ -547,6 +549,15 @@ func cmdSearch(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep search <query>"))
 	}
 	query := fs.Arg(0)
+	if *expandTop < 0 || *expandBudget < 0 {
+		return fail(fmt.Errorf("expand-top and expand-budget must be non-negative"))
+	}
+	if (*expandTop == 0) != (*expandBudget == 0) {
+		return fail(fmt.Errorf("expand-top and expand-budget must both be nonzero when expansion is requested"))
+	}
+	if *expandTop > 0 && !*asJSON {
+		return fail(fmt.Errorf("expanded hit bodies require --json"))
+	}
 
 	s, err := openStoreAt(*db)
 	if err != nil {
@@ -565,6 +576,12 @@ func cmdSearch(args []string) int {
 	if wsRoot, werr := workspaceRoot(*db); werr == nil {
 		if n := markStale(hits, wsRoot); n > 0 {
 			fmt.Fprintf(os.Stderr, "warning: %d hit(s) reference files modified since indexing; run 'ragrep index' to refresh\n", n)
+		}
+	}
+	if *expandTop > 0 {
+		hits, err = s.ExpandHitBodies(hits, *expandTop, *expandBudget)
+		if err != nil {
+			return fail(err)
 		}
 	}
 	if *asJSON {
