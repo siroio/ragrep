@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/siroio/ragrep/internal/config"
@@ -28,9 +29,11 @@ Usage:
   ragrep get <path> [--para N] [--context N] [--lines A-B]
   ragrep add [--tag t]... <path>            (reads content from stdin)
   ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
+  ragrep db list [--json]                   list configured document databases
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
+  --profile NAME document database profile from .ragrep/config.json
 
 Exit codes: 0 success, 1 error, 2 no hits / not found
 `
@@ -77,6 +80,8 @@ func run(args []string) int {
 		return cmdAdd(rest)
 	case "eval":
 		return cmdEval(rest)
+	case "db":
+		return cmdDB(rest)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return 1
@@ -85,6 +90,91 @@ func run(args []string) int {
 
 func dbFlag(fs *flag.FlagSet) *string {
 	return fs.String("db", defaultDBPath(), "index database path")
+}
+
+func profileFlag(fs *flag.FlagSet) *string {
+	return fs.String("profile", "", "named document database profile")
+}
+
+type dbSelection struct {
+	path string
+	root string
+}
+
+// selectDB resolves a command's database after flags have been parsed. A
+// selected profile always uses the discovered workspace as its document root,
+// even when its database file lives elsewhere.
+func selectDB(fs *flag.FlagSet, db, profile string) (dbSelection, error) {
+	var explicitDB bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "db" {
+			explicitDB = true
+		}
+	})
+	if explicitDB && profile != "" {
+		return dbSelection{}, fmt.Errorf("--db and --profile cannot be used together")
+	}
+	if explicitDB || (profile == "" && os.Getenv("RAGREP_DB") != "") {
+		root, err := workspaceRoot(db)
+		if err != nil {
+			return dbSelection{}, err
+		}
+		return dbSelection{path: db, root: root}, nil
+	}
+
+	root, found, err := discoveredWorkspaceRoot()
+	if err != nil {
+		return dbSelection{}, err
+	}
+	cfg := config.Config{}
+	if found {
+		cfg, err = config.Load(root)
+		if err != nil {
+			return dbSelection{}, err
+		}
+	}
+
+	if profile != "" {
+		return selectProfile(root, cfg, profile)
+	}
+	if cfg.DefaultProfile != "" {
+		return selectProfile(root, cfg, cfg.DefaultProfile)
+	}
+	root, err = workspaceRoot(db)
+	if err != nil {
+		return dbSelection{}, err
+	}
+	return dbSelection{path: db, root: root}, nil
+}
+
+func selectProfile(root string, cfg config.Config, name string) (dbSelection, error) {
+	profile, ok := cfg.Profiles[name]
+	if !ok {
+		return dbSelection{}, fmt.Errorf("unknown profile %q", name)
+	}
+	path := filepath.FromSlash(profile.Path)
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(root, path)
+	}
+	return dbSelection{path: path, root: root}, nil
+}
+
+func discoveredWorkspaceRoot() (string, bool, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", false, err
+	}
+	start := dir
+	for {
+		if info, err := os.Stat(filepath.Join(dir, ".ragrep")); err == nil && info.IsDir() {
+			return dir, true, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return start, false, nil
+		}
+		dir = parent
+	}
 }
 
 // defaultDBPath resolves the --db default, in priority order: $RAGREP_DB
@@ -105,24 +195,18 @@ func defaultDBPath() string {
 		return p
 	}
 	local := filepath.FromSlash(config.DefaultDB)
-	dir, err := os.Getwd()
+	dir, found, err := discoveredWorkspaceRoot()
 	if err != nil {
 		return local
 	}
-	for {
-		if info, err := os.Stat(filepath.Join(dir, ".ragrep")); err == nil && info.IsDir() {
-			cfg, err := config.Load(dir)
-			if err != nil {
-				return filepath.Join(dir, local)
-			}
-			return filepath.Join(dir, filepath.FromSlash(cfg.DB))
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return local
-		}
-		dir = parent
+	if !found {
+		return local
 	}
+	cfg, err := config.Load(dir)
+	if err != nil {
+		return filepath.Join(dir, local)
+	}
+	return filepath.Join(dir, filepath.FromSlash(cfg.DB))
 }
 
 // newFlagSet builds a FlagSet that reports parse errors to the caller
@@ -229,6 +313,77 @@ func workspaceRoot(dbPath string) (string, error) {
 	return dir, nil
 }
 
+func cmdDB(args []string) int {
+	if len(args) == 0 || args[0] != "list" {
+		return fail(fmt.Errorf("usage: ragrep db list [--json]"))
+	}
+	return cmdDBList(args[1:])
+}
+
+type profileListEntry struct {
+	Name         string `json:"name"`
+	Path         string `json:"path"`
+	ResolvedPath string `json:"resolved_path"`
+	Description  string `json:"description"`
+	Default      bool   `json:"default"`
+	Exists       bool   `json:"exists"`
+}
+
+func cmdDBList(args []string) int {
+	fs := newFlagSet("db list")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if code, handled := parseArgs(fs, args); handled {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return fail(fmt.Errorf("usage: ragrep db list [--json]"))
+	}
+	root, _, err := discoveredWorkspaceRoot()
+	if err != nil {
+		return fail(err)
+	}
+	cfg, err := config.Load(root)
+	if err != nil {
+		return fail(err)
+	}
+
+	names := make([]string, 0, len(cfg.Profiles))
+	for name := range cfg.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	profiles := make([]profileListEntry, 0, len(names))
+	for _, name := range names {
+		profile := cfg.Profiles[name]
+		resolved := filepath.FromSlash(profile.Path)
+		if !filepath.IsAbs(resolved) {
+			resolved = filepath.Join(root, resolved)
+		}
+		_, err := os.Stat(resolved)
+		profiles = append(profiles, profileListEntry{
+			Name:         name,
+			Path:         profile.Path,
+			ResolvedPath: resolved,
+			Description:  profile.Description,
+			Default:      name == cfg.DefaultProfile,
+			Exists:       err == nil,
+		})
+	}
+	if *asJSON {
+		if err := json.NewEncoder(os.Stdout).Encode(struct {
+			Profiles []profileListEntry `json:"profiles"`
+		}{Profiles: profiles}); err != nil {
+			return fail(err)
+		}
+		return 0
+	}
+	fmt.Println("NAME\tPATH\tRESOLVED_PATH\tDESCRIPTION\tDEFAULT\tEXISTS")
+	for _, profile := range profiles {
+		fmt.Printf("%s\t%s\t%s\t%s\t%t\t%t\n", profile.Name, profile.Path, profile.ResolvedPath, profile.Description, profile.Default, profile.Exists)
+	}
+	return 0
+}
+
 // looksAbsKey reports whether k has the shape of a key from the old
 // (pre-relative) absolute-path key format: a leading "/" (POSIX-style) or a
 // Windows drive-letter prefix such as "C:/". Root-relative keys (this
@@ -267,8 +422,13 @@ func openStoreAt(dbPath string) (*store.Store, error) {
 func cmdInit(args []string) int {
 	fs := newFlagSet("init")
 	db := dbFlag(fs)
+	profile := profileFlag(fs)
 	if code, handled := parseArgs(fs, args); handled {
 		return code
+	}
+	selected, err := selectDB(fs, *db, *profile)
+	if err != nil {
+		return fail(err)
 	}
 	dir, err := embed.CacheDir()
 	if err != nil {
@@ -277,12 +437,12 @@ func cmdInit(args []string) int {
 	if err := embed.EnsureAssets(dir); err != nil {
 		return fail(err)
 	}
-	s, err := openStoreAt(*db)
+	s, err := openStoreAt(selected.path)
 	if err != nil {
 		return fail(err)
 	}
 	s.Close()
-	fmt.Printf("initialized %s (assets in %s)\n", *db, dir)
+	fmt.Printf("initialized %s (assets in %s)\n", selected.path, dir)
 	return 0
 }
 
@@ -347,6 +507,7 @@ func runConverter(argv []string, input string) (string, error) {
 func cmdIndex(args []string) int {
 	fset := newFlagSet("index")
 	db := dbFlag(fset)
+	profile := profileFlag(fset)
 	prune := fset.Bool("prune", false, "remove indexed docs under the given roots that no longer exist on disk")
 	includeCode := fset.Bool("include-code", false, "don't exclude common source code extensions (.go, .py, ...) from the document index")
 	if code, handled := parseArgs(fset, args); handled {
@@ -355,10 +516,11 @@ func cmdIndex(args []string) int {
 	if fset.NArg() == 0 {
 		return fail(fmt.Errorf("usage: ragrep index <path>..."))
 	}
-	wsRoot, err := workspaceRoot(*db)
+	selected, err := selectDB(fset, *db, *profile)
 	if err != nil {
 		return fail(err)
 	}
+	wsRoot := selected.root
 	// Validate every root arg is inside the workspace UP FRONT, before
 	// opening the store or loading the (slow) embedding model. Deferring this
 	// to normPath inside the walk only fires it when the walk reaches an
@@ -373,7 +535,7 @@ func cmdIndex(args []string) int {
 		}
 		normRoots[i] = nr
 	}
-	s, err := openStoreAt(*db)
+	s, err := openStoreAt(selected.path)
 	if err != nil {
 		return fail(err)
 	}
@@ -535,6 +697,7 @@ func (f *strFlags) Set(v string) error {
 func cmdSearch(args []string) int {
 	fs := newFlagSet("search")
 	db := dbFlag(fs)
+	profile := profileFlag(fs)
 	mode := fs.String("mode", "hybrid", "hybrid|vector|text")
 	k := fs.Int("k", 10, "max results")
 	asJSON := fs.Bool("json", false, "JSON output")
@@ -547,8 +710,12 @@ func cmdSearch(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep search <query>"))
 	}
 	query := fs.Arg(0)
+	selected, err := selectDB(fs, *db, *profile)
+	if err != nil {
+		return fail(err)
+	}
 
-	s, err := openStoreAt(*db)
+	s, err := openStoreAt(selected.path)
 	if err != nil {
 		return fail(err)
 	}
@@ -562,10 +729,8 @@ func cmdSearch(args []string) int {
 		fmt.Fprintln(os.Stderr, "no hits")
 		return 2
 	}
-	if wsRoot, werr := workspaceRoot(*db); werr == nil {
-		if n := markStale(hits, wsRoot); n > 0 {
-			fmt.Fprintf(os.Stderr, "warning: %d hit(s) reference files modified since indexing; run 'ragrep index' to refresh\n", n)
-		}
+	if n := markStale(hits, selected.root); n > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d hit(s) reference files modified since indexing; run 'ragrep index' to refresh\n", n)
 	}
 	if *asJSON {
 		json.NewEncoder(os.Stdout).Encode(hits)
@@ -663,6 +828,7 @@ func normPath(p, root string) (string, error) {
 func cmdGet(args []string) int {
 	fs := newFlagSet("get")
 	db := dbFlag(fs)
+	profile := profileFlag(fs)
 	para := fs.Int("para", -1, "paragraph number (from search results)")
 	context := fs.Int("context", 0, "±N paragraphs around --para")
 	lines := fs.String("lines", "", "line range A-B")
@@ -673,12 +839,13 @@ func cmdGet(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep get <path>"))
 	}
 	arg := fs.Arg(0)
-	wsRoot, err := workspaceRoot(*db)
+	selected, err := selectDB(fs, *db, *profile)
 	if err != nil {
 		return fail(err)
 	}
+	wsRoot := selected.root
 
-	s, err := openStoreAt(*db)
+	s, err := openStoreAt(selected.path)
 	if err != nil {
 		return fail(err)
 	}
@@ -754,6 +921,7 @@ func withFrontmatter(content string, tags []string) string {
 func cmdAdd(args []string) int {
 	fs := newFlagSet("add")
 	db := dbFlag(fs)
+	profile := profileFlag(fs)
 	var tags strFlags
 	fs.Var(&tags, "tag", "tag to add to the new file's frontmatter (repeatable)")
 	if code, handled := parseArgs(fs, args); handled {
@@ -763,14 +931,15 @@ func cmdAdd(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep add [--tag t]... <path>"))
 	}
 	path := fs.Arg(0)
+	selected, err := selectDB(fs, *db, *profile)
+	if err != nil {
+		return fail(err)
+	}
 
 	if _, err := os.Stat(path); err == nil {
 		return fail(fmt.Errorf("%s already exists; edit it and run `ragrep index` instead", path))
 	}
-	wsRoot, err := workspaceRoot(*db)
-	if err != nil {
-		return fail(err)
-	}
+	wsRoot := selected.root
 	key, err := normPath(path, wsRoot)
 	if err != nil {
 		return fail(err)
@@ -797,7 +966,7 @@ func cmdAdd(args []string) int {
 		return fail(err)
 	}
 
-	s, err := openStoreAt(*db)
+	s, err := openStoreAt(selected.path)
 	if err != nil {
 		return fail(err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -94,6 +95,266 @@ func captureStderr(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return buf.String()
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+func writeProfileConfig(t *testing.T, root, body string) {
+	t.Helper()
+	dir := filepath.Join(root, ".ragrep")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectDBProfileUsesWorkspaceRootForExternalProfilePath(t *testing.T) {
+	root := t.TempDir()
+	writeProfileConfig(t, root, `{"profiles":{"game":{"path":"profiles/game.db","description":"game docs"}}}`)
+	subdir := filepath.Join(root, "docs", "nested")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(subdir)
+
+	fs := newFlagSet("search")
+	db := dbFlag(fs)
+	profile := profileFlag(fs)
+	if _, handled := parseArgs(fs, []string{"--profile", "game"}); handled {
+		t.Fatal("parseArgs unexpectedly handled --profile")
+	}
+	got, err := selectDB(fs, *db, *profile)
+	if err != nil {
+		t.Fatalf("selectDB: %v", err)
+	}
+	if want := filepath.Join(root, "profiles", "game.db"); got.path != want {
+		t.Fatalf("path=%q, want %q", got.path, want)
+	}
+	if got.root != root {
+		t.Fatalf("root=%q, want %q", got.root, root)
+	}
+}
+
+func TestSelectDBUsesDefaultProfileUnlessEnvironmentOverridesIt(t *testing.T) {
+	root := t.TempDir()
+	writeProfileConfig(t, root, `{"default_profile":"game","profiles":{"game":{"path":".ragrep/game.db"}}}`)
+	t.Chdir(root)
+
+	fs := newFlagSet("search")
+	db := dbFlag(fs)
+	profile := profileFlag(fs)
+	if _, handled := parseArgs(fs, nil); handled {
+		t.Fatal("parseArgs unexpectedly handled empty args")
+	}
+	got, err := selectDB(fs, *db, *profile)
+	if err != nil {
+		t.Fatalf("selectDB: %v", err)
+	}
+	if want := filepath.Join(root, ".ragrep", "game.db"); got.path != want {
+		t.Fatalf("default profile path=%q, want %q", got.path, want)
+	}
+
+	t.Setenv("RAGREP_DB", "env.db")
+	fs = newFlagSet("search")
+	db = dbFlag(fs)
+	profile = profileFlag(fs)
+	if _, handled := parseArgs(fs, nil); handled {
+		t.Fatal("parseArgs unexpectedly handled empty args")
+	}
+	got, err = selectDB(fs, *db, *profile)
+	if err != nil {
+		t.Fatalf("selectDB with environment: %v", err)
+	}
+	if got.path != "env.db" {
+		t.Fatalf("environment path=%q, want env.db", got.path)
+	}
+}
+
+func TestDiscoveredWorkspaceRootFallsBackToCurrentDirectory(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+
+	got, found, err := discoveredWorkspaceRoot()
+	if err != nil {
+		t.Fatalf("discoveredWorkspaceRoot: %v", err)
+	}
+	if found {
+		t.Fatalf("found=%v, want false without .ragrep", found)
+	}
+	if got != root {
+		t.Fatalf("root=%q, want current directory %q", got, root)
+	}
+}
+
+func TestSearchRejectsProfileAndDBTogether(t *testing.T) {
+	root := t.TempDir()
+	writeProfileConfig(t, root, `{"profiles":{"game":{"path":".ragrep/game.db"}}}`)
+	t.Chdir(root)
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = run([]string{"search", "query", "--db", "other.db", "--profile", "game", "--mode", "text"})
+	})
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--db and --profile") {
+		t.Fatalf("stderr=%q, want selector conflict", stderr)
+	}
+}
+
+func TestSearchExplicitDBDoesNotReadUnrelatedInvalidConfig(t *testing.T) {
+	root := t.TempDir()
+	writeProfileConfig(t, root, `{"profiles":{"game":{"path":""}}}`)
+	t.Chdir(root)
+	db := filepath.Join(t.TempDir(), "explicit.db")
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = run([]string{"search", "query", "--db", db, "--mode", "text"})
+	})
+	if code != 2 {
+		t.Fatalf("exit=%d, want 2 (empty database)", code)
+	}
+	if strings.Contains(stderr, "profile") {
+		t.Fatalf("stderr=%q, explicit --db should not read profile configuration", stderr)
+	}
+}
+
+func TestSearchRejectsUnknownProfileBeforeOpeningStore(t *testing.T) {
+	root := t.TempDir()
+	writeProfileConfig(t, root, `{"profiles":{"game":{"path":".ragrep/game.db"}}}`)
+	t.Chdir(root)
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = run([]string{"search", "query", "--profile", "missing", "--mode", "text"})
+	})
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1", code)
+	}
+	if !strings.Contains(stderr, `unknown profile "missing"`) {
+		t.Fatalf("stderr=%q, want unknown-profile error", stderr)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".ragrep", "game.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("profile db created before validation: stat err=%v", err)
+	}
+}
+
+func TestDBListJSONReportsSortedProfilesWithoutOpeningDatabases(t *testing.T) {
+	root := t.TempDir()
+	writeProfileConfig(t, root, `{
+		"default_profile":"game",
+		"profiles":{
+			"research":{"path":"research.db","description":"research docs"},
+			"game":{"path":".ragrep/game.db","description":"game docs"}
+		}
+	}`)
+	t.Chdir(root)
+
+	var code int
+	stdout := captureStdout(t, func() {
+		code = run([]string{"db", "list", "--json"})
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	var out struct {
+		Profiles []struct {
+			Name         string `json:"name"`
+			Path         string `json:"path"`
+			ResolvedPath string `json:"resolved_path"`
+			Description  string `json:"description"`
+			Default      bool   `json:"default"`
+			Exists       bool   `json:"exists"`
+		} `json:"profiles"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("JSON output=%q: %v", stdout, err)
+	}
+	if len(out.Profiles) != 2 {
+		t.Fatalf("profiles=%d, want 2", len(out.Profiles))
+	}
+	if out.Profiles[0].Name != "game" || out.Profiles[1].Name != "research" {
+		t.Fatalf("profile order=%q,%q, want game,research", out.Profiles[0].Name, out.Profiles[1].Name)
+	}
+	game := out.Profiles[0]
+	if game.Path != ".ragrep/game.db" || game.ResolvedPath != filepath.Join(root, ".ragrep", "game.db") || game.Description != "game docs" || !game.Default || game.Exists {
+		t.Fatalf("game=%+v, want configured default missing DB", game)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".ragrep", "game.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("db list opened profile db: stat err=%v", err)
+	}
+}
+
+func TestDBListTextReportsProfileMetadata(t *testing.T) {
+	root := t.TempDir()
+	writeProfileConfig(t, root, `{"default_profile":"game","profiles":{"game":{"path":".ragrep/game.db","description":"game docs"}}}`)
+	t.Chdir(root)
+
+	var code int
+	stdout := captureStdout(t, func() {
+		code = run([]string{"db", "list"})
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	for _, want := range []string{"NAME", "PATH", "RESOLVED_PATH", "DESCRIPTION", "game", ".ragrep/game.db", filepath.Join(root, ".ragrep", "game.db"), "game docs", "true", "false"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout=%q, want %q", stdout, want)
+		}
+	}
+}
+
+func TestSearchUsesSelectedProfileDatabase(t *testing.T) {
+	root := t.TempDir()
+	writeProfileConfig(t, root, `{"profiles":{"game":{"path":".ragrep/game.db"}}}`)
+	profileDB := filepath.Join(root, ".ragrep", "game.db")
+	s, err := store.Open(profileDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("guide.md", "profile-only-token", 1, fakeEmbed); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	s.Close()
+	t.Chdir(root)
+
+	var code int
+	stdout := captureStdout(t, func() {
+		code = run([]string{"search", "profile-only-token", "--profile", "game", "--mode", "text"})
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	if !strings.Contains(stdout, "guide.md") {
+		t.Fatalf("stdout=%q, want hit from selected profile", stdout)
+	}
 }
 
 func TestParseArgsAcceptsInterspersedFlags(t *testing.T) {

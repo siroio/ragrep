@@ -73,6 +73,7 @@ func recalled(hits []store.Hit, c evalCase) bool {
 func cmdEval(args []string) int {
 	fs := newFlagSet("eval")
 	db := dbFlag(fs)
+	profile := profileFlag(fs)
 	mode := fs.String("mode", "hybrid", "hybrid|vector|text")
 	k := fs.Int("k", 10, "max results per query")
 	if code, handled := parseArgs(fs, args); handled {
@@ -80,6 +81,10 @@ func cmdEval(args []string) int {
 	}
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: ragrep eval <cases.jsonl>"))
+	}
+	selected, err := selectDB(fs, *db, *profile)
+	if err != nil {
+		return fail(err)
 	}
 
 	cases, err := readEvalCases(fs.Arg(0))
@@ -90,7 +95,7 @@ func cmdEval(args []string) int {
 		return fail(fmt.Errorf("no eval cases in %s", fs.Arg(0)))
 	}
 
-	s, err := openStoreAt(*db)
+	s, err := openStoreAt(selected.path)
 	if err != nil {
 		return fail(err)
 	}
