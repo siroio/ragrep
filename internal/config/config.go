@@ -20,8 +20,17 @@ const (
 // Config is the shape of .ragrep/config.json. All paths are interpreted
 // relative to the workspace root (the directory containing .ragrep/).
 type Config struct {
-	DB         string              `json:"db"`
-	Converters map[string][]string `json:"converters"`
+	DB             string              `json:"db"`
+	DefaultProfile string              `json:"default_profile"`
+	Profiles       map[string]Profile  `json:"profiles"`
+	Converters     map[string][]string `json:"converters"`
+}
+
+// Profile identifies a named document database and describes its corpus.
+// Relative path resolution is left to the caller.
+type Profile struct {
+	Path        string `json:"path"`
+	Description string `json:"description"`
 }
 
 // Load reads .ragrep/config.json from root. A missing file is not an error:
@@ -45,6 +54,19 @@ func Load(root string) (Config, error) {
 	}
 	if cfg.DB == "" {
 		cfg.DB = DefaultDB
+	}
+	for name, profile := range cfg.Profiles {
+		if name == "" {
+			return Config{}, fmt.Errorf("profile name must not be empty")
+		}
+		if profile.Path == "" {
+			return Config{}, fmt.Errorf("profile %q path must not be empty", name)
+		}
+	}
+	if cfg.DefaultProfile != "" {
+		if _, ok := cfg.Profiles[cfg.DefaultProfile]; !ok {
+			return Config{}, fmt.Errorf("default profile %q is not configured", cfg.DefaultProfile)
+		}
 	}
 	return cfg, nil
 }

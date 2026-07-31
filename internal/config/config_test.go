@@ -60,6 +60,69 @@ func TestLoadPartialFillsDefaults(t *testing.T) {
 	}
 }
 
+// Named document profiles retain their configured path and description so
+// callers can choose a corpus without resolving paths inside the loader.
+func TestLoadReadsDocumentProfiles(t *testing.T) {
+	root := t.TempDir()
+	writeConfig(t, root, `{
+		"default_profile": "game",
+		"profiles": {
+			"game": {
+				"path": ".ragrep/game.db",
+				"description": "Game design documents"
+			}
+		}
+	}`)
+
+	cfg, err := Load(root)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DefaultProfile != "game" {
+		t.Fatalf("DefaultProfile=%q, want game", cfg.DefaultProfile)
+	}
+	profile, ok := cfg.Profiles["game"]
+	if !ok {
+		t.Fatal("Profiles does not contain game")
+	}
+	if profile.Path != ".ragrep/game.db" {
+		t.Fatalf("profile.Path=%q, want .ragrep/game.db", profile.Path)
+	}
+	if profile.Description != "Game design documents" {
+		t.Fatalf("profile.Description=%q, want Game design documents", profile.Description)
+	}
+}
+
+func TestLoadRejectsEmptyProfileName(t *testing.T) {
+	root := t.TempDir()
+	writeConfig(t, root, `{"profiles": {"": {"path": ".ragrep/game.db"}}}`)
+
+	if _, err := Load(root); err == nil {
+		t.Fatal("Load: want error for empty profile name, got nil")
+	}
+}
+
+func TestLoadRejectsEmptyProfilePath(t *testing.T) {
+	root := t.TempDir()
+	writeConfig(t, root, `{"profiles": {"game": {"path": ""}}}`)
+
+	if _, err := Load(root); err == nil {
+		t.Fatal("Load: want error for empty profile path, got nil")
+	}
+}
+
+func TestLoadRejectsUnknownDefaultProfile(t *testing.T) {
+	root := t.TempDir()
+	writeConfig(t, root, `{
+		"default_profile": "research",
+		"profiles": {"game": {"path": ".ragrep/game.db"}}
+	}`)
+
+	if _, err := Load(root); err == nil {
+		t.Fatal("Load: want error for unknown default profile, got nil")
+	}
+}
+
 // Malformed JSON must be a clear, non-nil error -- not a silently zeroed
 // Config.
 func TestLoadBadJSON(t *testing.T) {
