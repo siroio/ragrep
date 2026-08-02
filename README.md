@@ -21,7 +21,7 @@ go build -o ragrep.exe ./cmd/ragrep    # unixは .exe 不要
 ```
 
 ビルドにはcgo（Cツールチェーン）が必要（`github.com/yalue/onnxruntime_go`がcgo必須のため）。
-Windowsは mingw-w64 か MSVC を入れて `CGO_ENABLED=1` でビルドする。
+Windowsは MinGW-w64（GCC）を入れて `CGO_ENABLED=1` でビルドする（Go 1.25以降はDWARF 5対応のbinutils 2.37以上が必要）。
 
 ## Setup
 
