@@ -11,11 +11,14 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ncruces/go-sqlite3/vfs"
 	"golang.org/x/sys/windows"
 )
+
+var sandboxVFSRegistryTestMu sync.Mutex
 
 func TestSandboxVFSIsRegisteredByName(t *testing.T) {
 	got := vfs.Find(sandboxVFSName)
@@ -24,6 +27,43 @@ func TestSandboxVFSIsRegisteredByName(t *testing.T) {
 	}
 	if _, ok := got.(vfs.VFSFilename); !ok {
 		t.Fatalf("vfs.Find(%q) returned %T, want vfs.VFSFilename", sandboxVFSName, got)
+	}
+}
+
+func TestOpenUsesRegisteredSandboxVFS(t *testing.T) {
+	sandboxVFSRegistryTestMu.Lock()
+	t.Cleanup(sandboxVFSRegistryTestMu.Unlock)
+
+	original := vfs.Find(sandboxVFSName)
+	if original == nil {
+		t.Fatalf("vfs.Find(%q) returned nil", sandboxVFSName)
+	}
+	originalFilenameVFS, ok := original.(vfs.VFSFilename)
+	if !ok {
+		t.Fatalf("vfs.Find(%q) returned %T, want vfs.VFSFilename", sandboxVFSName, original)
+	}
+
+	observer := &observingSandboxVFS{VFSFilename: originalFilenameVFS}
+	vfs.Register(sandboxVFSName, observer)
+	t.Cleanup(func() {
+		vfs.Register(sandboxVFSName, original)
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "observed.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", dbPath, err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	fullPathnameCalls, openFilenameCalls := observer.counts()
+	if fullPathnameCalls == 0 && openFilenameCalls == 0 {
+		t.Fatalf("store.Open(%q) did not traverse %q: FullPathname=%d OpenFilename=%d", dbPath, sandboxVFSName, fullPathnameCalls, openFilenameCalls)
+	}
+
+	vfs.Register(sandboxVFSName, original)
+	if restored := vfs.Find(sandboxVFSName); restored != original {
+		t.Fatalf("vfs.Find(%q) after restore = %T, want exact original registration %T", sandboxVFSName, restored, original)
 	}
 }
 
@@ -479,6 +519,33 @@ type sandboxVFSDelegateStub struct {
 	deleteErr              error
 	deleteName             string
 	deleteSyncDir          bool
+}
+
+type observingSandboxVFS struct {
+	vfs.VFSFilename
+	mu                sync.Mutex
+	fullPathnameCalls int
+	openFilenameCalls int
+}
+
+func (v *observingSandboxVFS) FullPathname(name string) (string, error) {
+	v.mu.Lock()
+	v.fullPathnameCalls++
+	v.mu.Unlock()
+	return v.VFSFilename.FullPathname(name)
+}
+
+func (v *observingSandboxVFS) OpenFilename(name *vfs.Filename, flags vfs.OpenFlag) (vfs.File, vfs.OpenFlag, error) {
+	v.mu.Lock()
+	v.openFilenameCalls++
+	v.mu.Unlock()
+	return v.VFSFilename.OpenFilename(name, flags)
+}
+
+func (v *observingSandboxVFS) counts() (fullPathnameCalls, openFilenameCalls int) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.fullPathnameCalls, v.openFilenameCalls
 }
 
 func (s *sandboxVFSDelegateStub) FullPathname(name string) (string, error) {
