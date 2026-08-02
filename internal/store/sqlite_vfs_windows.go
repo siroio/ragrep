@@ -40,6 +40,9 @@ func init() {
 func (s *sandboxVFS) FullPathname(name string) (string, error) {
 	path, err := s.VFSFilename.FullPathname(name)
 	if err == nil {
+		if err := rejectUnsupportedWindowsNamespace(path); err != nil {
+			return "", err
+		}
 		if err := inspectSandboxDatabasePath(path); err != nil {
 			return "", fmt.Errorf("inspect SQLite database path %q: %w", path, err)
 		}

@@ -220,6 +220,67 @@ func TestSandboxVFSFullPathnameKeepsSuccessfulDelegateResult(t *testing.T) {
 	}
 }
 
+func TestSandboxVFSFullPathnameRejectsUnsupportedNamespacesOnDelegateSuccess(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{
+			name: "local success control",
+			path: filepath.Join(sandboxTestDirectory(t), "local-success.sqlite"),
+		},
+		{
+			name: "unc namespace",
+			path: `\\server\share\database.sqlite`,
+		},
+		{
+			name: "device namespace",
+			path: `\\.\PIPE\database.sqlite`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := &sandboxVFSDelegateStub{fullPath: tt.path}
+			recoveryCalls := 0
+			adapter := sandboxVFS{
+				VFSFilename: base,
+				recoverPath: func(string) (string, error) {
+					recoveryCalls++
+					return "recovered/result", nil
+				},
+			}
+
+			got, err := adapter.FullPathname(tt.path)
+			if tt.name == "local success control" {
+				if err != nil {
+					t.Fatalf("FullPathname() error = %v, want nil", err)
+				}
+				if got != tt.path {
+					t.Fatalf("FullPathname() = %q, want %q", got, tt.path)
+				}
+				if recoveryCalls != 0 {
+					t.Fatalf("recovery called %d times, want 0", recoveryCalls)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("FullPathname(%q) = %q, want unsupported-namespace error", tt.path, got)
+			}
+			if got != "" {
+				t.Fatalf("FullPathname(%q) = %q, want empty path on unsupported-namespace rejection", tt.path, got)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), "unsupported") {
+				t.Fatalf("FullPathname(%q) error = %v, want unsupported-namespace error", tt.path, err)
+			}
+			if recoveryCalls != 0 {
+				t.Fatalf("recovery called %d times, want 0", recoveryCalls)
+			}
+		})
+	}
+}
+
 func TestSandboxVFSFullPathnamePreservesNonPermissionError(t *testing.T) {
 	wantErr := errors.New("non-permission failure")
 	base := &sandboxVFSDelegateStub{
