@@ -66,25 +66,15 @@ func hasPinnedSQLiteOKSymlinkCode(err error) bool {
 
 func errorHasNumericCode(err error, code uint32) bool {
 	value := reflect.ValueOf(err)
-	for value.IsValid() {
-		if value.Kind() == reflect.Pointer {
-			if value.IsNil() {
-				return false
-			}
-			value = value.Elem()
-			continue
-		}
-		switch value.Kind() {
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-			return value.Uint() == uint64(code)
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			n := value.Int()
-			return n >= 0 && uint64(n) == uint64(code)
-		default:
-			return false
-		}
+	if !value.IsValid() {
+		return false
 	}
-	return false
+	switch value.Kind() {
+	case reflect.Uint8, reflect.Uint16, reflect.Uint32:
+		return value.Uint() == uint64(code)
+	default:
+		return false
+	}
 }
 
 func recoverSandboxPath(name string) (string, error) {
