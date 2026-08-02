@@ -64,7 +64,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0(embedding float[768]);
 
 // Open opens (creating if needed) the SQLite index at path and ensures schema.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite3", "file:"+path+"?_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite3", storeDSN(path))
 	if err != nil {
 		return nil, err
 	}
