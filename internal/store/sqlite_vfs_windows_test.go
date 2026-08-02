@@ -4,10 +4,17 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ncruces/go-sqlite3/vfs"
+	"golang.org/x/sys/windows"
 )
 
 func TestSandboxVFSIsRegisteredByName(t *testing.T) {
@@ -76,6 +83,378 @@ func TestSandboxVFSDelegatesVFSOperations(t *testing.T) {
 	}
 	if base.deleteName != "database" || !base.deleteSyncDir {
 		t.Fatalf("Delete delegated (%q, %v), want (%q, %v)", base.deleteName, base.deleteSyncDir, "database", true)
+	}
+}
+
+func TestSandboxVFSFullPathnameKeepsSuccessfulDelegateResult(t *testing.T) {
+	base := &sandboxVFSDelegateStub{fullPath: "delegate/result"}
+	recoveryCalls := 0
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: func(string) (string, error) {
+			recoveryCalls++
+			return "recovered/result", nil
+		},
+	}
+
+	got, err := adapter.FullPathname("input/path")
+	if err != nil {
+		t.Fatalf("FullPathname() error = %v, want nil", err)
+	}
+	if got != "delegate/result" {
+		t.Fatalf("FullPathname() = %q, want %q", got, "delegate/result")
+	}
+	if recoveryCalls != 0 {
+		t.Fatalf("recovery called %d times, want 0", recoveryCalls)
+	}
+}
+
+func TestSandboxVFSFullPathnamePreservesNonPermissionError(t *testing.T) {
+	wantErr := errors.New("non-permission failure")
+	base := &sandboxVFSDelegateStub{
+		fullPath:    "delegate/result",
+		fullPathErr: wantErr,
+	}
+	recoveryCalls := 0
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: func(string) (string, error) {
+			recoveryCalls++
+			return "recovered/result", nil
+		},
+	}
+
+	got, err := adapter.FullPathname("input/path")
+	if got != "delegate/result" {
+		t.Fatalf("FullPathname() = %q, want %q", got, "delegate/result")
+	}
+	if err != wantErr {
+		t.Fatalf("FullPathname() error = %v, want exact error %v", err, wantErr)
+	}
+	if recoveryCalls != 0 {
+		t.Fatalf("recovery called %d times, want 0", recoveryCalls)
+	}
+}
+
+func TestSandboxVFSFullPathnameRecoversAccessDenied(t *testing.T) {
+	const input = "input/path"
+	const wantPath = "recovered/path"
+	base := &sandboxVFSDelegateStub{
+		fullPath:    "delegate/result",
+		fullPathErr: fmt.Errorf("sandbox: %w", windows.ERROR_ACCESS_DENIED),
+	}
+	var recoveredName string
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: func(name string) (string, error) {
+			recoveredName = name
+			return wantPath, nil
+		},
+	}
+
+	got, err := adapter.FullPathname(input)
+	if err != nil {
+		t.Fatalf("FullPathname() error = %v, want nil", err)
+	}
+	if got != wantPath {
+		t.Fatalf("FullPathname() = %q, want %q", got, wantPath)
+	}
+	if recoveredName != input {
+		t.Fatalf("recovery received %q, want %q", recoveredName, input)
+	}
+}
+
+func TestSandboxVFSFullPathnameUsesDefaultRecovery(t *testing.T) {
+	dir := sandboxTestDirectory(t)
+	db := filepath.Join(dir, "existing.sqlite")
+	if err := os.WriteFile(db, []byte("database"), 0o600); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+
+	base := &sandboxVFSDelegateStub{fullPathErr: windows.ERROR_ACCESS_DENIED}
+	adapter := sandboxVFS{VFSFilename: base}
+	got, err := adapter.FullPathname(db)
+	if err != nil {
+		t.Fatalf("FullPathname() error = %v, want nil", err)
+	}
+	assertSandboxPathEqual(t, got, sandboxExpectedCanonicalPath(t, db))
+}
+
+func TestRecoverSandboxPathResolvesExistingDatabase(t *testing.T) {
+	dir := sandboxTestDirectory(t)
+	db := filepath.Join(dir, "existing.sqlite")
+	if err := os.WriteFile(db, []byte("database"), 0o600); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+
+	got, err := sandboxVFSFullPathnameWithRecovery(db)
+	if err != nil {
+		t.Fatalf("recover existing database: %v", err)
+	}
+	assertSandboxPathEqual(t, got, sandboxExpectedCanonicalPath(t, db))
+}
+
+func TestRecoverSandboxPathAllowsNewDatabaseAfterParentResolution(t *testing.T) {
+	dir := sandboxTestDirectory(t)
+	db := filepath.Join(dir, "new.sqlite")
+
+	got, err := sandboxVFSFullPathnameWithRecovery(db)
+	if err != nil {
+		t.Fatalf("recover new database: %v", err)
+	}
+	assertSandboxPathEqual(t, got, sandboxExpectedCanonicalPath(t, db))
+	if _, err := os.Stat(db); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery created database: stat error = %v", err)
+	}
+}
+
+func TestRecoverSandboxPathRejectsMissingParentInsteadOfReturningAbs(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "missing-parent", "database.sqlite")
+
+	got, err := sandboxVFSFullPathnameWithRecovery(db)
+	if err == nil {
+		t.Fatalf("recover missing parent returned %q, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("recover missing parent returned %q, want empty path", got)
+	}
+}
+
+func TestRecoverSandboxPathRejectsInaccessibleParent(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "blocked-parent")
+	if err := os.MkdirAll(blocked, 0o755); err != nil {
+		t.Fatalf("create blocked parent: %v", err)
+	}
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Skipf("current Windows user is unavailable: %v", err)
+	}
+	if err := denySandboxDirectoryAccess(blocked, currentUser.Username); err != nil {
+		t.Skipf("denying parent access is unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := restoreSandboxDirectoryAccess(blocked, currentUser.Username); err != nil {
+			t.Logf("restore parent access: %v", err)
+		}
+	})
+
+	db := filepath.Join(blocked, "database.sqlite")
+	got, err := sandboxVFSFullPathnameWithRecovery(db)
+	if err == nil {
+		t.Fatalf("recover inaccessible parent returned %q, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("recover inaccessible parent returned %q, want empty path", got)
+	}
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) && !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("recover inaccessible parent error = %v, want permission denial", err)
+	}
+}
+
+func TestRecoverSandboxPathAllowsDirectoryJunctionAndCanonicalizesParent(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "junction-target")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("create junction target: %v", err)
+	}
+	junction := filepath.Join(t.TempDir(), "junction-parent")
+	createSandboxDirectoryJunction(t, junction, target)
+	db := filepath.Join(junction, "database.sqlite")
+	if err := os.WriteFile(db, []byte("database"), 0o600); err != nil {
+		t.Fatalf("create database through junction: %v", err)
+	}
+
+	got, err := sandboxVFSFullPathnameWithRecovery(db)
+	if err != nil {
+		t.Fatalf("recover junction database: %v", err)
+	}
+	assertSandboxPathEqual(t, got, sandboxExpectedCanonicalPath(t, db))
+	if strings.Contains(strings.ToLower(sandboxComparablePath(got)), strings.ToLower(sandboxComparablePath(junction))) {
+		t.Fatalf("recovered path %q still contains junction path %q", got, junction)
+	}
+}
+
+func TestRecoverSandboxPathRejectsFinalDatabaseReparsePoint(t *testing.T) {
+	dir := sandboxTestDirectory(t)
+	target := filepath.Join(dir, "target.sqlite")
+	link := filepath.Join(dir, "database.sqlite")
+	if err := os.WriteFile(target, []byte("database"), 0o600); err != nil {
+		t.Fatalf("create reparse target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		targetDirectory := filepath.Join(t.TempDir(), "reparse-target")
+		if mkdirErr := os.MkdirAll(targetDirectory, 0o755); mkdirErr != nil {
+			t.Fatalf("create directory reparse target: %v", mkdirErr)
+		}
+		link = filepath.Join(t.TempDir(), "database.sqlite")
+		createSandboxDirectoryJunction(t, link, targetDirectory)
+	}
+
+	got, err := sandboxVFSFullPathnameWithRecovery(link)
+	if err == nil {
+		t.Fatalf("recover final reparse point returned %q, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("recover final reparse point returned %q, want empty path", got)
+	}
+}
+
+func TestRecoverSandboxPathPreservesSpacesAndNonASCII(t *testing.T) {
+	dir := filepath.Join(sandboxTestDirectory(t), "space folder 日本語")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create spaces/non-ASCII directory: %v", err)
+	}
+	db := filepath.Join(dir, "database 日本語.sqlite")
+	if err := os.WriteFile(db, []byte("database"), 0o600); err != nil {
+		t.Fatalf("create spaces/non-ASCII database: %v", err)
+	}
+
+	got, err := sandboxVFSFullPathnameWithRecovery(db)
+	if err != nil {
+		t.Fatalf("recover spaces/non-ASCII database: %v", err)
+	}
+	assertSandboxPathEqual(t, got, sandboxExpectedCanonicalPath(t, db))
+}
+
+func TestRecoverSandboxPathAcceptsExtendedLengthLocalPath(t *testing.T) {
+	dir := sandboxTestDirectory(t)
+	db := filepath.Join(dir, "extended.sqlite")
+	if err := os.WriteFile(db, []byte("database"), 0o600); err != nil {
+		t.Fatalf("create extended-length database: %v", err)
+	}
+	abs, err := filepath.Abs(db)
+	if err != nil {
+		t.Fatalf("absolute database path: %v", err)
+	}
+	if len(filepath.VolumeName(abs)) != 2 {
+		t.Skipf("test path is not on a local drive: %q", abs)
+	}
+	extended := `\\?\` + abs
+
+	got, err := sandboxVFSFullPathnameWithRecovery(extended)
+	if err != nil {
+		t.Fatalf("recover extended-length database: %v", err)
+	}
+	if !strings.HasPrefix(strings.ToLower(got), `\\?\`) {
+		t.Fatalf("recovered path %q lost its extended-length prefix", got)
+	}
+	assertSandboxPathEqual(t, got, sandboxExpectedCanonicalPath(t, db))
+}
+
+func TestRecoverSandboxPathRejectsUnsupportedNamespaces(t *testing.T) {
+	paths := []string{
+		`\\server\share\database.sqlite`,
+		`\\?\UNC\server\share\database.sqlite`,
+		`\\.\PIPE\database.sqlite`,
+		`\??\C:\database.sqlite`,
+		`\??\UNC\server\share\database.sqlite`,
+		`\Device\HarddiskVolume1\database.sqlite`,
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			got, err := recoverSandboxPath(path)
+			if err == nil {
+				t.Fatalf("recover unsupported namespace returned %q, want error", got)
+			}
+			if got != "" {
+				t.Fatalf("recover unsupported namespace returned %q, want empty path", got)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), "unsupported") {
+				t.Fatalf("recover unsupported namespace error = %v, want an unsupported-namespace error", err)
+			}
+		})
+	}
+}
+
+func sandboxVFSFullPathnameWithRecovery(name string) (string, error) {
+	base := &sandboxVFSDelegateStub{fullPathErr: windows.ERROR_ACCESS_DENIED}
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: recoverSandboxPath,
+	}
+	return adapter.FullPathname(name)
+}
+
+func sandboxTestDirectory(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "sandbox path")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create test directory: %v", err)
+	}
+	return dir
+}
+
+func createSandboxDirectoryJunction(t *testing.T, junction, target string) {
+	t.Helper()
+	if output, err := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", junction, target).CombinedOutput(); err != nil {
+		t.Skipf("creating a directory junction is unavailable: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	t.Cleanup(func() { _ = os.Remove(junction) })
+}
+
+func denySandboxDirectoryAccess(path, account string) error {
+	argument := account + ":(OI)(CI)F"
+	output, err := exec.Command("icacls.exe", path, "/deny", argument).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("icacls deny: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func restoreSandboxDirectoryAccess(path, account string) error {
+	output, err := exec.Command("icacls.exe", path, "/remove:d", account).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("icacls restore: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func sandboxExpectedCanonicalPath(t *testing.T, path string) string {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("absolute path: %v", err)
+	}
+	parentPointer, err := windows.UTF16PtrFromString(filepath.Dir(abs))
+	if err != nil {
+		t.Fatalf("encode expected parent path: %v", err)
+	}
+	parentHandle, err := windows.CreateFile(
+		parentPointer,
+		windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("open expected parent handle: %v", err)
+	}
+	defer windows.CloseHandle(parentHandle)
+
+	buffer := make([]uint16, 32768)
+	length, err := windows.GetFinalPathNameByHandle(parentHandle, &buffer[0], uint32(len(buffer)), 0)
+	if err != nil {
+		t.Fatalf("resolve expected parent handle: %v", err)
+	}
+	if length == 0 || length >= uint32(len(buffer)) {
+		t.Fatalf("unexpected expected parent path length: %d", length)
+	}
+	return filepath.Join(windows.UTF16ToString(buffer[:length]), filepath.Base(abs))
+}
+
+func sandboxComparablePath(path string) string {
+	path = strings.ReplaceAll(path, "/", `\`)
+	if strings.HasPrefix(path, `\\?\`) {
+		path = path[4:]
+	}
+	return strings.ToLower(filepath.Clean(path))
+}
+
+func assertSandboxPathEqual(t *testing.T, got, want string) {
+	t.Helper()
+	if sandboxComparablePath(got) != sandboxComparablePath(want) {
+		t.Fatalf("recovered path = %q, want canonical path %q", got, want)
 	}
 }
 
