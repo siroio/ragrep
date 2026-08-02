@@ -45,15 +45,22 @@ func (s *sandboxVFS) FullPathname(name string) (string, error) {
 		}
 		return path, nil
 	}
-	if !isWindowsPermissionDenied(err) && !hasPinnedSQLiteOKSymlinkCode(err) {
-		return path, err
-	}
 
 	recoverPath := s.recoverPath
 	if recoverPath == nil {
 		recoverPath = recoverSandboxPath
 	}
-	return recoverPath(name)
+	if isWindowsPermissionDenied(err) || hasPinnedSQLiteOKSymlinkCode(err) {
+		return recoverPath(name)
+	}
+	if errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+		recovered, recoveryErr := recoverPath(name)
+		if recoveryErr == nil {
+			return recovered, nil
+		}
+		return path, err
+	}
+	return path, err
 }
 
 func isWindowsPermissionDenied(err error) bool {

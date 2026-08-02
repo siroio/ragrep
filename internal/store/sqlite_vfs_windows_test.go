@@ -303,8 +303,96 @@ func TestSandboxVFSFullPathnameRecoversPinnedOKSymlink(t *testing.T) {
 	}
 }
 
+func TestSandboxVFSFullPathnameRecoversPathNotFoundWhenRecoverySucceeds(t *testing.T) {
+	const input = "input/path"
+	const wantPath = "recovered/path"
+	base := &sandboxVFSDelegateStub{
+		fullPath:    "delegate/result",
+		fullPathErr: windows.ERROR_PATH_NOT_FOUND,
+	}
+	recoveryCalls := 0
+	var recoveredName string
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: func(name string) (string, error) {
+			recoveryCalls++
+			recoveredName = name
+			return wantPath, nil
+		},
+	}
+
+	got, err := adapter.FullPathname(input)
+	if err != nil {
+		t.Fatalf("FullPathname() error = %v, want nil", err)
+	}
+	if got != wantPath {
+		t.Fatalf("FullPathname() = %q, want %q", got, wantPath)
+	}
+	if recoveryCalls != 1 {
+		t.Fatalf("recovery called %d times, want 1", recoveryCalls)
+	}
+	if recoveredName != input {
+		t.Fatalf("recovery received %q, want %q", recoveredName, input)
+	}
+}
+
+func TestSandboxVFSFullPathnamePreservesOriginalPathNotFoundWhenRecoveryFails(t *testing.T) {
+	wantErr := windows.ERROR_PATH_NOT_FOUND
+	base := &sandboxVFSDelegateStub{
+		fullPath:    "delegate/result",
+		fullPathErr: wantErr,
+	}
+	recoveryCalls := 0
+	recoveryErr := errors.New("recovery failed")
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: func(string) (string, error) {
+			recoveryCalls++
+			return "recovered/result", recoveryErr
+		},
+	}
+
+	got, err := adapter.FullPathname("input/path")
+	if got != "delegate/result" {
+		t.Fatalf("FullPathname() = %q, want %q", got, "delegate/result")
+	}
+	if err != wantErr {
+		t.Fatalf("FullPathname() error = %v, want exact original error %v", err, wantErr)
+	}
+	if recoveryCalls != 1 {
+		t.Fatalf("recovery called %d times, want 1", recoveryCalls)
+	}
+}
+
 func TestSandboxVFSFullPathnamePreservesDirectInt512Error(t *testing.T) {
 	wantErr := sandboxVFSIntErrorCode(512)
+	base := &sandboxVFSDelegateStub{
+		fullPath:    "delegate/result",
+		fullPathErr: wantErr,
+	}
+	recoveryCalls := 0
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: func(string) (string, error) {
+			recoveryCalls++
+			return "recovered/result", nil
+		},
+	}
+
+	got, err := adapter.FullPathname("input/path")
+	if got != "delegate/result" {
+		t.Fatalf("FullPathname() = %q, want %q", got, "delegate/result")
+	}
+	if err != wantErr {
+		t.Fatalf("FullPathname() error = %v, want exact error %v", err, wantErr)
+	}
+	if recoveryCalls != 0 {
+		t.Fatalf("recovery called %d times, want 0", recoveryCalls)
+	}
+}
+
+func TestSandboxVFSFullPathnamePreservesFileNotFoundError(t *testing.T) {
+	wantErr := windows.ERROR_FILE_NOT_FOUND
 	base := &sandboxVFSDelegateStub{
 		fullPath:    "delegate/result",
 		fullPathErr: wantErr,
@@ -467,6 +555,18 @@ func TestRecoverSandboxPathRejectsMissingParentInsteadOfReturningAbs(t *testing.
 	}
 }
 
+func TestSandboxVFSFullPathnamePreservesOriginalPathNotFoundForMissingParent(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "missing-parent", "database.sqlite")
+
+	got, err := sandboxVFSFullPathnameWithPathError(db)
+	if got != db {
+		t.Fatalf("FullPathname(%q) = %q, want original delegate path", db, got)
+	}
+	if !errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+		t.Fatalf("FullPathname(%q) error = %v, want PATH_NOT_FOUND", db, err)
+	}
+}
+
 func TestRecoverSandboxPathRejectsInaccessibleParent(t *testing.T) {
 	blocked := filepath.Join(t.TempDir(), "blocked-parent")
 	if err := os.MkdirAll(blocked, 0o755); err != nil {
@@ -498,6 +598,18 @@ func TestRecoverSandboxPathRejectsInaccessibleParent(t *testing.T) {
 	}
 }
 
+func TestSandboxVFSFullPathnamePreservesOriginalPathNotFoundForUnsupportedNamespace(t *testing.T) {
+	db := `\\server\share\database.sqlite`
+
+	got, err := sandboxVFSFullPathnameWithPathError(db)
+	if got != db {
+		t.Fatalf("FullPathname(%q) = %q, want original delegate path", db, got)
+	}
+	if !errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+		t.Fatalf("FullPathname(%q) error = %v, want PATH_NOT_FOUND", db, err)
+	}
+}
+
 func TestRecoverSandboxPathAllowsDirectoryJunctionAndCanonicalizesParent(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "junction-target")
 	if err := os.MkdirAll(target, 0o755); err != nil {
@@ -517,6 +629,31 @@ func TestRecoverSandboxPathAllowsDirectoryJunctionAndCanonicalizesParent(t *test
 	assertSandboxPathEqual(t, got, sandboxExpectedCanonicalPath(t, db))
 	if strings.Contains(strings.ToLower(sandboxComparablePath(got)), strings.ToLower(sandboxComparablePath(junction))) {
 		t.Fatalf("recovered path %q still contains junction path %q", got, junction)
+	}
+}
+
+func TestSandboxVFSFullPathnamePreservesOriginalPathNotFoundForFinalDatabaseReparsePoint(t *testing.T) {
+	dir := sandboxTestDirectory(t)
+	target := filepath.Join(dir, "target.sqlite")
+	link := filepath.Join(dir, "database.sqlite")
+	if err := os.WriteFile(target, []byte("database"), 0o600); err != nil {
+		t.Fatalf("create reparse target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		targetDirectory := filepath.Join(t.TempDir(), "reparse-target")
+		if mkdirErr := os.MkdirAll(targetDirectory, 0o755); mkdirErr != nil {
+			t.Fatalf("create directory reparse target: %v", mkdirErr)
+		}
+		link = filepath.Join(t.TempDir(), "database.sqlite")
+		createSandboxDirectoryJunction(t, link, targetDirectory)
+	}
+
+	got, err := sandboxVFSFullPathnameWithPathError(link)
+	if got != link {
+		t.Fatalf("FullPathname(%q) = %q, want original delegate path", link, got)
+	}
+	if !errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+		t.Fatalf("FullPathname(%q) error = %v, want PATH_NOT_FOUND", link, err)
 	}
 }
 
@@ -647,16 +784,28 @@ func sandboxVFSFullPathnameWithRecovery(name string) (string, error) {
 	return adapter.FullPathname(name)
 }
 
+func sandboxVFSFullPathnameWithPathError(name string) (string, error) {
+	base := &sandboxVFSDelegateStub{
+		fullPath:    name,
+		fullPathErr: windows.ERROR_PATH_NOT_FOUND,
+	}
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: recoverSandboxPath,
+	}
+	return adapter.FullPathname(name)
+}
+
 func requireApprovedSandboxRecoveryTrigger(t *testing.T, path string) {
 	t.Helper()
 	rawPath, rawErr := vfs.Find("os").(vfs.VFSFilename).FullPathname(path)
-	if isWindowsPermissionDenied(rawErr) || hasPinnedSQLiteOKSymlinkCode(rawErr) {
+	if isWindowsPermissionDenied(rawErr) || hasPinnedSQLiteOKSymlinkCode(rawErr) || errors.Is(rawErr, windows.ERROR_PATH_NOT_FOUND) {
 		return
 	}
 	if rawErr == nil {
 		t.Skipf("os VFS FullPathname(%q) = (%q, nil); ordinary success is not an approved sandbox recovery trigger", path, rawPath)
 	}
-	t.Skipf("os VFS FullPathname(%q) = (%q, %v); approved recovery only applies to permission denial or pinned code %d", path, rawPath, rawErr, sandboxPinnedSQLiteOKSymlink)
+	t.Skipf("os VFS FullPathname(%q) = (%q, %v); approved recovery only applies to permission denial, pinned code %d, or exact PATH_NOT_FOUND", path, rawPath, rawErr, sandboxPinnedSQLiteOKSymlink)
 }
 
 func sandboxTestDirectory(t *testing.T) string {
