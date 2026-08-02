@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"unsafe"
 
@@ -15,6 +16,10 @@ import (
 )
 
 const sandboxVFSName = "ragrep-sandbox"
+
+// ncruces/go-sqlite3 v0.19.0 returns this private _ErrorCode value when the
+// OS VFS hits a symlink/junction path it cannot open directly.
+const sandboxPinnedSQLiteOKSymlink = 512
 
 type sandboxVFS struct {
 	vfs.VFSFilename
@@ -34,7 +39,13 @@ func init() {
 
 func (s *sandboxVFS) FullPathname(name string) (string, error) {
 	path, err := s.VFSFilename.FullPathname(name)
-	if err == nil || !isWindowsPermissionDenied(err) {
+	if err == nil {
+		if err := inspectSandboxDatabasePath(path); err != nil {
+			return "", fmt.Errorf("inspect SQLite database path %q: %w", path, err)
+		}
+		return path, nil
+	}
+	if !isWindowsPermissionDenied(err) && !hasPinnedSQLiteOKSymlinkCode(err) {
 		return path, err
 	}
 
@@ -47,6 +58,33 @@ func (s *sandboxVFS) FullPathname(name string) (string, error) {
 
 func isWindowsPermissionDenied(err error) bool {
 	return errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, os.ErrPermission)
+}
+
+func hasPinnedSQLiteOKSymlinkCode(err error) bool {
+	return errorHasNumericCode(err, sandboxPinnedSQLiteOKSymlink)
+}
+
+func errorHasNumericCode(err error, code uint32) bool {
+	value := reflect.ValueOf(err)
+	for value.IsValid() {
+		if value.Kind() == reflect.Pointer {
+			if value.IsNil() {
+				return false
+			}
+			value = value.Elem()
+			continue
+		}
+		switch value.Kind() {
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			return value.Uint() == uint64(code)
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			n := value.Int()
+			return n >= 0 && uint64(n) == uint64(code)
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func recoverSandboxPath(name string) (string, error) {
@@ -74,13 +112,20 @@ func recoverSandboxPath(name string) (string, error) {
 	}
 
 	finalPath := filepath.Join(canonicalParent, base)
-	if err := inspectWindowsFinalComponent(finalPath); err != nil {
-		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-			return finalPath, nil
-		}
+	if err := inspectSandboxDatabasePath(finalPath); err != nil {
 		return "", fmt.Errorf("inspect SQLite database path %q: %w", finalPath, err)
 	}
 	return finalPath, nil
+}
+
+func inspectSandboxDatabasePath(path string) error {
+	if err := inspectWindowsFinalComponent(path); err != nil {
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func rejectUnsupportedWindowsNamespace(path string) error {

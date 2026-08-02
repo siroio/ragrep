@@ -67,6 +67,75 @@ func TestOpenUsesRegisteredSandboxVFS(t *testing.T) {
 	}
 }
 
+func TestOpenThroughAncestorJunctionUsesCanonicalTargetPaths(t *testing.T) {
+	sandboxVFSRegistryTestMu.Lock()
+	t.Cleanup(sandboxVFSRegistryTestMu.Unlock)
+
+	original := vfs.Find(sandboxVFSName)
+	if original == nil {
+		t.Fatalf("vfs.Find(%q) returned nil", sandboxVFSName)
+	}
+	originalFilenameVFS, ok := original.(vfs.VFSFilename)
+	if !ok {
+		t.Fatalf("vfs.Find(%q) returned %T, want vfs.VFSFilename", sandboxVFSName, original)
+	}
+
+	observer := &observingSandboxVFS{VFSFilename: originalFilenameVFS}
+	vfs.Register(sandboxVFSName, observer)
+	t.Cleanup(func() {
+		vfs.Register(sandboxVFSName, original)
+	})
+
+	targetRoot := filepath.Join(t.TempDir(), "junction-target")
+	parent := filepath.Join(targetRoot, "real-parent")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatalf("create real parent: %v", err)
+	}
+	junction := filepath.Join(t.TempDir(), "junction-parent")
+	createSandboxDirectoryJunction(t, junction, targetRoot)
+
+	dbPath := filepath.Join(junction, "real-parent", "observed.sqlite")
+	wantDBPath := filepath.Join(parent, "observed.sqlite")
+	requireApprovedSandboxRecoveryTrigger(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", dbPath, err)
+	}
+	if _, err := store.UpsertDoc("docs/junction.md", "retry with backoff", 123, fakeEmbed); err != nil {
+		store.Close()
+		t.Fatalf("UpsertDoc(): %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen Open(%q): %v", dbPath, err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+
+	doc, err := reopened.GetDoc("docs/junction.md")
+	if err != nil {
+		t.Fatalf("GetDoc(): %v", err)
+	}
+	if doc != "retry with backoff" {
+		t.Fatalf("GetDoc() = %q, want stored content", doc)
+	}
+
+	hits, err := reopened.SearchVector(mustFakeEmbed(t, "title: none | text: retry with backoff"), 1, nil)
+	if err != nil {
+		t.Fatalf("SearchVector(): %v", err)
+	}
+	if len(hits) != 1 || hits[0].Doc != "docs/junction.md" {
+		t.Fatalf("SearchVector() hits = %+v, want persisted sqlite-vec row", hits)
+	}
+
+	events := observer.openEvents()
+	assertObservedCanonicalMainDBPath(t, events, wantDBPath)
+	assertObservedCanonicalSidecarPaths(t, events, wantDBPath)
+}
+
 func TestSandboxVFSDelegatesVFSOperations(t *testing.T) {
 	wantFile := &sandboxVFSFileStub{}
 	wantErr := errors.New("delegate error")
@@ -127,7 +196,9 @@ func TestSandboxVFSDelegatesVFSOperations(t *testing.T) {
 }
 
 func TestSandboxVFSFullPathnameKeepsSuccessfulDelegateResult(t *testing.T) {
-	base := &sandboxVFSDelegateStub{fullPath: "delegate/result"}
+	dir := sandboxTestDirectory(t)
+	wantPath := filepath.Join(dir, "new.sqlite")
+	base := &sandboxVFSDelegateStub{fullPath: wantPath}
 	recoveryCalls := 0
 	adapter := sandboxVFS{
 		VFSFilename: base,
@@ -141,8 +212,8 @@ func TestSandboxVFSFullPathnameKeepsSuccessfulDelegateResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FullPathname() error = %v, want nil", err)
 	}
-	if got != "delegate/result" {
-		t.Fatalf("FullPathname() = %q, want %q", got, "delegate/result")
+	if got != wantPath {
+		t.Fatalf("FullPathname() = %q, want %q", got, wantPath)
 	}
 	if recoveryCalls != 0 {
 		t.Fatalf("recovery called %d times, want 0", recoveryCalls)
@@ -204,6 +275,34 @@ func TestSandboxVFSFullPathnameRecoversAccessDenied(t *testing.T) {
 	}
 }
 
+func TestSandboxVFSFullPathnameRecoversPinnedOKSymlink(t *testing.T) {
+	const input = "input/path"
+	const wantPath = "recovered/path"
+	base := &sandboxVFSDelegateStub{
+		fullPath:    "delegate/result",
+		fullPathErr: sandboxVFSPrivateErrorCode(sandboxPinnedSQLiteOKSymlink),
+	}
+	var recoveredName string
+	adapter := sandboxVFS{
+		VFSFilename: base,
+		recoverPath: func(name string) (string, error) {
+			recoveredName = name
+			return wantPath, nil
+		},
+	}
+
+	got, err := adapter.FullPathname(input)
+	if err != nil {
+		t.Fatalf("FullPathname() error = %v, want nil", err)
+	}
+	if got != wantPath {
+		t.Fatalf("FullPathname() = %q, want %q", got, wantPath)
+	}
+	if recoveredName != input {
+		t.Fatalf("recovery received %q, want %q", recoveredName, input)
+	}
+}
+
 func TestSandboxVFSFullPathnameUsesDefaultRecovery(t *testing.T) {
 	dir := sandboxTestDirectory(t)
 	db := filepath.Join(dir, "existing.sqlite")
@@ -218,6 +317,32 @@ func TestSandboxVFSFullPathnameUsesDefaultRecovery(t *testing.T) {
 		t.Fatalf("FullPathname() error = %v, want nil", err)
 	}
 	assertSandboxPathEqual(t, got, sandboxExpectedCanonicalPath(t, db))
+}
+
+func TestSandboxVFSFullPathnameRecoversOSVFSSymlinkResultThroughAncestorJunction(t *testing.T) {
+	targetRoot := filepath.Join(t.TempDir(), "junction-target")
+	parent := filepath.Join(targetRoot, "real-parent")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatalf("create real parent: %v", err)
+	}
+	junction := filepath.Join(t.TempDir(), "junction-parent")
+	createSandboxDirectoryJunction(t, junction, targetRoot)
+
+	db := filepath.Join(junction, "real-parent", "database.sqlite")
+	if err := os.WriteFile(filepath.Join(parent, "database.sqlite"), []byte("database"), 0o600); err != nil {
+		t.Fatalf("create database through target parent: %v", err)
+	}
+	requireApprovedSandboxRecoveryTrigger(t, db)
+
+	adapter := sandboxVFS{VFSFilename: vfs.Find("os").(vfs.VFSFilename)}
+	got, err := adapter.FullPathname(db)
+	if err != nil {
+		t.Fatalf("FullPathname(%q) error = %v, want nil", db, err)
+	}
+	assertSandboxPathEqual(t, got, filepath.Join(parent, "database.sqlite"))
+	if strings.Contains(strings.ToLower(sandboxComparablePath(got)), strings.ToLower(sandboxComparablePath(junction))) {
+		t.Fatalf("FullPathname(%q) = %q, still contains junction path %q", db, got, junction)
+	}
 }
 
 func TestRecoverSandboxPathResolvesExistingDatabase(t *testing.T) {
@@ -338,6 +463,32 @@ func TestRecoverSandboxPathRejectsFinalDatabaseReparsePoint(t *testing.T) {
 	}
 }
 
+func TestSandboxVFSFullPathnameRejectsFinalDatabaseReparsePointOnDelegateSuccess(t *testing.T) {
+	dir := sandboxTestDirectory(t)
+	target := filepath.Join(dir, "target.sqlite")
+	link := filepath.Join(dir, "database.sqlite")
+	if err := os.WriteFile(target, []byte("database"), 0o600); err != nil {
+		t.Fatalf("create reparse target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		targetDirectory := filepath.Join(t.TempDir(), "reparse-target")
+		if mkdirErr := os.MkdirAll(targetDirectory, 0o755); mkdirErr != nil {
+			t.Fatalf("create directory reparse target: %v", mkdirErr)
+		}
+		link = filepath.Join(t.TempDir(), "database.sqlite")
+		createSandboxDirectoryJunction(t, link, targetDirectory)
+	}
+
+	adapter := sandboxVFS{VFSFilename: vfs.Find("os").(vfs.VFSFilename)}
+	got, err := adapter.FullPathname(link)
+	if err == nil {
+		t.Fatalf("FullPathname(%q) = %q, want error", link, got)
+	}
+	if got != "" {
+		t.Fatalf("FullPathname(%q) = %q, want empty path on reparse-point rejection", link, got)
+	}
+}
+
 func TestRecoverSandboxPathPreservesSpacesAndNonASCII(t *testing.T) {
 	dir := filepath.Join(sandboxTestDirectory(t), "space folder 日本語")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -412,6 +563,15 @@ func sandboxVFSFullPathnameWithRecovery(name string) (string, error) {
 		recoverPath: recoverSandboxPath,
 	}
 	return adapter.FullPathname(name)
+}
+
+func requireApprovedSandboxRecoveryTrigger(t *testing.T, path string) {
+	t.Helper()
+	rawPath, rawErr := vfs.Find("os").(vfs.VFSFilename).FullPathname(path)
+	if rawErr == nil || isWindowsPermissionDenied(rawErr) || hasPinnedSQLiteOKSymlinkCode(rawErr) {
+		return
+	}
+	t.Skipf("os VFS FullPathname(%q) = (%q, %v); approved recovery only applies to permission denial or pinned code %d", path, rawPath, rawErr, sandboxPinnedSQLiteOKSymlink)
 }
 
 func sandboxTestDirectory(t *testing.T) string {
@@ -498,6 +658,33 @@ func assertSandboxPathEqual(t *testing.T, got, want string) {
 	}
 }
 
+func assertObservedCanonicalMainDBPath(t *testing.T, events []sandboxVFSOpenEvent, wantDBPath string) {
+	t.Helper()
+	wantComparable := sandboxComparablePath(wantDBPath)
+	for _, event := range events {
+		if event.flags&vfs.OPEN_MAIN_DB == 0 {
+			continue
+		}
+		if sandboxComparablePath(event.path) == wantComparable {
+			return
+		}
+	}
+	t.Fatalf("observer open events = %+v, want an OPEN_MAIN_DB path equal to %q", events, wantDBPath)
+}
+
+func assertObservedCanonicalSidecarPaths(t *testing.T, events []sandboxVFSOpenEvent, wantDBPath string) {
+	t.Helper()
+	wantComparable := sandboxComparablePath(wantDBPath)
+	for _, event := range events {
+		if event.flags&vfs.OPEN_MAIN_JOURNAL == 0 && event.flags&vfs.OPEN_WAL == 0 {
+			continue
+		}
+		if !strings.HasPrefix(sandboxComparablePath(event.path), wantComparable) {
+			t.Fatalf("observer sidecar event = %+v, want canonical sidecar path rooted at %q", event, wantDBPath)
+		}
+	}
+}
+
 type sandboxVFSDelegateStub struct {
 	fullPath               string
 	fullPathErr            error
@@ -526,6 +713,12 @@ type observingSandboxVFS struct {
 	mu                sync.Mutex
 	fullPathnameCalls int
 	openFilenameCalls int
+	openFilenamePaths []sandboxVFSOpenEvent
+}
+
+type sandboxVFSOpenEvent struct {
+	flags vfs.OpenFlag
+	path  string
 }
 
 func (v *observingSandboxVFS) FullPathname(name string) (string, error) {
@@ -538,6 +731,12 @@ func (v *observingSandboxVFS) FullPathname(name string) (string, error) {
 func (v *observingSandboxVFS) OpenFilename(name *vfs.Filename, flags vfs.OpenFlag) (vfs.File, vfs.OpenFlag, error) {
 	v.mu.Lock()
 	v.openFilenameCalls++
+	if name != nil {
+		v.openFilenamePaths = append(v.openFilenamePaths, sandboxVFSOpenEvent{
+			flags: flags,
+			path:  name.String(),
+		})
+	}
 	v.mu.Unlock()
 	return v.VFSFilename.OpenFilename(name, flags)
 }
@@ -546,6 +745,14 @@ func (v *observingSandboxVFS) counts() (fullPathnameCalls, openFilenameCalls int
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.fullPathnameCalls, v.openFilenameCalls
+}
+
+func (v *observingSandboxVFS) openEvents() []sandboxVFSOpenEvent {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	events := make([]sandboxVFSOpenEvent, len(v.openFilenamePaths))
+	copy(events, v.openFilenamePaths)
+	return events
 }
 
 func (s *sandboxVFSDelegateStub) FullPathname(name string) (string, error) {
@@ -578,6 +785,12 @@ func (s *sandboxVFSDelegateStub) Delete(name string, syncDir bool) error {
 }
 
 type sandboxVFSFileStub struct{}
+
+type sandboxVFSPrivateErrorCode uint32
+
+func (e sandboxVFSPrivateErrorCode) Error() string {
+	return fmt.Sprintf("sqlite error %d", uint32(e))
+}
 
 func (sandboxVFSFileStub) Close() error { return nil }
 
