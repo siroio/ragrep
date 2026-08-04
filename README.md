@@ -123,11 +123,12 @@ ragrepを使うための手順書。
 | エージェント | コマンド |
 |---|---|
 | Claude Code | `/plugin marketplace add siroio/ragrep` → `/plugin install ragrep@ragrep` |
+| Codex | `codex plugin marketplace add siroio/ragrep` → `codex plugin add ragrep@ragrep` |
 | Gemini CLI | `gemini extensions install https://github.com/siroio/ragrep` |
 | GitHub Copilot CLI | `copilot plugin marketplace add siroio/ragrep` → `copilot plugin install ragrep@ragrep` |
 | Kimi Code | `/plugins install https://github.com/siroio/ragrep` |
 | Factory Droid | `droid plugin marketplace add https://github.com/siroio/ragrep` → `droid plugin install ragrep@ragrep` |
-| Codex / Cursor / その他 | `npx skills add siroio/ragrep`（[skills.sh](https://skills.sh)、対話的に選択） |
+| Cursor / その他 | `npx skills add siroio/ragrep`（[skills.sh](https://skills.sh)、対話的に選択） |
 
 基本ワークフロー（Adaptive Context Expansion）:
 
