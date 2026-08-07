@@ -96,6 +96,21 @@ func TestOpenVersionMismatchRequiresReindex(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsOldSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "code.db")
+	s, err := Open(path, "test-model", 768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	bumpUserVersion(t, path, 1)
+	_, err = Open(path, "test-model", 768)
+	if !errors.Is(err, ErrReindexRequired) {
+		t.Fatalf("Open with schema version 1: err=%v, want ErrReindexRequired", err)
+	}
+}
+
 func TestOpenModelMismatchRequiresReindex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "code.db")
 	s, err := Open(path, "model-a", 768)

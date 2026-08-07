@@ -21,7 +21,7 @@ import (
 
 // schemaVersion is stamped into PRAGMA user_version on creation. There is no
 // migration path across versions: bump this and require re-index instead.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // ErrReindexRequired is returned by Open when an existing code.db's schema
 // version or embedding model/dimension no longer matches what the caller
@@ -70,6 +70,7 @@ CREATE VIRTUAL TABLE symbol_fts USING fts5(
     qualified_name,
     signature,
     documentation,
+    body,
     content='symbols',
     content_rowid='id',
     tokenize='trigram'

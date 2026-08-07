@@ -302,6 +302,60 @@ func TestUpsertSymbolsResyncsFTSWhenIndexedColumnChanges(t *testing.T) {
 	}
 }
 
+func TestSearchSymbolsTextMatchesBody(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+
+	sym := sym("go:body", "Handle", "service.Handle", "", `func Handle() { panic("ERR_LIVE_731") }`)
+	fe.register(sym, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols(sym.Path, "filehash-1", []codeindex.Symbol{sym}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	hits, err := s.SearchSymbolsText("ERR_LIVE_731", 5)
+	if err != nil || len(hits) != 1 || hits[0].Key != sym.Key {
+		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+}
+
+func TestSearchSymbolsAutoSkipsVectorForExactMatch(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+	sym := sym("service:handle", "Handle", "service.Handle", "", "func Handle() {}")
+	fe.register(sym, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols(sym.Path, "filehash-1", []codeindex.Symbol{sym}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	called := 0
+	hits, used, err := s.SearchSymbolsAuto("service.Handle", 5, func() ([]float32, error) {
+		called++
+		return []float32{1, 0, 0}, nil
+	})
+	if err != nil || used || called != 0 || len(hits) == 0 || hits[0].QualifiedName != "service.Handle" {
+		t.Fatalf("hits=%v used=%v called=%v err=%v", hits, used, called, err)
+	}
+}
+
+func TestSearchSymbolsAutoUsesVectorForNonExactQuery(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+	sym := sym("service:handle", "Handle", "service.Handle", "", "func Handle() {}")
+	fe.register(sym, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols(sym.Path, "filehash-1", []codeindex.Symbol{sym}, 0, fe.embed); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	called := 0
+	_, used, err := s.SearchSymbolsAuto("responsibility query", 5, func() ([]float32, error) {
+		called++
+		return []float32{1, 0, 0}, nil
+	})
+	if err != nil || !used || called != 1 {
+		t.Fatalf("used=%v called=%v err=%v", used, called, err)
+	}
+}
+
 // TestSearchSymbolsHybridExactMatchBeatsSemanticSimilarity constructs a case
 // where the exact-name match would actually LOSE under plain RRF fusion (no
 // exact-match pin), so the assertion is falsifiable rather than

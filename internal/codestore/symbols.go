@@ -43,9 +43,9 @@ type SymbolHit struct {
 // existingSymbolRow is one row already stored for a file, fetched before a
 // file-level upsert transaction so UpsertSymbols can diff old vs. new.
 type existingSymbolRow struct {
-	id                                            int64
-	name, qualifiedName, signature, documentation string
-	bodyHash, fileHash                            string
+	id                                                  int64
+	name, qualifiedName, signature, documentation, body string
+	bodyHash, fileHash                                  string
 }
 
 // UpsertSymbols replaces path's stored symbols with symbols, in one
@@ -132,7 +132,7 @@ func (s *Store) UpsertSymbols(path, fileHash string, symbols []codeindex.Symbol,
 
 func (s *Store) existingSymbolRows(path string) (map[string]existingSymbolRow, error) {
 	rows, err := s.db.Query(`
-		SELECT key, id, name, qualified_name, signature, documentation, body_hash, file_hash
+		SELECT key, id, name, qualified_name, signature, documentation, body, body_hash, file_hash
 		FROM symbols WHERE path=?`, path)
 	if err != nil {
 		return nil, err
@@ -143,7 +143,7 @@ func (s *Store) existingSymbolRows(path string) (map[string]existingSymbolRow, e
 	for rows.Next() {
 		var key string
 		var row existingSymbolRow
-		if err := rows.Scan(&key, &row.id, &row.name, &row.qualifiedName, &row.signature, &row.documentation, &row.bodyHash, &row.fileHash); err != nil {
+		if err := rows.Scan(&key, &row.id, &row.name, &row.qualifiedName, &row.signature, &row.documentation, &row.body, &row.bodyHash, &row.fileHash); err != nil {
 			return nil, err
 		}
 		out[key] = row
@@ -159,9 +159,9 @@ func (s *Store) existingSymbolRows(path string) (map[string]existingSymbolRow, e
 // the same convention), and the symbols row itself.
 func deleteSymbolRow(tx *sql.Tx, key string, old existingSymbolRow) error {
 	if _, err := tx.Exec(`
-		INSERT INTO symbol_fts(symbol_fts, rowid, name, qualified_name, signature, documentation)
-		VALUES('delete', ?, ?, ?, ?, ?)`,
-		old.id, old.name, old.qualifiedName, old.signature, old.documentation); err != nil {
+		INSERT INTO symbol_fts(symbol_fts, rowid, name, qualified_name, signature, documentation, body)
+		VALUES('delete', ?, ?, ?, ?, ?, ?)`,
+		old.id, old.name, old.qualifiedName, old.signature, old.documentation, old.body); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM symbol_vec WHERE rowid=?`, old.id); err != nil {
@@ -194,8 +194,8 @@ func insertSymbol(tx *sql.Tx, fileHash string, sym codeindex.Symbol, runID int64
 		return err
 	}
 	if _, err := tx.Exec(`
-		INSERT INTO symbol_fts(rowid, name, qualified_name, signature, documentation) VALUES (?,?,?,?,?)`,
-		id, sym.Name, sym.QualifiedName, sym.Signature, sym.Documentation); err != nil {
+		INSERT INTO symbol_fts(rowid, name, qualified_name, signature, documentation, body) VALUES (?,?,?,?,?,?)`,
+		id, sym.Name, sym.QualifiedName, sym.Signature, sym.Documentation, sym.Body); err != nil {
 		return err
 	}
 	return embedAndStoreVector(tx, id, sym.EmbeddingText, embed)
@@ -219,14 +219,14 @@ func updateSymbol(tx *sql.Tx, fileHash string, sym codeindex.Symbol, old existin
 	// conditionally resyncing only when name/qualified_name/signature look
 	// changed — can never drift out of sync with the symbols row.
 	if _, err := tx.Exec(`
-		INSERT INTO symbol_fts(symbol_fts, rowid, name, qualified_name, signature, documentation)
-		VALUES('delete', ?, ?, ?, ?, ?)`,
-		old.id, old.name, old.qualifiedName, old.signature, old.documentation); err != nil {
+		INSERT INTO symbol_fts(symbol_fts, rowid, name, qualified_name, signature, documentation, body)
+		VALUES('delete', ?, ?, ?, ?, ?, ?)`,
+		old.id, old.name, old.qualifiedName, old.signature, old.documentation, old.body); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`
-		INSERT INTO symbol_fts(rowid, name, qualified_name, signature, documentation) VALUES (?,?,?,?,?)`,
-		old.id, sym.Name, sym.QualifiedName, sym.Signature, sym.Documentation); err != nil {
+		INSERT INTO symbol_fts(rowid, name, qualified_name, signature, documentation, body) VALUES (?,?,?,?,?,?)`,
+		old.id, sym.Name, sym.QualifiedName, sym.Signature, sym.Documentation, sym.Body); err != nil {
 		return err
 	}
 
@@ -655,6 +655,36 @@ func rrfMerge(lists [][]int64) ([]int64, map[int64]float64) {
 	return ids, scores
 }
 
+func prioritizeExactIDs(exactIDs, candidates []int64, scores map[int64]float64, k int) ([]int64, map[int64]bool) {
+	exact := make(map[int64]bool, len(exactIDs))
+	for _, id := range exactIDs {
+		exact[id] = true
+	}
+	sort.Slice(exactIDs, func(i, j int) bool {
+		a, b := exactIDs[i], exactIDs[j]
+		if scores[a] != scores[b] {
+			return scores[a] > scores[b]
+		}
+		return a < b
+	})
+
+	ordered := make([]int64, 0, len(exactIDs)+len(candidates))
+	seen := make(map[int64]bool, len(exactIDs))
+	for _, id := range exactIDs {
+		ordered = append(ordered, id)
+		seen[id] = true
+	}
+	for _, id := range candidates {
+		if !seen[id] {
+			ordered = append(ordered, id)
+		}
+	}
+	if len(ordered) > k {
+		ordered = ordered[:k]
+	}
+	return ordered, exact
+}
+
 // symbolHitsByIDs builds SymbolHits for ids, in the order given. ftsRank and
 // vecRank may be nil (meaning "no rank info from that source"); exact marks
 // ids that should be reported as exact matches.
@@ -690,6 +720,36 @@ func (s *Store) SearchSymbolsText(query string, k int) ([]SymbolHit, error) {
 		scores[id] = 1.0 / float64(r)
 	}
 	return s.symbolHitsByIDs(ids, ftsRank, nil, nil, scores)
+}
+
+// SearchSymbolsAuto skips vector search for an exact symbol name or qualified
+// name match, otherwise using the same hybrid search as semantic queries.
+func (s *Store) SearchSymbolsAuto(query string, k int, vector func() ([]float32, error)) ([]SymbolHit, bool, error) {
+	exactIDs, err := s.exactMatchIDs(query)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(exactIDs) > 0 {
+		textIDs, err := s.searchSymbolsTextIDs(query, rrfFetch)
+		if err != nil {
+			return nil, false, err
+		}
+		textRanks := rankMap(textIDs)
+		scores := make(map[int64]float64, len(textIDs))
+		for id, rank := range textRanks {
+			scores[id] = 1.0 / float64(rank)
+		}
+		ordered, exact := prioritizeExactIDs(exactIDs, textIDs, scores, k)
+		hits, err := s.symbolHitsByIDs(ordered, textRanks, nil, exact, scores)
+		return hits, false, err
+	}
+
+	v, err := vector()
+	if err != nil {
+		return nil, false, err
+	}
+	hits, err := s.SearchSymbolsHybrid(query, v, k)
+	return hits, true, err
 }
 
 // SearchSymbolsVector ranks by vector distance alone.
@@ -730,36 +790,7 @@ func (s *Store) SearchSymbolsHybrid(query string, vector []float32, k int) ([]Sy
 	}
 
 	fusedIDs, scores := rrfMerge([][]int64{textIDs, vecIDs})
-	exact := make(map[int64]bool, len(exactIDs))
-	for _, id := range exactIDs {
-		exact[id] = true
-	}
-
-	exactOrdered := make([]int64, len(exactIDs))
-	copy(exactOrdered, exactIDs)
-	sort.Slice(exactOrdered, func(i, j int) bool {
-		a, b := exactOrdered[i], exactOrdered[j]
-		if scores[a] != scores[b] {
-			return scores[a] > scores[b]
-		}
-		return a < b
-	})
-
-	ordered := make([]int64, 0, len(exactOrdered)+len(fusedIDs))
-	seen := make(map[int64]bool, len(exactOrdered))
-	for _, id := range exactOrdered {
-		ordered = append(ordered, id)
-		seen[id] = true
-	}
-	for _, id := range fusedIDs {
-		if seen[id] {
-			continue
-		}
-		ordered = append(ordered, id)
-	}
-	if len(ordered) > k {
-		ordered = ordered[:k]
-	}
+	ordered, exact := prioritizeExactIDs(exactIDs, fusedIDs, scores, k)
 
 	return s.symbolHitsByIDs(ordered, rankMap(textIDs), rankMap(vecIDs), exact, scores)
 }
