@@ -77,9 +77,10 @@ type pooledLanguageServer struct {
 }
 
 type lspPoolEntry struct {
-	server *pooledLanguageServer
-	leases int
-	timer  *time.Timer
+	server          *pooledLanguageServer
+	leases          int
+	timer           *time.Timer
+	timerGeneration uint64
 }
 
 type lspPoolKey struct {
@@ -167,14 +168,16 @@ func (p *lspPool) release(key lspPoolKey, entry *lspPoolEntry) {
 	}
 	entry.leases--
 	if entry.leases == 0 {
-		entry.timer = time.AfterFunc(p.idle, func() { p.closeIdle(key, entry) })
+		entry.timerGeneration++
+		generation := entry.timerGeneration
+		entry.timer = time.AfterFunc(p.idle, func() { p.closeIdle(key, entry, generation) })
 	}
 }
 
-func (p *lspPool) closeIdle(key lspPoolKey, entry *lspPoolEntry) {
+func (p *lspPool) closeIdle(key lspPoolKey, entry *lspPoolEntry, generation uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.entries[key] != entry || entry.leases != 0 {
+	if p.entries[key] != entry || entry.leases != 0 || entry.timerGeneration != generation {
 		return
 	}
 	delete(p.entries, key)

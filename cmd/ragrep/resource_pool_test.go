@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -156,5 +157,46 @@ func TestLSPPoolClosesIdleClientOnce(t *testing.T) {
 	}
 	if closeCount.Load() != 1 {
 		t.Fatalf("close count=%d, want 1", closeCount.Load())
+	}
+}
+
+func TestLSPPoolStaleIdleCallbackDoesNotCloseReacquiredClient(t *testing.T) {
+	var closeCount atomic.Int32
+	p := newLSPPool(time.Hour, func(context.Context, string, string) (*pooledLanguageServer, error) {
+		return &pooledLanguageServer{
+			client: new(lsp.Client),
+			close: func() error {
+				closeCount.Add(1)
+				return nil
+			},
+		}, nil
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, release, err := p.Acquire(context.Background(), root, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	key := lspPoolKey{root: root, language: "go"}
+	entry := p.entries[key]
+	staleGeneration := entry.timerGeneration
+
+	_, release, err = p.Acquire(context.Background(), root, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	p.closeIdle(key, entry, staleGeneration)
+
+	if p.entries[key] != entry || closeCount.Load() != 0 {
+		t.Fatalf("entry retained=%v close count=%d", p.entries[key] == entry, closeCount.Load())
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
