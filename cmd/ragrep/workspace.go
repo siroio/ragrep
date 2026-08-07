@@ -35,7 +35,9 @@ type workspaceState struct {
 	refresh              *workspaceRefresh
 	fullRefreshRequired  bool
 	fullRefreshEpoch     uint64
-	confirmPath          func(string, string) error
+	confirmPath          func(context.Context, string, string) error
+	confirmationContext  context.Context
+	cancelConfirmations  context.CancelFunc
 	closed               bool
 	shutdownDone         chan struct{}
 	shutdownErr          error
@@ -43,6 +45,7 @@ type workspaceState struct {
 	refreshWG            sync.WaitGroup
 	watcherWG            sync.WaitGroup
 	confirmationMu       sync.Mutex
+	confirmationWG       sync.WaitGroup
 	confirmationLocks    map[string]*sync.Mutex
 	pendingConfirmations map[workspaceConfirmation]struct{}
 }
@@ -130,6 +133,7 @@ func newWorkspaceState(root string, store *codestore.Store, roots []string, lang
 		}
 		pendingConfirmations[workspaceConfirmation{path: state.Path, hash: state.Hash}] = struct{}{}
 	}
+	confirmationContext, cancelConfirmations := context.WithCancel(context.Background())
 	return &workspaceState{
 		root:                 absRoot,
 		language:             language,
@@ -140,6 +144,8 @@ func newWorkspaceState(root string, store *codestore.Store, roots []string, lang
 		generation:           generation,
 		pendingConfirmations: pendingConfirmations,
 		shutdownDone:         make(chan struct{}),
+		confirmationContext:  confirmationContext,
+		cancelConfirmations:  cancelConfirmations,
 	}, nil
 }
 
@@ -443,19 +449,27 @@ func (w *workspaceState) requireFullRefresh() {
 	w.mu.Unlock()
 }
 
-func (w *workspaceState) setConfirmation(confirm func(string, string) error) {
+func (w *workspaceState) setConfirmation(confirm func(context.Context, string, string) error) {
 	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return
+	}
 	w.confirmPath = confirm
 	pending := w.pendingConfirmations
 	w.pendingConfirmations = nil
-	w.mu.Unlock()
 	for confirmation := range pending {
-		go w.runConfirmation(confirm, confirmation)
+		w.startConfirmationLocked(confirm, confirmation)
 	}
+	w.mu.Unlock()
 }
 
 func (w *workspaceState) scheduleConfirmation(path, hash string) {
 	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return
+	}
 	confirm := w.confirmPath
 	if confirm == nil {
 		if w.pendingConfirmations == nil {
@@ -463,19 +477,27 @@ func (w *workspaceState) scheduleConfirmation(path, hash string) {
 		}
 		w.pendingConfirmations[workspaceConfirmation{path: path, hash: hash}] = struct{}{}
 	}
-	w.mu.Unlock()
 	if confirm != nil {
-		go w.runConfirmation(confirm, workspaceConfirmation{path: path, hash: hash})
+		w.startConfirmationLocked(confirm, workspaceConfirmation{path: path, hash: hash})
 	}
+	w.mu.Unlock()
 }
 
-func (w *workspaceState) runConfirmation(confirm func(string, string) error, confirmation workspaceConfirmation) {
-	if err := confirm(confirmation.path, confirmation.hash); err != nil {
+func (w *workspaceState) startConfirmationLocked(confirm func(context.Context, string, string) error, confirmation workspaceConfirmation) {
+	w.confirmationWG.Add(1)
+	go w.runConfirmation(confirm, confirmation)
+}
+
+func (w *workspaceState) runConfirmation(confirm func(context.Context, string, string) error, confirmation workspaceConfirmation) {
+	defer w.confirmationWG.Done()
+	if err := confirm(w.confirmationContext, confirmation.path, confirmation.hash); err != nil {
 		w.mu.Lock()
-		if w.pendingConfirmations == nil {
-			w.pendingConfirmations = make(map[workspaceConfirmation]struct{})
+		if !w.closed {
+			if w.pendingConfirmations == nil {
+				w.pendingConfirmations = make(map[workspaceConfirmation]struct{})
+			}
+			w.pendingConfirmations[confirmation] = struct{}{}
 		}
-		w.pendingConfirmations[confirmation] = struct{}{}
 		w.mu.Unlock()
 	}
 }
@@ -573,6 +595,9 @@ func (w *workspaceState) Close() error {
 		return err
 	}
 	w.closed = true
+	if w.cancelConfirmations != nil {
+		w.cancelConfirmations()
+	}
 	watcher := w.watcher
 	w.watcher = nil
 	w.mu.Unlock()
@@ -582,6 +607,7 @@ func (w *workspaceState) Close() error {
 	}
 	w.refreshWG.Wait()
 	w.watcherWG.Wait()
+	w.confirmationWG.Wait()
 	w.mu.Lock()
 	w.shutdownErr = err
 	close(w.shutdownDone)

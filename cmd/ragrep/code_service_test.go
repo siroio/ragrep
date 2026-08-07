@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -531,12 +534,39 @@ func main() {
 }
 `
 
+const blockingInitializeServerSrc = `package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"io"
+	"net/textproto"
+	"os"
+	"strconv"
+	"time"
+)
+
+func main() {
+	tp := textproto.NewReader(bufio.NewReader(os.Stdin))
+	hdr, err := tp.ReadMIMEHeader()
+	if err != nil { return }
+	n, err := strconv.Atoi(hdr.Get("Content-Length"))
+	if err != nil { return }
+	body := make([]byte, n)
+	if _, err := io.ReadFull(tp.R, body); err != nil { return }
+	var msg map[string]json.RawMessage
+	if json.Unmarshal(body, &msg) != nil { return }
+	_ = os.WriteFile("initialize.started", []byte(strconv.Itoa(os.Getpid())), 0644)
+	time.Sleep(time.Second)
+}
+`
+
 func useBlockingDocumentSymbolServer(t *testing.T, svc *codeService, root string) (started, release string) {
 	t.Helper()
 	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "blocking-document-symbol", blockingDocumentSymbolServerSrc)
 	_ = svc.lsps.Close()
 	svc.lsps = newLSPPool(time.Hour, func(context.Context, string, string) (*pooledLanguageServer, error) {
-		client, _, err := startLanguageServer(exe, root)
+		client, _, err := startLanguageServer(context.Background(), exe, root)
 		if err != nil {
 			return nil, err
 		}
@@ -555,6 +585,59 @@ func waitForTestPath(t *testing.T, path string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", path)
+}
+
+func TestWorkspaceCloseCancelsConfirmationBlockedInInitialize(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-blocking-initialize", blockingInitializeServerSrc)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"`+filepath.ToSlash(exe)+`"}}`)
+	ws.save(t, "service.go", "package service\nfunc BlockedInitialize() {}\n")
+	if _, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "BlockedInitialize"}); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(ws.root, "initialize.started")
+	waitForTestPath(t, started)
+	pidText, err := os.ReadFile(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidText)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- ws.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("workspace Close did not cancel LSP initialize")
+	}
+	serviceClosed := make(chan error, 1)
+	go func() { serviceClosed <- svc.Close() }()
+	select {
+	case err := <-serviceClosed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("service Close remained blocked after canceled initialize")
+	}
+	if testProcessExists(pid) {
+		t.Fatalf("language server process %d still exists after Close", pid)
+	}
+}
+
+func testProcessExists(pid int) bool {
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("tasklist", "/FI", "PID eq "+strconv.Itoa(pid), "/FO", "CSV", "/NH").Output()
+		return err == nil && strings.Contains(string(out), `,"`+strconv.Itoa(pid)+`",`)
+	}
+	process, err := os.FindProcess(pid)
+	return err == nil && process.Signal(syscall.Signal(0)) == nil
 }
 
 func TestConfirmPathOlderPromotionCannotOverwriteNewerCompletion(t *testing.T) {
@@ -704,6 +787,94 @@ func TestConfirmPathMutationWaitsForActiveSnapshot(t *testing.T) {
 	}
 }
 
+func TestConfirmPathEmbeddingDoesNotBlockLiveSnapshot(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-confirm-embedding", fakeLSPServerDocumentSymbolSrc)
+	_ = svc.lsps.Close()
+	svc.lsps = newLSPPool(time.Hour, func(context.Context, string, string) (*pooledLanguageServer, error) {
+		client, _, err := startLanguageServer(context.Background(), exe, ws.root)
+		if err != nil {
+			return nil, err
+		}
+		return &pooledLanguageServer{client: client, close: client.Close}, nil
+	})
+	body := "package service\nfunc Foo() {\n}\n"
+	hash := ws.save(t, "service.go", body)
+	if err := ws.store.PutLiveFile("service.go", hash, body, 1); err != nil {
+		t.Fatal(err)
+	}
+	embedder.started = make(chan struct{})
+	release := make(chan struct{})
+	embedder.release = release
+	confirmed := make(chan error, 1)
+	go func() { confirmed <- svc.ConfirmPath(context.Background(), ws.root, "service.go", hash) }()
+	select {
+	case <-embedder.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("confirmation did not reach embedding")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, unlock, err := ws.Snapshot(ctx)
+	if err != nil {
+		close(release)
+		<-confirmed
+		t.Fatalf("Snapshot blocked behind embedding: %v", err)
+	}
+	live, err := ws.store.SearchLiveText("Foo", 1)
+	unlock()
+	if err != nil || len(live) != 1 || !live[0].Live {
+		close(release)
+		<-confirmed
+		t.Fatalf("live=%+v err=%v", live, err)
+	}
+	close(release)
+	if err := <-confirmed; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConfirmPathEmbedsOnlyChangedSymbols(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	src := strings.Replace(fakeLSPServerDocumentSymbolSrc,
+		`[{"name":"Foo","detail":"func Foo()","kind":12,"range":{"start":{"line":1,"character":0},"end":{"line":3,"character":1}},"selectionRange":{"start":{"line":1,"character":5},"end":{"line":1,"character":8}},"children":[]}]`,
+		`[{"name":"Foo","detail":"func Foo()","kind":12,"range":{"start":{"line":1,"character":0},"end":{"line":3,"character":1}},"selectionRange":{"start":{"line":1,"character":5},"end":{"line":1,"character":8}},"children":[]},{"name":"Bar","detail":"func Bar()","kind":12,"range":{"start":{"line":4,"character":0},"end":{"line":6,"character":1}},"selectionRange":{"start":{"line":4,"character":5},"end":{"line":4,"character":8}},"children":[]}]`, 1)
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-confirm-selective-embedding", src)
+	_ = svc.lsps.Close()
+	svc.lsps = newLSPPool(time.Hour, func(ctx context.Context, _, _ string) (*pooledLanguageServer, error) {
+		client, _, err := startLanguageServer(ctx, exe, ws.root)
+		if err != nil {
+			return nil, err
+		}
+		return &pooledLanguageServer{client: client, close: client.Close}, nil
+	})
+	bodyA := "package service\nfunc Foo() {\n\t// version A\n}\nfunc Bar() {\n\t// stable\n}\n"
+	hashA := ws.save(t, "service.go", bodyA)
+	if err := ws.store.PutLiveFile("service.go", hashA, bodyA, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ConfirmPath(context.Background(), ws.root, "service.go", hashA); err != nil {
+		t.Fatal(err)
+	}
+	if embedder.calls.Load() != 2 {
+		t.Fatalf("initial embed calls=%d, want 2", embedder.calls.Load())
+	}
+
+	bodyB := strings.Replace(bodyA, "version A", "version B", 1)
+	hashB := ws.save(t, "service.go", bodyB)
+	if err := ws.store.PutLiveFile("service.go", hashB, bodyB, 2); err != nil {
+		t.Fatal(err)
+	}
+	embedder.calls.Store(0)
+	if err := svc.ConfirmPath(context.Background(), ws.root, "service.go", hashB); err != nil {
+		t.Fatal(err)
+	}
+	if embedder.calls.Load() != 1 {
+		t.Fatalf("changed embed calls=%d, want 1", embedder.calls.Load())
+	}
+}
+
 func TestCodeServiceSearchSchedulesConfirmationWithoutBlockingBarrier(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
@@ -745,7 +916,7 @@ func TestCodeServiceFailedConfirmationRetriesOnNextRead(t *testing.T) {
 		if attempts.Add(1) == 1 {
 			return nil, errors.New("transient LSP start failure")
 		}
-		client, _, err := startLanguageServer(exe, root)
+		client, _, err := startLanguageServer(ctx, exe, root)
 		if err != nil {
 			return nil, err
 		}

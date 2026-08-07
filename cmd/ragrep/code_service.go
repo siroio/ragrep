@@ -115,8 +115,8 @@ func (s *codeService) Search(ctx context.Context, req searchRequest) (searchResp
 }
 
 func (s *codeService) enableConfirmation(ws *workspaceState, db string) {
-	ws.setConfirmation(func(path, hash string) error {
-		return s.confirmPathAtDB(context.Background(), ws.root, db, path, hash)
+	ws.setConfirmation(func(ctx context.Context, path, hash string) error {
+		return s.confirmPathAtDB(ctx, ws.root, db, path, hash)
 	})
 }
 
@@ -631,6 +631,24 @@ func (s *codeService) confirmPathAtDB(ctx context.Context, root, db, path, expec
 	if err != nil {
 		return err
 	}
+	vectors := make(map[string][]float32, len(symbols))
+	for _, symbol := range symbols {
+		previous, err := ws.store.GetSymbol(symbol.Key)
+		if err == nil && previous.EmbeddingText == symbol.EmbeddingText && previous.BodyHash == symbol.BodyHash {
+			continue
+		}
+		if err != nil && !errors.Is(err, codestore.ErrNotFound) {
+			return err
+		}
+		if _, ok := vectors[symbol.EmbeddingText]; ok {
+			continue
+		}
+		vector, err := s.embeddings.Embed(ctx, symbol.EmbeddingText)
+		if err != nil {
+			return err
+		}
+		vectors[symbol.EmbeddingText] = vector
+	}
 	if err := ws.updateMu.LockContext(ctx); err != nil {
 		return err
 	}
@@ -648,7 +666,7 @@ func (s *codeService) confirmPathAtDB(ctx context.Context, root, db, path, expec
 		return nil
 	}
 	if _, err := ws.store.UpsertSymbols(rel, file.Hash, symbols, 0, func(text string) ([]float32, error) {
-		return s.embeddings.Embed(ctx, text)
+		return vectors[text], nil
 	}); err != nil {
 		return err
 	}

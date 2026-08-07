@@ -16,6 +16,21 @@ type blockingTextEmbedder struct {
 	active, maxActive *atomic.Int32
 }
 
+type lifecycleTextEmbedder struct {
+	started    chan struct{}
+	release    chan struct{}
+	startOnce  sync.Once
+	closeCount atomic.Int32
+}
+
+func (e *lifecycleTextEmbedder) Embed(string) ([]float32, error) {
+	e.startOnce.Do(func() { close(e.started) })
+	<-e.release
+	return []float32{1}, nil
+}
+
+func (e *lifecycleTextEmbedder) Close() { e.closeCount.Add(1) }
+
 type cancellationAfterFirstCheckContext struct {
 	context.Context
 	checked chan struct{}
@@ -102,6 +117,81 @@ func TestEmbeddingPoolConstructsOnceAndSerializes(t *testing.T) {
 	}
 }
 
+func TestWorkspaceAndServiceCloseDoNotWaitForActiveEmbedding(t *testing.T) {
+	embedder := &lifecycleTextEmbedder{started: make(chan struct{}), release: make(chan struct{})}
+	p := newEmbeddingPool(func() (textEmbedder, error) { return embedder, nil })
+	svc := newCodeService(nil, p, nil)
+	w := newTestWorkspace(t, "func BlockingEmbedding() {}")
+	w.setConfirmation(func(ctx context.Context, _, _ string) error {
+		_, err := p.Embed(ctx, "blocking")
+		return err
+	})
+	<-embedder.started
+
+	workspaceClosed := make(chan error, 1)
+	go func() { workspaceClosed <- w.Close() }()
+	var workspaceErr error
+	workspacePrompt := false
+	select {
+	case workspaceErr = <-workspaceClosed:
+		workspacePrompt = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	serviceClosed := make(chan error, 1)
+	go func() { serviceClosed <- svc.Close() }()
+	var serviceErr error
+	servicePrompt := false
+	select {
+	case serviceErr = <-serviceClosed:
+		servicePrompt = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	rejected := make(chan error, 1)
+	go func() {
+		_, err := p.Embed(context.Background(), "after-close")
+		rejected <- err
+	}()
+	var rejectedErr error
+	rejectedPrompt := false
+	select {
+	case rejectedErr = <-rejected:
+		rejectedPrompt = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	if embedder.closeCount.Load() != 0 {
+		t.Fatalf("active embedder close count=%d, want 0 before worker exits", embedder.closeCount.Load())
+	}
+	close(embedder.release)
+	if !workspacePrompt {
+		workspaceErr = <-workspaceClosed
+	}
+	if !servicePrompt {
+		serviceErr = <-serviceClosed
+	}
+	if !rejectedPrompt {
+		rejectedErr = <-rejected
+	}
+	if !workspacePrompt || workspaceErr != nil {
+		t.Fatalf("workspace Close prompt=%v err=%v", workspacePrompt, workspaceErr)
+	}
+	if !servicePrompt || serviceErr != nil {
+		t.Fatalf("service Close prompt=%v err=%v", servicePrompt, serviceErr)
+	}
+	if !rejectedPrompt || rejectedErr == nil {
+		t.Fatalf("post-Close Embed prompt=%v err=%v", rejectedPrompt, rejectedErr)
+	}
+	deadline := time.Now().Add(time.Second)
+	for embedder.closeCount.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if embedder.closeCount.Load() != 1 {
+		t.Fatalf("embedder close count=%d, want 1 after worker exits", embedder.closeCount.Load())
+	}
+	if err := svc.Close(); err != nil || embedder.closeCount.Load() != 1 {
+		t.Fatalf("second Close err=%v close count=%d", err, embedder.closeCount.Load())
+	}
+}
+
 func TestLSPPoolReusesOverlappingLease(t *testing.T) {
 	var constructed atomic.Int32
 	p := newLSPPool(time.Hour, func(context.Context, string, string) (*pooledLanguageServer, error) {
@@ -164,6 +254,65 @@ func TestLSPPoolCancellationWhileWaitingSkipsLease(t *testing.T) {
 
 	if err := <-done; !errors.Is(err, context.Canceled) || constructed.Load() != 0 || len(p.entries) != 0 {
 		t.Fatalf("error=%v constructed=%d entries=%d, want canceled without lease", err, constructed.Load(), len(p.entries))
+	}
+}
+
+func TestWorkspaceCloseCancelsConfirmationWaitingForOtherLSPConstructor(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	constructorStarted := make(chan struct{})
+	releaseConstructor := make(chan struct{})
+	p := newLSPPool(time.Hour, func(_ context.Context, root, _ string) (*pooledLanguageServer, error) {
+		if root == rootA {
+			close(constructorStarted)
+			<-releaseConstructor
+		}
+		return &pooledLanguageServer{client: new(lsp.Client)}, nil
+	})
+	first := make(chan error, 1)
+	go func() {
+		_, release, err := p.Acquire(context.Background(), rootA, "go")
+		if err == nil {
+			release()
+		}
+		first <- err
+	}()
+	<-constructorStarted
+
+	w := newTestWorkspace(t, "func WaitingForLSP() {}")
+	confirmationStarted := make(chan struct{})
+	w.setConfirmation(func(ctx context.Context, _, _ string) error {
+		close(confirmationStarted)
+		_, release, err := p.Acquire(ctx, rootB, "go")
+		if err == nil {
+			release()
+		}
+		return err
+	})
+	<-confirmationStarted
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+	prompt := false
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+		prompt = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseConstructor)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if !prompt {
+		if err := <-closed; err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("workspace Close waited for another workspace's LSP constructor")
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

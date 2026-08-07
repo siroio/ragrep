@@ -20,10 +20,12 @@ type textEmbedder interface {
 }
 
 type embeddingPool struct {
-	mu          sync.Mutex
+	mu          contextMutex
+	stateMu     sync.Mutex
 	constructor func() (textEmbedder, error)
 	embedder    textEmbedder
 	closed      bool
+	active      bool
 }
 
 func newEmbeddingPool(constructor func() (textEmbedder, error)) *embeddingPool {
@@ -43,33 +45,78 @@ func (p *embeddingPool) Embed(ctx context.Context, text string) ([]float32, erro
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := ctx.Err(); err != nil {
+	p.stateMu.Lock()
+	closed := p.closed
+	p.stateMu.Unlock()
+	if closed {
+		return nil, errors.New("embedding pool is closed")
+	}
+	if err := p.mu.LockContext(ctx); err != nil {
 		return nil, err
 	}
+	p.stateMu.Lock()
 	if p.closed {
+		p.stateMu.Unlock()
+		p.mu.Unlock()
 		return nil, errors.New("embedding pool is closed")
 	}
 	if p.embedder == nil {
 		embedder, err := p.constructor()
 		if err != nil {
+			p.stateMu.Unlock()
+			p.mu.Unlock()
 			return nil, err
 		}
 		p.embedder = embedder
 	}
-	return p.embedder.Embed(text)
+	embedder := p.embedder
+	p.active = true
+	p.stateMu.Unlock()
+
+	type result struct {
+		vector []float32
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		vector, err := embedder.Embed(text)
+		p.stateMu.Lock()
+		p.active = false
+		closeEmbedder := p.closed && p.embedder == embedder
+		if closeEmbedder {
+			p.embedder = nil
+		}
+		p.stateMu.Unlock()
+		if closeEmbedder {
+			embedder.Close()
+		}
+		p.mu.Unlock()
+		done <- result{vector: vector, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-done:
+		return result.vector, result.err
+	}
 }
 
 func (p *embeddingPool) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.stateMu.Lock()
 	if p.closed {
+		p.stateMu.Unlock()
 		return nil
 	}
 	p.closed = true
-	if p.embedder != nil {
-		p.embedder.Close()
+	if p.active {
+		p.stateMu.Unlock()
+		return nil
+	}
+	embedder := p.embedder
+	p.embedder = nil
+	p.stateMu.Unlock()
+	if embedder != nil {
+		embedder.Close()
 	}
 	return nil
 }
@@ -92,7 +139,7 @@ type lspPoolKey struct {
 }
 
 type lspPool struct {
-	mu          sync.Mutex
+	mu          contextMutex
 	idle        time.Duration
 	constructor func(context.Context, string, string) (*pooledLanguageServer, error)
 	entries     map[lspPoolKey]*lspPoolEntry
@@ -116,7 +163,7 @@ func newLSPPool(idle time.Duration, constructor func(context.Context, string, st
 			if err != nil {
 				return nil, err
 			}
-			client, initResult, err := startLanguageServer(command, root)
+			client, initResult, err := startLanguageServer(ctx, command, root)
 			if err != nil {
 				return nil, err
 			}
@@ -145,7 +192,9 @@ func (p *lspPool) AcquireWithMetadata(ctx context.Context, root, language string
 		return nil, "", "", nil, err
 	}
 	key := lspPoolKey{root: root, language: language}
-	p.mu.Lock()
+	if err := p.mu.LockContext(ctx); err != nil {
+		return nil, "", "", nil, err
+	}
 	defer p.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, "", "", nil, err

@@ -85,7 +85,7 @@ func TestWorkspaceBarrierSeesSaveBeforeWatcherDelivery(t *testing.T) {
 func TestWorkspaceQueuesConfirmationBeforeCallbackRegistration(t *testing.T) {
 	w := newTestWorkspace(t, "func QueuedConfirmation() {}")
 	confirmed := make(chan string, 1)
-	w.setConfirmation(func(path, hash string) error {
+	w.setConfirmation(func(_ context.Context, path, hash string) error {
 		confirmed <- path + ":" + hash
 		return nil
 	})
@@ -118,7 +118,7 @@ func TestWorkspaceQueuesPersistedLiveConfirmationAtStartup(t *testing.T) {
 	}
 	t.Cleanup(func() { w.Close() })
 	confirmed := make(chan string, 1)
-	w.setConfirmation(func(path, hash string) error {
+	w.setConfirmation(func(_ context.Context, path, hash string) error {
 		confirmed <- path + ":" + hash
 		return nil
 	})
@@ -130,6 +130,37 @@ func TestWorkspaceQueuesPersistedLiveConfirmationAtStartup(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("persisted live confirmation was not resumed")
 	}
+}
+
+func TestWorkspaceCloseCancelsAndJoinsConfirmation(t *testing.T) {
+	w := newTestWorkspace(t, "func CloseConfirmation() {}")
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	w.setConfirmation(func(ctx context.Context, _, _ string) error {
+		close(started)
+		<-ctx.Done()
+		close(finished)
+		return ctx.Err()
+	})
+	<-started
+
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Close did not cancel blocked confirmation")
+	}
+	select {
+	case <-finished:
+	default:
+		t.Fatal("Close returned before confirmation exited")
+	}
+
+	w.scheduleConfirmation("late.go", "late-hash")
 }
 
 func TestWorkspaceGenerationChangesOnlyWithVisibleContent(t *testing.T) {

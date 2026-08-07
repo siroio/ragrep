@@ -250,13 +250,13 @@ func gitRevision(wsRoot string) string {
 
 // startLanguageServer launches serverCmd and drives it through
 // initialize/initialized. The caller must Close the returned client.
-func startLanguageServer(serverCmd, wsRoot string) (*lsp.Client, *lsp.InitializeResult, error) {
+func startLanguageServer(ctx context.Context, serverCmd, wsRoot string) (*lsp.Client, *lsp.InitializeResult, error) {
 	client, err := lsp.Start(serverCmd, nil, lsp.WithDir(wsRoot))
 	if err != nil {
 		return nil, nil, fmt.Errorf("starting language server %q: %w", serverCmd, err)
 	}
 	pid := os.Getpid()
-	result, err := client.Initialize(context.Background(), lsp.InitializeParams{
+	result, err := client.Initialize(ctx, lsp.InitializeParams{
 		ProcessID:    &pid,
 		RootURI:      fileURI(wsRoot),
 		Capabilities: lsp.DefaultClientCapabilities(),
@@ -265,7 +265,15 @@ func startLanguageServer(serverCmd, wsRoot string) (*lsp.Client, *lsp.Initialize
 		client.Close()
 		return nil, nil, fmt.Errorf("initialize: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		client.Close()
+		return nil, nil, fmt.Errorf("initialize: %w", err)
+	}
 	if err := client.Initialized(); err != nil {
+		client.Close()
+		return nil, nil, fmt.Errorf("initialized: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
 		client.Close()
 		return nil, nil, fmt.Errorf("initialized: %w", err)
 	}
