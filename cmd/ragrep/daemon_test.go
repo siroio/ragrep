@@ -400,6 +400,102 @@ func TestWorkspaceRegistryPersistsOnlyExplicitRoots(t *testing.T) {
 	}
 }
 
+func TestWorkspaceRegistryReusesSameFileDatabaseAliases(t *testing.T) {
+	t.Run("default then custom alias", func(t *testing.T) {
+		root := testWorkspaceRoot(t)
+		r, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Hour, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		first, err := r.ResolveCode(root, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(root, "code-alias.db")
+		if err := os.Symlink(filepath.Join(root, ".ragrep", "code.db"), alias); err != nil {
+			t.Skipf("cannot create database symlink: %v", err)
+		}
+		second, err := r.ResolveCode(root, alias)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first != second || len(r.entries) != 1 || len(r.codeEntries) != 0 {
+			t.Fatalf("same state=%v default entries=%d custom entries=%d", first == second, len(r.entries), len(r.codeEntries))
+		}
+	})
+
+	t.Run("custom alias then default", func(t *testing.T) {
+		root := testWorkspaceRoot(t)
+		alias := filepath.Join(root, "code-alias.db")
+		if err := os.Symlink(filepath.Join(root, ".ragrep", "code.db"), alias); err != nil {
+			t.Skipf("cannot create database symlink: %v", err)
+		}
+		r, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Hour, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		first, err := r.ResolveCode(root, alias)
+		if err != nil {
+			t.Fatal(err)
+		}
+		release, err := r.AcquireCode(root, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := r.ResolveCode(root, "")
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		if first != second || len(r.entries) != 0 || len(r.codeEntries) != 1 {
+			release()
+			t.Fatalf("same state=%v default entries=%d custom entries=%d", first == second, len(r.entries), len(r.codeEntries))
+		}
+		for _, entry := range r.codeEntries {
+			if entry.leases != 1 {
+				release()
+				t.Fatalf("leases=%d, want 1", entry.leases)
+			}
+		}
+		release()
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-first.shutdownDone:
+		default:
+			t.Fatal("registry Close did not close reused custom entry")
+		}
+	})
+
+	t.Run("custom aliases", func(t *testing.T) {
+		root := testWorkspaceRoot(t)
+		r, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Hour, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		db := filepath.Join(root, "custom.db")
+		first, err := r.ResolveCode(root, db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(root, "custom-alias.db")
+		if err := os.Symlink(db, alias); err != nil {
+			t.Skipf("cannot create database symlink: %v", err)
+		}
+		second, err := r.ResolveCode(root, alias)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first != second || len(r.codeEntries) != 1 {
+			t.Fatalf("same state=%v custom entries=%d", first == second, len(r.codeEntries))
+		}
+	})
+}
+
 func TestWorkspaceRegistryAutoRegistersAncestorAndEvictsIdle(t *testing.T) {
 	root := testWorkspaceRoot(t)
 	sub := filepath.Join(root, "pkg")

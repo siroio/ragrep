@@ -13,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -392,6 +394,10 @@ func (r *workspaceRegistry) Resolve(path string) (*workspaceState, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.resolveLocked(root)
+}
+
+func (r *workspaceRegistry) resolveLocked(root string) (*workspaceState, error) {
 	if r.closed {
 		return nil, errors.New("workspace registry is closed")
 	}
@@ -425,16 +431,23 @@ func (r *workspaceRegistry) ResolveCode(path, db string) (*workspaceState, error
 	if err != nil {
 		return nil, err
 	}
-	if isDefault {
-		return r.Resolve(root)
-	}
-	key := codeWorkspaceKey{root: root, db: db}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return nil, errors.New("workspace registry is closed")
 	}
-	entry := r.codeEntries[key]
+	if isDefault && r.entries[root] != nil {
+		return r.resolveLocked(root)
+	}
+	key, entry := r.findCodeEntryLocked(root, db)
+	if entry != nil {
+		r.scheduleCodeEvictionLocked(key, entry)
+		return entry.state, nil
+	}
+	if isDefault {
+		return r.resolveLocked(root)
+	}
+	entry = r.codeEntries[key]
 	if entry == nil {
 		entry = &workspaceRegistryEntry{}
 		r.codeEntries[key] = entry
@@ -460,8 +473,16 @@ func (r *workspaceRegistry) Acquire(path string) (func(), error) {
 		return nil, err
 	}
 	r.mu.Lock()
+	entry, err := r.acquireLocked(root)
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return r.defaultCodeRelease(root, entry), nil
+}
+
+func (r *workspaceRegistry) acquireLocked(root string) (*workspaceRegistryEntry, error) {
 	if r.closed {
-		r.mu.Unlock()
 		return nil, errors.New("workspace registry is closed")
 	}
 	entry := r.entries[root]
@@ -470,7 +491,6 @@ func (r *workspaceRegistry) Acquire(path string) (func(), error) {
 		r.entries[root] = entry
 	}
 	if entry.removing {
-		r.mu.Unlock()
 		return nil, ErrWorkspaceNotFound
 	}
 	if entry.state == nil {
@@ -479,7 +499,6 @@ func (r *workspaceRegistry) Acquire(path string) (func(), error) {
 			if !entry.explicit {
 				delete(r.entries, root)
 			}
-			r.mu.Unlock()
 			return nil, err
 		}
 		entry.state = state
@@ -490,25 +509,7 @@ func (r *workspaceRegistry) Acquire(path string) (func(), error) {
 		entry.timer.Stop()
 		entry.timer = nil
 	}
-	r.mu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			var closeEntry *workspaceRegistryEntry
-			r.mu.Lock()
-			if r.entries[root] == entry && entry.leases > 0 {
-				entry.leases--
-				if entry.leases == 0 && entry.removing {
-					delete(r.entries, root)
-					closeEntry = entry
-				} else {
-					r.scheduleEvictionLocked(root, entry)
-				}
-			}
-			r.mu.Unlock()
-			_ = closeWorkspaceEntry(closeEntry)
-		})
-	}, nil
+	return entry, nil
 }
 
 func (r *workspaceRegistry) AcquireCode(path, db string) (func(), error) {
@@ -516,16 +517,28 @@ func (r *workspaceRegistry) AcquireCode(path, db string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	if isDefault {
-		return r.Acquire(root)
-	}
-	key := codeWorkspaceKey{root: root, db: db}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
 		return nil, errors.New("workspace registry is closed")
 	}
-	entry := r.codeEntries[key]
+	if isDefault && r.entries[root] != nil {
+		entry, err := r.acquireLocked(root)
+		r.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return r.defaultCodeRelease(root, entry), nil
+	}
+	key, entry := r.findCodeEntryLocked(root, db)
+	if entry == nil && isDefault {
+		entry, err = r.acquireLocked(root)
+		r.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return r.defaultCodeRelease(root, entry), nil
+	}
 	if entry == nil {
 		entry = &workspaceRegistryEntry{}
 		r.codeEntries[key] = entry
@@ -559,6 +572,57 @@ func (r *workspaceRegistry) AcquireCode(path, db string) (func(), error) {
 	}, nil
 }
 
+func (r *workspaceRegistry) defaultCodeRelease(root string, entry *workspaceRegistryEntry) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			var closeEntry *workspaceRegistryEntry
+			r.mu.Lock()
+			if r.entries[root] == entry && entry.leases > 0 {
+				entry.leases--
+				if entry.leases == 0 && entry.removing {
+					delete(r.entries, root)
+					closeEntry = entry
+				} else {
+					r.scheduleEvictionLocked(root, entry)
+				}
+			}
+			r.mu.Unlock()
+			_ = closeWorkspaceEntry(closeEntry)
+		})
+	}
+}
+
+func (r *workspaceRegistry) findCodeEntryLocked(root, db string) (codeWorkspaceKey, *workspaceRegistryEntry) {
+	key := codeWorkspaceKey{root: root, db: canonicalCodeDBKey(db)}
+	if entry := r.codeEntries[key]; entry != nil {
+		return key, entry
+	}
+	for candidate, entry := range r.codeEntries {
+		if candidate.root == root && sameCodeDB(candidate.db, db) {
+			return candidate, entry
+		}
+	}
+	return key, nil
+}
+
+func canonicalCodeDBKey(path string) string {
+	key := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	return key
+}
+
+func sameCodeDB(a, b string) bool {
+	aInfo, aErr := os.Stat(a)
+	bInfo, bErr := os.Stat(b)
+	if aErr == nil && bErr == nil {
+		return os.SameFile(aInfo, bInfo)
+	}
+	return canonicalCodeDBKey(a) == canonicalCodeDBKey(b)
+}
+
 func codeWorkspacePaths(path, db string) (root, canonicalDB string, isDefault bool, err error) {
 	root, err = canonicalWorkspaceRoot(path)
 	if err != nil {
@@ -588,8 +652,8 @@ func codeWorkspacePaths(path, db string) (root, canonicalDB string, isDefault bo
 	if err != nil {
 		return "", "", false, err
 	}
-	canonicalDB = filepath.Clean(canonicalDB)
-	return root, canonicalDB, canonicalDB == filepath.Clean(defaultDB), nil
+	canonicalDB = canonicalCodeDBKey(canonicalDB)
+	return root, canonicalDB, sameCodeDB(canonicalDB, defaultDB), nil
 }
 
 func (r *workspaceRegistry) scheduleEvictionLocked(root string, entry *workspaceRegistryEntry) {
