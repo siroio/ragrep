@@ -1,10 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/embed"
 )
 
@@ -86,4 +96,184 @@ func TestUnknownFlagExitsOne(t *testing.T) {
 	if code := run([]string{"search", "--bogusflag", "x"}); code != 1 {
 		t.Fatalf("unknown flag exit=%d, want 1", code)
 	}
+}
+
+func TestSmokeDaemonLiveSearchIsFreshAndIsolated(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal("go toolchain is required for daemon smoke test")
+	}
+	packageDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exeName := "ragrep-smoke"
+	if runtime.GOOS == "windows" {
+		exeName += ".exe"
+	}
+	executable := filepath.Join(t.TempDir(), exeName)
+	build := exec.Command(goBin, "build", "-o", executable, ".")
+	build.Dir = packageDir
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build daemon: %v\n%s", err, output)
+	}
+
+	environmentRoot := t.TempDir()
+	environment := isolatedDaemonEnvironment(environmentRoot)
+	firstRoot := daemonSmokeWorkspace(t, "func OldWorkspaceSymbol() {}\n")
+	secondRoot := daemonSmokeWorkspace(t, "func SecondWorkspaceOnly() {}\n")
+	var daemonPID int
+	stopped := false
+	t.Cleanup(func() {
+		if stopped {
+			return
+		}
+		_, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "stop")
+		if err != nil && daemonPID > 0 {
+			if process, findErr := os.FindProcess(daemonPID); findErr == nil {
+				_ = process.Kill()
+			}
+		}
+		if err != nil {
+			t.Errorf("daemon cleanup: %v: %s", err, stderr)
+		}
+	})
+
+	stdout, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "start")
+	if err != nil {
+		t.Fatalf("daemon start: %v: %s", err, stderr)
+	}
+	daemonPID, err = strconv.Atoi(strings.TrimSpace(stdout))
+	if err != nil || daemonPID <= 0 {
+		t.Fatalf("daemon PID=%q err=%v", stdout, err)
+	}
+	secondStart, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "start")
+	if err != nil || strings.TrimSpace(secondStart) != strconv.Itoa(daemonPID) {
+		t.Fatalf("second start PID=%q want=%d err=%v stderr=%s", secondStart, daemonPID, err, stderr)
+	}
+	for _, root := range []string{firstRoot, secondRoot} {
+		if _, stderr, err := runBuiltRagrep(executable, packageDir, environment, "workspace", "add", root); err != nil {
+			t.Fatalf("workspace add %s: %v: %s", root, err, stderr)
+		}
+	}
+
+	initial := daemonSmokeSearch(t, executable, firstRoot, environment, "OldWorkspaceSymbol")
+	if !initial.Fresh || !daemonSmokeHasPath(initial.Hits, "service.go") {
+		t.Fatalf("initial search=%+v", initial)
+	}
+	second := daemonSmokeSearch(t, executable, secondRoot, environment, "SecondWorkspaceOnly")
+	if !second.Fresh || !daemonSmokeHasPath(second.Hits, "service.go") {
+		t.Fatalf("second workspace search=%+v", second)
+	}
+
+	started := time.Now()
+	if err := os.WriteFile(filepath.Join(firstRoot, "service.go"), []byte("package sample\nfunc NewWorkspaceSymbol() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(firstRoot, "untracked.go"), []byte("package sample\nfunc AddedUntrackedSymbol() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	updated := daemonSmokeSearch(t, executable, firstRoot, environment, "NewWorkspaceSymbol AddedUntrackedSymbol OldWorkspaceSymbol")
+	visibility := time.Since(started)
+	if visibility > 500*time.Millisecond {
+		t.Fatalf("save visibility=%v, want <=500ms", visibility)
+	}
+	if !updated.Fresh || !daemonSmokeHasPath(updated.Hits, "service.go") || !daemonSmokeHasPath(updated.Hits, "untracked.go") {
+		t.Fatalf("updated search=%+v", updated)
+	}
+	if _, stderr, err := runBuiltRagrep(executable, firstRoot, environment, "code", "search", "--mode", "auto", "--json", "-k", "5", "OldWorkspaceSymbol"); daemonSmokeExitCode(err) != 2 {
+		t.Fatalf("old symbol search err=%v stderr=%s, want exit 2", err, stderr)
+	}
+	if _, stderr, err := runBuiltRagrep(executable, firstRoot, environment, "code", "search", "--mode", "auto", "--json", "-k", "5", "SecondWorkspaceOnly"); daemonSmokeExitCode(err) != 2 {
+		t.Fatalf("cross-workspace search err=%v stderr=%s, want exit 2", err, stderr)
+	}
+
+	if _, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "stop"); err != nil {
+		t.Fatalf("daemon stop: %v: %s", err, stderr)
+	}
+	stopped = true
+	listener, err := net.Listen("tcp", daemonAddress)
+	if err != nil {
+		t.Fatalf("daemon process still owns %s: %v", daemonAddress, err)
+	}
+	_ = listener.Close()
+	t.Logf("save visibility: %v", visibility)
+}
+
+type daemonSmokeSearchResult struct {
+	Hits       []codestore.SymbolHit `json:"hits"`
+	Fresh      bool                  `json:"fresh"`
+	Generation uint64                `json:"generation"`
+}
+
+func daemonSmokeWorkspace(t *testing.T, body string) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".ragrep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service.go"), []byte("package sample\n"+body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func isolatedDaemonEnvironment(root string) []string {
+	names := map[string]bool{"APPDATA": true, "LOCALAPPDATA": true, "XDG_CACHE_HOME": true, "XDG_CONFIG_HOME": true}
+	environment := make([]string, 0, len(os.Environ())+4)
+	for _, value := range os.Environ() {
+		name, _, _ := strings.Cut(value, "=")
+		if !names[strings.ToUpper(name)] {
+			environment = append(environment, value)
+		}
+	}
+	return append(environment,
+		"APPDATA="+filepath.Join(root, "config"),
+		"LOCALAPPDATA="+filepath.Join(root, "cache"),
+		"XDG_CACHE_HOME="+filepath.Join(root, "cache"),
+		"XDG_CONFIG_HOME="+filepath.Join(root, "config"),
+	)
+}
+
+func runBuiltRagrep(executable, directory string, environment []string, args ...string) (string, string, error) {
+	command := exec.Command(executable, args...)
+	command.Dir = directory
+	command.Env = environment
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	err := command.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+func daemonSmokeSearch(t *testing.T, executable, root string, environment []string, query string) daemonSmokeSearchResult {
+	t.Helper()
+	stdout, stderr, err := runBuiltRagrep(executable, root, environment, "code", "search", "--mode", "auto", "--json", "-k", "5", query)
+	if err != nil {
+		t.Fatalf("code search %q: %v: %s", query, err, stderr)
+	}
+	var result daemonSmokeSearchResult
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode search %q: %v: %s", query, err, stdout)
+	}
+	return result
+}
+
+func daemonSmokeHasPath(hits []codestore.SymbolHit, path string) bool {
+	for _, hit := range hits {
+		if filepath.ToSlash(hit.Path) == path {
+			return true
+		}
+	}
+	return false
+}
+
+func daemonSmokeExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
 }

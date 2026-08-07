@@ -245,6 +245,68 @@ func TestDaemonListenerIsSingleton(t *testing.T) {
 	}
 }
 
+func TestDaemonServiceSharesEmbedderWithoutCrossingWorkspaces(t *testing.T) {
+	first := newTestWorkspace(t, "package sample\nfunc WorkspaceOneOnly() {}\n")
+	second := newTestWorkspace(t, "package sample\nfunc WorkspaceTwoOnly() {}\n")
+	var constructors atomic.Int32
+	embedder := new(serviceTestEmbedder)
+	service := newCodeService(func(root string) (*workspaceState, error) {
+		switch root {
+		case first.root:
+			return first.workspaceState, nil
+		case second.root:
+			return second.workspaceState, nil
+		default:
+			return nil, ErrWorkspaceNotFound
+		}
+	}, newEmbeddingPool(func() (textEmbedder, error) {
+		constructors.Add(1)
+		return embedder, nil
+	}), nil)
+	t.Cleanup(func() { _ = service.Close() })
+
+	for _, root := range []string{first.root, second.root} {
+		if _, err := service.Search(context.Background(), searchRequest{Root: root, Query: "request validation"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if constructors.Load() != 1 {
+		t.Fatalf("embedder constructors=%d, want one daemon-wide instance", constructors.Load())
+	}
+
+	firstResult, err := service.Search(context.Background(), searchRequest{Root: first.root, Query: "WorkspaceOneOnly"})
+	if err != nil || len(firstResult.Hits) == 0 || !firstResult.Fresh {
+		t.Fatalf("first workspace result=%+v err=%v", firstResult, err)
+	}
+	isolated, err := service.Search(context.Background(), searchRequest{Root: second.root, Query: "WorkspaceOneOnly"})
+	if err != nil || len(isolated.Hits) != 0 || !isolated.Fresh {
+		t.Fatalf("second workspace leaked first result=%+v err=%v", isolated, err)
+	}
+}
+
+func TestDaemonFakeLSPShutsDownWhenIdle(t *testing.T) {
+	var closed atomic.Int32
+	pool := newLSPPool(10*time.Millisecond, func(context.Context, string, string) (*pooledLanguageServer, error) {
+		return &pooledLanguageServer{client: new(lsp.Client), close: func() error {
+			closed.Add(1)
+			return nil
+		}}, nil
+	})
+	t.Cleanup(func() { _ = pool.Close() })
+	_, _, _, release, err := pool.AcquireWithMetadata(context.Background(), t.TempDir(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	deadline := time.Now().Add(time.Second)
+	for closed.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if closed.Load() != 1 {
+		t.Fatalf("fake LSP close calls=%d, want 1 after idle timeout", closed.Load())
+	}
+}
+
 func TestDaemonProcessHelperConfiguresChild(t *testing.T) {
 	cmd := newDaemonProcessCommand(os.Args[0])
 	if len(cmd.Args) != 3 || cmd.Args[0] != os.Args[0] || cmd.Args[1] != "daemon" || cmd.Args[2] != "serve" {
@@ -951,4 +1013,116 @@ func TestCleanupDaemonRemovesDiscoveryAfterResourcesClose(t *testing.T) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("discovery remains after cleanup: %v", err)
 	}
+}
+
+func BenchmarkWorkspaceBarrier(b *testing.B) {
+	workspace, store := newDaemonBenchmarkWorkspace(b, "func BarrierCandidate() {}\n")
+	defer workspace.Close()
+	defer store.Close()
+	if _, err := workspace.Barrier(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for range b.N {
+		if _, err := workspace.Barrier(context.Background()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkExactSearch(b *testing.B) {
+	workspace, store := newDaemonBenchmarkWorkspace(b, "func ExactSearchCandidate() {}\n")
+	defer workspace.Close()
+	defer store.Close()
+	embedder := new(serviceTestEmbedder)
+	service := newCodeService(func(string) (*workspaceState, error) { return workspace, nil }, newEmbeddingPool(func() (textEmbedder, error) {
+		return embedder, nil
+	}), nil)
+	defer service.Close()
+	if _, err := service.Search(context.Background(), searchRequest{Root: workspace.root, Query: "ExactSearchCandidate", Mode: "auto"}); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for range b.N {
+		result, err := service.Search(context.Background(), searchRequest{Root: workspace.root, Query: "ExactSearchCandidate", Mode: "auto"})
+		if err != nil || len(result.Hits) == 0 || !result.Fresh {
+			b.Fatalf("result=%+v err=%v", result, err)
+		}
+	}
+	b.StopTimer()
+	if embedder.calls.Load() != 0 {
+		b.Fatalf("exact auto search used vector inference %d times", embedder.calls.Load())
+	}
+}
+
+func BenchmarkHybridSearch(b *testing.B) {
+	workspace, store := newDaemonBenchmarkWorkspace(b, "func ValidateRequest() {}\n")
+	defer workspace.Close()
+	defer store.Close()
+	symbol := serviceSymbol("service.go", "ValidateRequest", "func ValidateRequest() {}")
+	if _, err := store.UpsertSymbols(symbol.Path, codeindex.FileHash([]byte(symbol.Body)), []codeindex.Symbol{symbol}, 0, fakeCodeEmbed); err != nil {
+		b.Fatal(err)
+	}
+	service := newCodeService(func(string) (*workspaceState, error) { return workspace, nil }, newEmbeddingPool(func() (textEmbedder, error) {
+		return new(serviceTestEmbedder), nil
+	}), nil)
+	defer service.Close()
+	if _, err := service.Search(context.Background(), searchRequest{Root: workspace.root, Query: "request validation", Mode: "hybrid"}); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for range b.N {
+		result, err := service.Search(context.Background(), searchRequest{Root: workspace.root, Query: "request validation", Mode: "hybrid"})
+		if err != nil || len(result.Hits) == 0 || !result.UsedVector || !result.Fresh {
+			b.Fatalf("result=%+v err=%v", result, err)
+		}
+	}
+}
+
+func BenchmarkWorkspaceBarrierTwoWorkspaceIsolation(b *testing.B) {
+	first, firstStore := newDaemonBenchmarkWorkspace(b, "func FirstWorkspaceOnly() {}\n")
+	second, secondStore := newDaemonBenchmarkWorkspace(b, "func SecondWorkspaceOnly() {}\n")
+	defer first.Close()
+	defer second.Close()
+	defer firstStore.Close()
+	defer secondStore.Close()
+	service := newCodeService(func(root string) (*workspaceState, error) {
+		if root == first.root {
+			return first, nil
+		}
+		return second, nil
+	}, newEmbeddingPool(func() (textEmbedder, error) { return new(serviceTestEmbedder), nil }), nil)
+	defer service.Close()
+	b.ResetTimer()
+	for range b.N {
+		own, err := service.Search(context.Background(), searchRequest{Root: first.root, Query: "FirstWorkspaceOnly"})
+		if err != nil || len(own.Hits) == 0 {
+			b.Fatalf("own=%+v err=%v", own, err)
+		}
+		other, err := service.Search(context.Background(), searchRequest{Root: second.root, Query: "FirstWorkspaceOnly"})
+		if err != nil || len(other.Hits) != 0 {
+			b.Fatalf("other=%+v err=%v", other, err)
+		}
+	}
+}
+
+func newDaemonBenchmarkWorkspace(b *testing.B, body string) (*workspaceState, *codestore.Store) {
+	b.Helper()
+	root, err := filepath.Abs(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service.go"), []byte("package sample\n"+body), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	store, err := codestore.Open(filepath.Join(b.TempDir(), "code.db"), "test-model", codeEmbedDim)
+	if err != nil {
+		b.Fatal(err)
+	}
+	workspace, err := newWorkspaceState(root, store, []string{"."}, "go")
+	if err != nil {
+		store.Close()
+		b.Fatal(err)
+	}
+	return workspace, store
 }

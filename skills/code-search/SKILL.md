@@ -1,91 +1,61 @@
 ---
 name: code-search
-description: Use when a task requires locating or verifying code symbols (functions, methods, types) in a repo that has a ragrep code index (.ragrep/code.db) and the needed symbols/files are not already named in the request - finding where something is implemented, tracing callers/callees/references, or checking whether a claim about the code still holds. Do not use when every file and symbol the task needs is already given, or for general programming-language questions unrelated to this codebase. Triggers: "where is X implemented", "what calls Y", "find the function that...", シンボル検索, 呼び出し元.
+description: >-
+  Use when a task requires locating or verifying code symbols (functions,
+  methods, types) in a repo that has a ragrep code index (.ragrep/code.db) and
+  the needed symbols/files are not already named in the request - finding where
+  something is implemented, tracing callers/callees/references, or checking
+  whether a claim about the code still holds. Do not use when every file and
+  symbol the task needs is already given, or for general programming-language
+  questions unrelated to this codebase. Triggers: "where is X implemented",
+  "what calls Y", "find the function that...", シンボル検索, 呼び出し元.
 ---
 
 # Searching code with ragrep
 
 ## Overview
 
-`ragrep code` is a hybrid (vector + full-text) search over indexed code
-symbols (functions, methods, types), backed by a separate database
-(`.ragrep/code.db`, never the document `index.db`). Search only produces
-**candidates** — a language server (LSP) verifies relations (definition,
-references, callers, callees, tests) on demand. Treat yourself as the
-Retrieval Planner: search broad, verify with LSP before trusting a relation,
-fetch a symbol's body only for the 1-3 symbols you actually need to read.
+Use the daemon-backed `.ragrep/code.db` to find current code symbols. Search
+results are candidates; source, LSP expansion, and tests provide evidence.
 
-## Setup
+## Workflow
 
-Requires a language server registered per-language in `.ragrep/config.json`;
-only explicitly configured servers are ever launched — none is
-auto-downloaded or installed.
+Choose exactly one starting action:
+
+- If the request names every needed file or symbol, inspect those paths or
+  symbols directly with a source-reading command such as `rg` or
+  `Get-Content`. Do not run semantic search.
+- If anything must still be located, make this the first command:
 
 ```
-{"servers": {"go": "gopls"}}
+ragrep code search --mode auto --json -k 5 "<query>"
 ```
 
-```
-ragrep code index --language go <path>...   # index symbols (re-run after edits)
-```
+Then follow the response:
 
-## Quick Reference
+- On `workspace_syncing`, run the same full `ragrep code search --mode auto
+  --json -k 5 "<query>"` command again. Waiting alone is not recovery. Never
+  substitute cached output.
+- On `stale_live_key`, discard the key and body and run the same full search
+  command again with the original query. Do not repeat `code get` with the
+  stale key, use document `ragrep search`, guess, or implement from memory.
+- Use hits only when the JSON response has `fresh: true`.
 
-| Task | Command |
-|---|---|
-| Search symbols (candidates, no body) | `ragrep code search --json -k 5 "<query>"` |
-| Fetch one symbol's metadata | `ragrep code get --symbol <key>` |
-| Fetch metadata + body | `ragrep code get --symbol <key> --body` |
-| LSP-verify a relation (1 hop) | `ragrep code expand --symbol <key> --relation definition\|references\|callers\|callees\|tests` |
-| Assemble a budgeted context pack + manifest | `ragrep code pack --query "<q>" [--select <key>]... [--budget N] --json` |
-| Re-check a saved manifest against the workspace | `ragrep code verify --manifest <file> --json` |
+Select at most three hits and fetch only bodies you need:
 
-## Retrieval Workflow
+`ragrep code get --symbol <key> --body`
 
-1. Translate the request into English identifier-like keywords — identifiers
-   and doc comments in the index are English, so querying in another
-   language directly loses recall.
-2. `ragrep code search --json -k 5 "<keywords>"` for candidates (metadata
-   only, no body).
-3. Before trusting a relation (this symbol's definition/references/
-   callers/callees/tests), verify it with `ragrep code expand --symbol <key>
-   --relation <relation>` — an LSP-backed query, not a guess from the search
-   hit alone.
-4. `ragrep code get --symbol <key> --body` for at most 1-3 symbols whose
-   full body you actually need to read.
+Expand only the relation needed by the task:
 
-`ragrep code pack --query ... --select <key> --json` does steps 2 and 4 (plus
-relations) in one call and emits a stale-detectable manifest for later
-`code verify`.
+`ragrep code expand --symbol <key> --relation <relation>`
 
-## Ordering
-
-- **spec → plan**: use the `search` skill on the docs first to pin down
-  the requirement, then this skill to locate the code it touches.
-- **plan → implementation**: before reading code from a saved pack, run
-  `ragrep code verify --manifest <file>` to re-resolve stable keys and catch
-  files that changed since the pack was built — do not read straight off an
-  old manifest.
+Use one relation: `definition`, `references`, `callers`, `callees`, or `tests`.
 
 ## Rules
 
-- **Flags go BEFORE positional args**, same as document `ragrep`.
-- Search and pack results are **candidates**, not verified facts — a hit's
-  relations are only confirmed by `code expand` (LSP) or an actual
-  build/test run.
-- Re-index (`ragrep code index --language <lang> <path>...`) when files
-  changed since the last run; `code verify` on a saved manifest reports
-  staleness without re-indexing.
-- Only language servers registered in `.ragrep/config.json`'s `servers` map
-  are launched — an unregistered language fails with a clear error, nothing
-  is fetched automatically.
-
-## Common Mistakes
-
-| Mistake | Fix |
-|---|---|
-| Querying in the request's original (non-English) language | Translate intent into English identifier-style keywords first |
-| Trusting a search hit's implied relation without verifying | Run `code expand --relation ...` before relying on it |
-| Fetching full bodies for every candidate | `get --body` only the 1-3 symbols you'll actually read |
-| Reading code straight from an old pack/manifest | `code verify --manifest` first; re-index if stale |
-| Expecting an unregistered language to "just work" | Register its server in `.ragrep/config.json` `servers` — none is auto-installed |
+- Put flags before positional arguments.
+- Exact symbol and path queries in `auto` mode avoid vector inference.
+- Treat search hits as candidates. Confirm a relation with `code expand` and
+  confirm behavior with source and tests.
+- Only explicitly configured language servers run; none is installed
+  automatically.
