@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/siroio/ragrep/internal/codeindex"
+	"github.com/siroio/ragrep/internal/coderetrieval"
 	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/lsp"
 )
@@ -66,6 +67,21 @@ type daemonExpandRequest struct {
 	Relation string `json:"relation"`
 }
 
+type daemonPackRequest struct {
+	Root         string   `json:"root"`
+	DB           string   `json:"db"`
+	Query        string   `json:"query"`
+	K            int      `json:"k,omitempty"`
+	Budget       int      `json:"budget"`
+	SelectedKeys []string `json:"selected_keys,omitempty"`
+}
+
+type daemonVerifyRequest struct {
+	Root     string                 `json:"root"`
+	DB       string                 `json:"db"`
+	Manifest coderetrieval.Manifest `json:"manifest"`
+}
+
 type daemonCodeSearcher interface {
 	Search(context.Context, searchRequest) (searchResponse, error)
 }
@@ -80,6 +96,14 @@ type daemonCodeIndexer interface {
 
 type daemonCodeExpander interface {
 	Expand(context.Context, expandRequest) ([]codeExpandTarget, error)
+}
+
+type daemonCodePacker interface {
+	Pack(context.Context, packRequest) (codePackOutput, error)
+}
+
+type daemonCodeVerifier interface {
+	Verify(context.Context, verifyRequest) (codeVerifyOutput, error)
 }
 
 type daemonHandler struct {
@@ -123,11 +147,67 @@ func (h *daemonHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.index(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/expand":
 		h.expand(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/pack":
+		h.pack(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/verify":
+		h.verify(w, r)
 	case r.URL.Path == "/v1/workspaces":
 		h.workspaces(w, r)
 	default:
 		writeAPIError(w, http.StatusNotFound, &apiError{Code: "not_found", Message: "not found"})
 	}
+}
+
+func (h *daemonHandler) pack(w http.ResponseWriter, r *http.Request) {
+	var req daemonPackRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
+		return
+	}
+	release, ok := h.acquireWorkspace(w, req.Root, req.DB)
+	if !ok {
+		return
+	}
+	defer release()
+	packer, ok := h.service.(daemonCodePacker)
+	if !ok {
+		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
+		return
+	}
+	out, err := packer.Pack(r.Context(), packRequest{
+		Root: req.Root, DB: req.DB, Query: req.Query, K: req.K, Budget: req.Budget, SelectedKeys: req.SelectedKeys,
+	})
+	if err != nil {
+		status, apiErr := classifyAPIError(err)
+		writeAPIError(w, status, apiErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (h *daemonHandler) verify(w http.ResponseWriter, r *http.Request) {
+	var req daemonVerifyRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
+		return
+	}
+	release, ok := h.acquireWorkspace(w, req.Root, req.DB)
+	if !ok {
+		return
+	}
+	defer release()
+	verifier, ok := h.service.(daemonCodeVerifier)
+	if !ok {
+		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
+		return
+	}
+	out, err := verifier.Verify(r.Context(), verifyRequest{Root: req.Root, DB: req.DB, Manifest: req.Manifest})
+	if err != nil {
+		status, apiErr := classifyAPIError(err)
+		writeAPIError(w, status, apiErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *daemonHandler) index(w http.ResponseWriter, r *http.Request) {
@@ -348,6 +428,8 @@ type codeDaemonClient interface {
 	Get(context.Context, getRequest) (codeindex.Symbol, error)
 	Index(context.Context, indexRequest) (indexResult, error)
 	Expand(context.Context, expandRequest) ([]codeExpandTarget, error)
+	Pack(context.Context, packRequest) (codePackOutput, error)
+	Verify(context.Context, verifyRequest) (codeVerifyOutput, error)
 }
 
 var codeDaemonClientFactory = loadCodeDaemonClient
@@ -386,6 +468,22 @@ func (c daemonClient) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 	var targets []codeExpandTarget
 	err := c.do(ctx, http.MethodPost, "/v1/code/expand", daemonExpandRequest{Root: req.Root, DB: req.DB, Key: req.Key, Relation: req.Relation}, &targets)
 	return targets, err
+}
+
+func (c daemonClient) Pack(ctx context.Context, req packRequest) (codePackOutput, error) {
+	var out codePackOutput
+	err := c.do(ctx, http.MethodPost, "/v1/code/pack", daemonPackRequest{
+		Root: req.Root, DB: req.DB, Query: req.Query, K: req.K, Budget: req.Budget, SelectedKeys: req.SelectedKeys,
+	}, &out)
+	return out, err
+}
+
+func (c daemonClient) Verify(ctx context.Context, req verifyRequest) (codeVerifyOutput, error) {
+	var out codeVerifyOutput
+	err := c.do(ctx, http.MethodPost, "/v1/code/verify", daemonVerifyRequest{
+		Root: req.Root, DB: req.DB, Manifest: req.Manifest,
+	}, &out)
+	return out, err
 }
 
 func (c daemonClient) Stop(ctx context.Context) error {

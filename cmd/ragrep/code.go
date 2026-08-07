@@ -21,7 +21,6 @@ import (
 	"github.com/siroio/ragrep/internal/coderetrieval"
 	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/config"
-	"github.com/siroio/ragrep/internal/embed"
 	"github.com/siroio/ragrep/internal/lsp"
 )
 
@@ -856,16 +855,18 @@ const codePackDefaultBudget = 20000
 // plus a stale-detectable manifest describing what it drew on, ready to
 // write straight to a file for a later `code verify --manifest`.
 type codePackOutput struct {
-	Pack     coderetrieval.ContextPack `json:"pack"`
-	Manifest coderetrieval.Manifest    `json:"manifest"`
+	Pack       coderetrieval.ContextPack `json:"pack"`
+	Manifest   coderetrieval.Manifest    `json:"manifest"`
+	Fresh      bool                      `json:"fresh"`
+	Generation uint64                    `json:"generation"`
 }
 
 // buildManifest assembles a coderetrieval.Manifest from pack's actually
 // included symbol bodies: index identity (revision/server/model) from the
 // most recently recorded index_runs row, plus one SymbolRef per included
-// symbol using its store-recorded file_hash (see
-// (*codestore.Store).SymbolFileHash's doc comment for why that's preferred
-// over re-hashing the file from disk here). A store with no recorded index
+// symbol. Durable symbols use their store-recorded file_hash; live symbols
+// use the hash bound into the body snapshot that was just fetched. A store
+// with no recorded index
 // run yet (LatestIndexRun -> ErrNotFound) still produces a manifest, just
 // with empty identity fields -- that's provenance, not a hard requirement
 // (mirrors gitRevision's "unknown" fallback for the document/code indexes).
@@ -882,9 +883,12 @@ func buildManifest(s *codestore.Store, pack coderetrieval.ContextPack) (coderetr
 		ModelID:       run.ModelID,
 	}
 	for _, sym := range pack.Symbols {
-		hash, err := s.SymbolFileHash(sym.Key)
-		if err != nil {
-			return coderetrieval.Manifest{}, fmt.Errorf("manifest: file hash for %q: %w", sym.Key, err)
+		hash := sym.BodyHash
+		if !strings.HasPrefix(sym.Key, "live:") {
+			hash, err = s.SymbolFileHash(sym.Key)
+			if err != nil {
+				return coderetrieval.Manifest{}, fmt.Errorf("manifest: file hash for %q: %w", sym.Key, err)
+			}
 		}
 		m.Symbols = append(m.Symbols, coderetrieval.SymbolRef{
 			Key: sym.Key, QualifiedName: sym.QualifiedName, Path: sym.Path,
@@ -894,21 +898,15 @@ func buildManifest(s *codestore.Store, pack coderetrieval.ContextPack) (coderetr
 	return m, nil
 }
 
-// runCodePack is `code pack`'s core logic: hybrid search, then
-// coderetrieval.BuildContextPack, then buildManifest. Split out from
-// cmdCodePack (which resolves qv via the real embedding model) so tests can
-// drive it with a fake query vector, the same way TestFormatCodeSearchHits
-// drives formatCodeSearchHits directly without ever touching ONNX.
-func runCodePack(s *codestore.Store, query string, qv []float32, k, budget int, selectedKeys []string) (codePackOutput, error) {
-	hits, err := s.SearchSymbolsHybrid(query, qv, k)
-	if err != nil {
-		return codePackOutput{}, err
-	}
-
+// runCodePack is `code pack`'s post-search core: assemble the fresh service
+// hits and selected bodies, then build their manifest. The service supplies
+// its durable/live-aware getter so a replaced live key fails instead of
+// falling back to stale durable content.
+func runCodePack(s *codestore.Store, hits []codestore.SymbolHit, budget int, selectedKeys []string, getSymbol coderetrieval.SymbolGetter) (codePackOutput, error) {
 	pack, err := coderetrieval.BuildContextPack(hits, coderetrieval.AssembleOptions{
 		Budget:       budget,
 		SelectedKeys: selectedKeys,
-		GetSymbol:    s.GetSymbol,
+		GetSymbol:    getSymbol,
 		GetRelations: s.RelationsFrom,
 	})
 	if err != nil {
@@ -962,30 +960,19 @@ func cmdCodePack(args []string) int {
 		return fail(fmt.Errorf("--select accepts at most 3 keys, got %d", len(selected)))
 	}
 
-	s, err := openCodeStoreAt(*db)
+	root, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
 		return fail(err)
 	}
-	defer s.Close()
-
-	dir, err := embed.CacheDir()
+	client, err := codeDaemonClientFactory()
 	if err != nil {
 		return fail(err)
 	}
-	e, err := embed.New(dir)
+	out, err := client.Pack(context.Background(), packRequest{
+		Root: root, DB: dbPath, Query: *query, K: *k, Budget: *budget, SelectedKeys: []string(selected),
+	})
 	if err != nil {
-		return fail(err)
-	}
-	defer e.Close()
-
-	qv, err := e.Embed(*query)
-	if err != nil {
-		return fail(err)
-	}
-
-	out, err := runCodePack(s, *query, qv, *k, *budget, []string(selected))
-	if err != nil {
-		return fail(err)
+		return codeDaemonError(err)
 	}
 	if err := formatCodePackOutput(os.Stdout, out, *asJSON); err != nil {
 		return fail(err)
@@ -1135,20 +1122,17 @@ func cmdCodeVerify(args []string) int {
 		return fail(fmt.Errorf("manifest %s has zero symbols (not a valid manifest or code-pack output?)", *manifestPath))
 	}
 
-	wsRoot, err := workspaceRoot(*db)
+	wsRoot, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
 		return fail(err)
 	}
-
-	s, err := openCodeStoreAt(*db)
+	client, err := codeDaemonClientFactory()
 	if err != nil {
 		return fail(err)
 	}
-	defer s.Close()
-
-	out, err := runCodeVerify(s, m, wsRoot)
+	out, err := client.Verify(context.Background(), verifyRequest{Root: wsRoot, DB: dbPath, Manifest: m})
 	if err != nil {
-		return fail(err)
+		return codeDaemonError(err)
 	}
 	if err := formatCodeVerifyOutput(os.Stdout, out, *asJSON); err != nil {
 		return fail(err)

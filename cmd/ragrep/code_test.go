@@ -501,6 +501,8 @@ type fakeCodeDaemonClient struct {
 	get    func(context.Context, getRequest) (codeindex.Symbol, error)
 	index  func(context.Context, indexRequest) (indexResult, error)
 	expand func(context.Context, expandRequest) ([]codeExpandTarget, error)
+	pack   func(context.Context, packRequest) (codePackOutput, error)
+	verify func(context.Context, verifyRequest) (codeVerifyOutput, error)
 }
 
 func (f fakeCodeDaemonClient) Search(ctx context.Context, req searchRequest) (searchResponse, error) {
@@ -517,6 +519,14 @@ func (f fakeCodeDaemonClient) Index(ctx context.Context, req indexRequest) (inde
 
 func (f fakeCodeDaemonClient) Expand(ctx context.Context, req expandRequest) ([]codeExpandTarget, error) {
 	return f.expand(ctx, req)
+}
+
+func (f fakeCodeDaemonClient) Pack(ctx context.Context, req packRequest) (codePackOutput, error) {
+	return f.pack(ctx, req)
+}
+
+func (f fakeCodeDaemonClient) Verify(ctx context.Context, req verifyRequest) (codeVerifyOutput, error) {
+	return f.verify(ctx, req)
 }
 
 func injectCodeDaemonClient(t *testing.T, client codeDaemonClient) *int {
@@ -1705,6 +1715,23 @@ func codePackTestSymbol(key, path, qualifiedName string) codeindex.Symbol {
 	return sym
 }
 
+func runTestCodePack(t *testing.T, s *codestore.Store, query string, k, budget int, selectedKeys []string) codePackOutput {
+	t.Helper()
+	qv, err := fakeCodeEmbed(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.SearchSymbolsHybrid(query, qv, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCodePack(s, hits, budget, selectedKeys, s.GetSymbol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 func TestCmdCodePackUsageErrors(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "code.db")
 	if code := run([]string{"code", "pack", "--db", db}); code != 1 {
@@ -1719,10 +1746,131 @@ func TestCmdCodePackUsageErrors(t *testing.T) {
 	}
 }
 
-// runCodePack is `code pack`'s core logic minus the ONNX embedding call --
-// tests drive it with a fake query vector, the same way TestFormatCodeSearchHits
-// drives formatCodeSearchHits directly instead of going through the real CLI
-// (which would require the cached embedding model).
+func TestCodeServicePackReturnsFreshLiveBodyAndCapsCandidates(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	for i := range 6 {
+		ws.save(t, fmt.Sprintf("handler%d.go", i), fmt.Sprintf("package service\nfunc Handler%d() { SharedOperation() }", i))
+	}
+	search, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "handler0.go"})
+	if err != nil || len(search.Hits) != 1 || !search.Hits[0].Live {
+		t.Fatalf("search=%+v err=%v", search, err)
+	}
+
+	out, err := svc.Pack(context.Background(), packRequest{
+		Root: ws.root, Query: "SharedOperation", K: 99, Budget: 100_000,
+		SelectedKeys: []string{search.Hits[0].Key},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Fresh || out.Generation == 0 || len(out.Pack.Candidates) != 5 {
+		t.Fatalf("out=%+v", out)
+	}
+	if len(out.Pack.Symbols) != 1 || !strings.Contains(out.Pack.Symbols[0].Body, "SharedOperation") {
+		t.Fatalf("symbols=%+v", out.Pack.Symbols)
+	}
+	if len(out.Manifest.Symbols) != 1 || out.Manifest.Symbols[0].FileHash != out.Pack.Symbols[0].BodyHash {
+		t.Fatalf("manifest=%+v symbols=%+v", out.Manifest, out.Pack.Symbols)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wrapper map[string]json.RawMessage
+	if err := json.Unmarshal(b, &wrapper); err != nil {
+		t.Fatal(err)
+	}
+	if string(wrapper["fresh"]) != "true" || string(wrapper["generation"]) != "1" ||
+		bytes.Contains(wrapper["manifest"], []byte(`"fresh"`)) || bytes.Contains(wrapper["manifest"], []byte(`"generation"`)) {
+		t.Fatalf("freshness must be on the outer wrapper, not the manifest: %s", b)
+	}
+}
+
+func TestCodeServicePackRejectsReplacedLiveKey(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	ws.save(t, "service.go", "package service\nfunc FirstVersion() {}")
+	first, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "FirstVersion"})
+	if err != nil || len(first.Hits) != 1 {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	ws.save(t, "service.go", "package service\nfunc SecondVersion() {}")
+	if err := ws.refreshPaths([]string{filepath.Join(ws.root, "service.go")}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = svc.Pack(context.Background(), packRequest{
+		Root: ws.root, Query: "SecondVersion", Budget: 100_000,
+		SelectedKeys: []string{first.Hits[0].Key},
+	})
+	if !errors.Is(err, ErrStaleLiveKey) {
+		t.Fatalf("Pack stale key err=%v, want stale_live_key", err)
+	}
+}
+
+func TestCodeServicePackRejectsMoreThanThreeSelectedKeys(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	_, err := svc.Pack(context.Background(), packRequest{
+		Root: ws.root, Query: "anything", Budget: 100_000,
+		SelectedKeys: []string{"a", "b", "c", "d"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "at most 3") {
+		t.Fatalf("err=%v, want selected-key limit", err)
+	}
+}
+
+func TestCodeServicePackExpandsOnlyStoredRelations(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	body := "func Source() { Target() }\nfunc Target() {}"
+	hash := ws.save(t, "service.go", body)
+	source := serviceSymbol("service.go", "Source", "func Source() { Target() }")
+	target := serviceSymbol("service.go", "Target", "func Target() {}")
+	target.Range = codeindex.Range{Start: codeindex.Position{Line: 1}, End: codeindex.Position{Line: 2}}
+	if _, err := ws.store.UpsertSymbols("service.go", hash, []codeindex.Symbol{source, target}, 0, fakeCodeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	relation := codeindex.Relation{FromKey: source.Key, ToKey: target.Key, Kind: "callees", Source: "stored"}
+	if err := ws.store.ReplaceRelations(0, source.Key, []string{"callees"}, []codeindex.Relation{relation}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := svc.Pack(context.Background(), packRequest{
+		Root: ws.root, Query: "Source", Budget: 100_000, SelectedKeys: []string{source.Key},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out.Pack.Relations, []codeindex.Relation{relation}) {
+		t.Fatalf("relations=%+v, want stored relation only", out.Pack.Relations)
+	}
+}
+
+func TestCmdCodePackUsesDaemonAndKeepsFormatter(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	want := codePackOutput{Fresh: true, Generation: 7, Pack: coderetrieval.ContextPack{Budget: 1000}}
+	client := fakeCodeDaemonClient{pack: func(_ context.Context, req packRequest) (codePackOutput, error) {
+		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Query != "Foo" || req.K != 10 || req.Budget != 1000 || !reflect.DeepEqual(req.SelectedKeys, []string{"key"}) {
+			t.Fatalf("request=%+v", req)
+		}
+		return want, nil
+	}}
+	injectCodeDaemonClient(t, client)
+
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "pack", "--db", db, "--query", "Foo", "--select", "key", "--budget", "1000", "--json"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	var got codePackOutput
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("got=%+v err=%v, want=%+v", got, err, want)
+	}
+	if _, err := os.Stat(db); !os.IsNotExist(err) {
+		t.Fatalf("CLI must not create code.db, stat err=%v", err)
+	}
+}
+
+// runCodePack is `code pack`'s post-search core. These tests supply durable
+// hits directly so they never need the daemon embedding pool.
 func TestRunCodePackBudgetRespectedAndTruncationSurfaces(t *testing.T) {
 	s := newTestCodeStore(t)
 	a := codePackTestSymbol("a", "x.go", "A")
@@ -1738,26 +1886,15 @@ func TestRunCodePackBudgetRespectedAndTruncationSurfaces(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	qv, err := fakeCodeEmbed("A")
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	// First, measure the metadata-only cost (large budget, no --select) so
 	// the truncation budget below is derived rather than guessed.
-	metaOnly, err := runCodePack(s, "A", qv, 10, 100_000, nil)
-	if err != nil {
-		t.Fatalf("runCodePack (measure): %v", err)
-	}
+	metaOnly := runTestCodePack(t, s, "A", 10, 100_000, nil)
 	if metaOnly.Pack.Truncated {
 		t.Fatalf("measurement pack unexpectedly truncated: %+v", metaOnly.Pack)
 	}
 	budget := metaOnly.Pack.UsedChars + 50 // room for candidates + a sliver, not both bodies
 
-	out, err := runCodePack(s, "A", qv, 10, budget, []string{"a", "b"})
-	if err != nil {
-		t.Fatalf("runCodePack: %v", err)
-	}
+	out := runTestCodePack(t, s, "A", 10, budget, []string{"a", "b"})
 	if !out.Pack.Truncated {
 		t.Fatalf("pack.Truncated = false, want true: usedChars=%d budget=%d", out.Pack.UsedChars, budget)
 	}
@@ -1786,14 +1923,7 @@ func TestFormatCodePackOutputTextAndJSON(t *testing.T) {
 	if _, err := s.UpsertSymbols(a.Path, "filehash-a", []codeindex.Symbol{a}, 0, fakeCodeEmbed); err != nil {
 		t.Fatal(err)
 	}
-	qv, err := fakeCodeEmbed("A")
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := runCodePack(s, "A", qv, 10, 100_000, []string{"a"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	out := runTestCodePack(t, s, "A", 10, 100_000, []string{"a"})
 
 	var text bytes.Buffer
 	if err := formatCodePackOutput(&text, out, false); err != nil {
@@ -1874,20 +2004,78 @@ func codeVerifyWorkspace(t *testing.T) (root, db string, manifest coderetrieval.
 		t.Fatal(err)
 	}
 
-	qv, err := fakeCodeEmbed("A")
-	if err != nil {
-		s.Close()
-		t.Fatal(err)
-	}
-	out, err := runCodePack(s, "A", qv, 10, 100_000, []string{"a"})
+	out := runTestCodePack(t, s, "A", 10, 100_000, []string{"a"})
 	s.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(out.Manifest.Symbols) != 1 {
 		t.Fatalf("codeVerifyWorkspace: manifest has %d symbols, want 1", len(out.Manifest.Symbols))
 	}
+	injectCodeServiceDaemon(t, root, db)
 	return root, db, out.Manifest
+}
+
+func TestCodeServiceVerifyCrossesBarrierAndDetectsSuppressedChange(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	body := "package service\nfunc Current() {}"
+	hash := ws.save(t, "service.go", body)
+	sym := serviceSymbol("service.go", "Current", "func Current() {}")
+	putServiceSymbol(t, ws.store, sym, hash)
+	manifest := coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{{
+		Key: sym.Key, QualifiedName: sym.QualifiedName, Path: sym.Path, FileHash: hash,
+	}}}
+
+	clean, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: manifest})
+	if err != nil || !clean.Clean {
+		t.Fatalf("clean=%+v err=%v", clean, err)
+	}
+	ws.save(t, "service.go", "package service\nfunc Current() { changed() }")
+	stale, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: manifest})
+	if err != nil || stale.Clean || len(stale.Entries) != 1 || !stale.Entries[0].Stale {
+		t.Fatalf("stale=%+v err=%v", stale, err)
+	}
+}
+
+func TestCodeServiceVerifyWaitsForBarrier(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	unblock := make(chan struct{})
+	ws.enumerate = func(string, string) ([]string, error) {
+		<-unblock
+		return nil, nil
+	}
+	t.Cleanup(func() { close(unblock) })
+
+	out, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: coderetrieval.Manifest{
+		Symbols: []coderetrieval.SymbolRef{{Key: "missing", Path: "missing.go"}},
+	}})
+	if !errors.Is(err, ErrWorkspaceSyncing) || len(out.Entries) != 0 || out.Clean {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+}
+
+func TestCmdCodeVerifyUsesDaemonAndPreservesExitCode(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	manifest := coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{{Key: "a", Path: "a.go"}}}
+	manifestPath := writeManifestFile(t, manifest)
+	want := codeVerifyOutput{Entries: []codeVerifyEntry{{Key: "a", Path: "a.go", Stale: true, Resolved: true}}, Clean: false}
+	client := fakeCodeDaemonClient{verify: func(_ context.Context, req verifyRequest) (codeVerifyOutput, error) {
+		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || !reflect.DeepEqual(req.Manifest, manifest) {
+			t.Fatalf("request=%+v", req)
+		}
+		return want, nil
+	}}
+	injectCodeDaemonClient(t, client)
+
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "verify", "--db", db, "--manifest", manifestPath, "--json"})
+	if code != 2 || stderr != "" {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	var got codeVerifyOutput
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("got=%+v err=%v, want=%+v", got, err, want)
+	}
+	if _, err := os.Stat(db); !os.IsNotExist(err) {
+		t.Fatalf("CLI must not create code.db, stat err=%v", err)
+	}
 }
 
 func writeManifestFile(t *testing.T, m coderetrieval.Manifest) string {

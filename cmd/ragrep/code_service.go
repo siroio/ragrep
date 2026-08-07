@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/siroio/ragrep/internal/codeindex"
+	"github.com/siroio/ragrep/internal/coderetrieval"
 	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/config"
 	"github.com/siroio/ragrep/internal/lsp"
@@ -35,6 +36,17 @@ type searchResponse struct {
 type getRequest struct {
 	Root, DB, Key string
 	Body          bool
+}
+
+type packRequest struct {
+	Root, DB, Query string
+	K, Budget       int
+	SelectedKeys    []string
+}
+
+type verifyRequest struct {
+	Root, DB string
+	Manifest coderetrieval.Manifest
 }
 
 type indexRequest struct {
@@ -95,9 +107,7 @@ func (s *codeService) Search(ctx context.Context, req searchRequest) (searchResp
 	ws.setConfirmation(func(path, hash string) {
 		_ = s.confirmPathAtDB(context.Background(), ws.root, req.DB, path, hash)
 	})
-	barrierCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer cancel()
-	generation, err := ws.Barrier(barrierCtx)
+	generation, err := codeServiceBarrier(ctx, ws)
 	if err != nil {
 		return searchResponse{}, err
 	}
@@ -167,6 +177,46 @@ func (s *codeService) Search(ctx context.Context, req searchRequest) (searchResp
 		Degraded:   degraded,
 		UsedVector: usedVector,
 	}, nil
+}
+
+func (s *codeService) Pack(ctx context.Context, req packRequest) (codePackOutput, error) {
+	if len(req.SelectedKeys) > 3 {
+		return codePackOutput{}, fmt.Errorf("selected keys accepts at most 3 keys, got %d", len(req.SelectedKeys))
+	}
+	search, err := s.Search(ctx, searchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: "hybrid", K: req.K})
+	if err != nil {
+		return codePackOutput{}, err
+	}
+	ws, err := s.workspace(req.Root, req.DB)
+	if err != nil {
+		return codePackOutput{}, err
+	}
+	out, err := runCodePack(ws.store, search.Hits, req.Budget, req.SelectedKeys, func(key string) (codeindex.Symbol, error) {
+		return s.Get(ctx, getRequest{Root: req.Root, DB: req.DB, Key: key, Body: true})
+	})
+	if err != nil {
+		return codePackOutput{}, err
+	}
+	out.Fresh = search.Fresh
+	out.Generation = search.Generation
+	return out, nil
+}
+
+func (s *codeService) Verify(ctx context.Context, req verifyRequest) (codeVerifyOutput, error) {
+	ws, err := s.workspace(req.Root, req.DB)
+	if err != nil {
+		return codeVerifyOutput{}, err
+	}
+	if _, err := codeServiceBarrier(ctx, ws); err != nil {
+		return codeVerifyOutput{}, err
+	}
+	return runCodeVerify(ws.store, req.Manifest, ws.root)
+}
+
+func codeServiceBarrier(ctx context.Context, ws *workspaceState) (uint64, error) {
+	barrierCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	return ws.Barrier(barrierCtx)
 }
 
 func (s *codeService) Get(_ context.Context, req getRequest) (codeindex.Symbol, error) {
