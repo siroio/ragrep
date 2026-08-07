@@ -64,17 +64,20 @@ func newDaemonToken() (string, error) {
 }
 
 func writeDaemonDiscovery(path string, discovery daemonDiscovery) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	data, err := json.Marshal(discovery)
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	file, err := os.CreateTemp(dir, ".daemon-*.tmp")
 	if err != nil {
 		return err
 	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
 	if err := file.Chmod(0o600); err != nil {
 		file.Close()
 		return err
@@ -83,7 +86,10 @@ func writeDaemonDiscovery(path string, discovery daemonDiscovery) error {
 		file.Close()
 		return err
 	}
-	return file.Close()
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
 }
 
 func readDaemonDiscovery(path string) (daemonDiscovery, error) {
@@ -976,9 +982,42 @@ func cleanupDaemon(discoveryPath string, owned daemonDiscovery, resources ...io.
 	for _, resource := range resources {
 		_ = resource.Close()
 	}
-	if current, err := readDaemonDiscovery(discoveryPath); err == nil && current == owned {
-		_ = os.Remove(discoveryPath)
+	if discoveryPath == "" {
+		return
 	}
+	claim, err := claimDaemonDiscovery(discoveryPath)
+	if err != nil {
+		return
+	}
+	finishDaemonDiscoveryClaim(claim, discoveryPath, owned)
+}
+
+func finishDaemonDiscoveryClaim(claim, discoveryPath string, owned daemonDiscovery) {
+	current, err := readDaemonDiscovery(claim)
+	if err == nil && current == owned {
+		_ = os.Remove(claim)
+		return
+	}
+	if err := os.Link(claim, discoveryPath); err == nil || errors.Is(err, os.ErrExist) {
+		_ = os.Remove(claim)
+	}
+}
+
+func claimDaemonDiscovery(path string) (string, error) {
+	claimFile, err := os.CreateTemp(filepath.Dir(path), ".daemon-cleanup-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	claim := claimFile.Name()
+	if err := claimFile.Close(); err != nil {
+		_ = os.Remove(claim)
+		return "", err
+	}
+	if err := os.Rename(path, claim); err != nil {
+		_ = os.Remove(claim)
+		return "", err
+	}
+	return claim, nil
 }
 
 func newDaemonHTTPServer(handler http.Handler) *http.Server {

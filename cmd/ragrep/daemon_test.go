@@ -1062,6 +1062,27 @@ func TestCleanupDaemonPreservesNewerDiscovery(t *testing.T) {
 	}
 }
 
+func TestClaimedDaemonCleanupPreservesConcurrentDiscovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.json")
+	old := daemonDiscovery{Endpoint: "http://127.0.0.1:7377", Token: "old", PID: 1}
+	newer := daemonDiscovery{Endpoint: "http://127.0.0.1:7378", Token: "new", PID: 2}
+	if err := writeDaemonDiscovery(path, old); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claimDaemonDiscovery(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonDiscovery(path, newer); err != nil {
+		t.Fatal(err)
+	}
+	finishDaemonDiscoveryClaim(claim, path, old)
+	got, err := readDaemonDiscovery(path)
+	if err != nil || got != newer {
+		t.Fatalf("discovery=%+v err=%v, want replacement written immediately before removal", got, err)
+	}
+}
+
 func BenchmarkWorkspaceBarrier(b *testing.B) {
 	workspace, store := newDaemonBenchmarkWorkspace(b, "func BarrierCandidate() {}\n")
 	defer workspace.Close()
