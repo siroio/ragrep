@@ -16,6 +16,24 @@ type blockingTextEmbedder struct {
 	active, maxActive *atomic.Int32
 }
 
+type cancellationAfterFirstCheckContext struct {
+	context.Context
+	checked chan struct{}
+	once    sync.Once
+}
+
+func (c *cancellationAfterFirstCheckContext) Err() error {
+	first := false
+	c.once.Do(func() {
+		first = true
+		close(c.checked)
+	})
+	if first {
+		return nil
+	}
+	return c.Context.Err()
+}
+
 func (e *blockingTextEmbedder) Embed(string) ([]float32, error) {
 	active := e.active.Add(1)
 	for max := e.maxActive.Load(); active > max && !e.maxActive.CompareAndSwap(max, active); max = e.maxActive.Load() {
@@ -26,6 +44,36 @@ func (e *blockingTextEmbedder) Embed(string) ([]float32, error) {
 }
 
 func (*blockingTextEmbedder) Close() {}
+
+func TestEmbeddingPoolCancellationWhileWaitingSkipsEmbedder(t *testing.T) {
+	var calls atomic.Int32
+	p := newEmbeddingPool(func() (textEmbedder, error) {
+		return textEmbedderFunc(func(string) ([]float32, error) {
+			calls.Add(1)
+			return []float32{1}, nil
+		}), nil
+	})
+	base, cancel := context.WithCancel(context.Background())
+	ctx := &cancellationAfterFirstCheckContext{Context: base, checked: make(chan struct{})}
+	p.mu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Embed(ctx, "canceled")
+		done <- err
+	}()
+	<-ctx.checked
+	cancel()
+	p.mu.Unlock()
+
+	if err := <-done; !errors.Is(err, context.Canceled) || calls.Load() != 0 {
+		t.Fatalf("error=%v embed calls=%d, want canceled without embedding", err, calls.Load())
+	}
+}
+
+type textEmbedderFunc func(string) ([]float32, error)
+
+func (f textEmbedderFunc) Embed(text string) ([]float32, error) { return f(text) }
+func (textEmbedderFunc) Close()                                 {}
 
 func TestEmbeddingPoolConstructsOnceAndSerializes(t *testing.T) {
 	var constructed, active, maxActive atomic.Int32
@@ -93,6 +141,29 @@ func TestLSPPoolAcquireWithMetadataPreservesServerIdentity(t *testing.T) {
 	defer release()
 	if got != client || name != "fake-lsp" || version != "v1.2.3" {
 		t.Fatalf("client=%p name=%q version=%q", got, name, version)
+	}
+}
+
+func TestLSPPoolCancellationWhileWaitingSkipsLease(t *testing.T) {
+	var constructed atomic.Int32
+	p := newLSPPool(time.Hour, func(context.Context, string, string) (*pooledLanguageServer, error) {
+		constructed.Add(1)
+		return &pooledLanguageServer{client: new(lsp.Client)}, nil
+	})
+	base, cancel := context.WithCancel(context.Background())
+	ctx := &cancellationAfterFirstCheckContext{Context: base, checked: make(chan struct{})}
+	p.mu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := p.Acquire(ctx, t.TempDir(), "go")
+		done <- err
+	}()
+	<-ctx.checked
+	cancel()
+	p.mu.Unlock()
+
+	if err := <-done; !errors.Is(err, context.Canceled) || constructed.Load() != 0 || len(p.entries) != 0 {
+		t.Fatalf("error=%v constructed=%d entries=%d, want canceled without lease", err, constructed.Load(), len(p.entries))
 	}
 }
 

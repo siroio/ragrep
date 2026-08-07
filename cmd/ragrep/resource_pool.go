@@ -45,6 +45,9 @@ func (p *embeddingPool) Embed(ctx context.Context, text string) ([]float32, erro
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if p.closed {
 		return nil, errors.New("embedding pool is closed")
 	}
@@ -144,6 +147,9 @@ func (p *lspPool) AcquireWithMetadata(ctx context.Context, root, language string
 	key := lspPoolKey{root: root, language: language}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, "", "", nil, err
+	}
 	if p.closed {
 		return nil, "", "", nil, errors.New("LSP pool is closed")
 	}

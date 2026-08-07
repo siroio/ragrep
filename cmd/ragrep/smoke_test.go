@@ -196,20 +196,25 @@ func TestSmokeDaemonLiveSearchIsFreshAndIsolated(t *testing.T) {
 		t.Fatalf("second workspace search=%+v", second)
 	}
 
-	started := time.Now()
-	if err := os.WriteFile(filepath.Join(firstRoot, "service.go"), []byte("package sample\nfunc NewWorkspaceSymbol() {}\n"), 0o644); err != nil {
-		t.Fatal(err)
+	visibilitySamples := make([]time.Duration, 5)
+	for i := range visibilitySamples {
+		newSymbol := fmt.Sprintf("NewWorkspaceSymbol%d", i)
+		untrackedSymbol := fmt.Sprintf("AddedUntrackedSymbol%d", i)
+		started := time.Now()
+		if err := os.WriteFile(filepath.Join(firstRoot, "service.go"), []byte("package sample\nfunc "+newSymbol+"() {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(firstRoot, "untracked.go"), []byte("package sample\nfunc "+untrackedSymbol+"() {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		updated := daemonSmokeSearch(t, executable, firstRoot, environment, newSymbol+" "+untrackedSymbol)
+		visibilitySamples[i] = time.Since(started)
+		if !updated.Fresh || !daemonSmokeHasPath(updated.Hits, "service.go") || !daemonSmokeHasPath(updated.Hits, "untracked.go") {
+			t.Fatalf("sample %d updated search=%+v", i, updated)
+		}
 	}
-	if err := os.WriteFile(filepath.Join(firstRoot, "untracked.go"), []byte("package sample\nfunc AddedUntrackedSymbol() {}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	updated := daemonSmokeSearch(t, executable, firstRoot, environment, "NewWorkspaceSymbol AddedUntrackedSymbol OldWorkspaceSymbol")
-	visibility := time.Since(started)
-	if visibility > 500*time.Millisecond {
-		t.Fatalf("save visibility=%v, want <=500ms", visibility)
-	}
-	if !updated.Fresh || !daemonSmokeHasPath(updated.Hits, "service.go") || !daemonSmokeHasPath(updated.Hits, "untracked.go") {
-		t.Fatalf("updated search=%+v", updated)
+	if p95 := durationP95(visibilitySamples); p95 > 500*time.Millisecond {
+		t.Fatalf("save visibility p95=%v, want <=500ms (samples=%v)", p95, visibilitySamples)
 	}
 	if _, stderr, err := runBuiltRagrep(executable, firstRoot, environment, "code", "search", "--mode", "auto", "--json", "-k", "5", "OldWorkspaceSymbol"); daemonSmokeExitCode(err) != 2 {
 		t.Fatalf("old symbol search err=%v stderr=%s, want exit 2", err, stderr)
@@ -225,7 +230,7 @@ func TestSmokeDaemonLiveSearchIsFreshAndIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 	stopped = true
-	t.Logf("save visibility: %v", visibility)
+	t.Logf("save visibility p95: %v (samples=%v)", durationP95(visibilitySamples), visibilitySamples)
 }
 
 type daemonSmokeSearchResult struct {

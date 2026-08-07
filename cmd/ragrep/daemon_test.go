@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1099,6 +1100,64 @@ func BenchmarkWorkspaceBarrier(b *testing.B) {
 	b.StopTimer()
 }
 
+func TestWarmCandidateSearchP95(t *testing.T) {
+	workspace, store := newDaemonBenchmarkWorkspace(t, "func ExactSearchCandidate() {}\nfunc ValidateRequest() {}\n")
+	defer workspace.Close()
+	defer store.Close()
+	exactSymbol := serviceSymbol("service.go", "ExactSearchCandidate", "func ExactSearchCandidate() {}")
+	symbol := serviceSymbol("service.go", "ValidateRequest", "func ValidateRequest() {}")
+	if _, err := store.UpsertSymbols(symbol.Path, codeindex.FileHash([]byte("package sample\n"+exactSymbol.Body+"\n"+symbol.Body+"\n")), []codeindex.Symbol{exactSymbol, symbol}, 0, fakeCodeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	embedder := new(serviceTestEmbedder)
+	service := newCodeService(func(string) (*workspaceState, error) { return workspace, nil }, newEmbeddingPool(func() (textEmbedder, error) {
+		return embedder, nil
+	}), nil)
+	defer service.Close()
+
+	cases := []struct {
+		name    string
+		request searchRequest
+		check   func(searchResponse) bool
+	}{
+		{"exact", searchRequest{Root: workspace.root, Query: "ExactSearchCandidate", Mode: "auto"}, func(result searchResponse) bool {
+			return len(result.Hits) > 0 && result.Fresh && !result.UsedVector
+		}},
+		{"ambiguous", searchRequest{Root: workspace.root, Query: "request validation", Mode: "hybrid"}, func(result searchResponse) bool {
+			return len(result.Hits) > 0 && result.Hits[0].Key == symbol.Key && result.Hits[0].VecRank > 0 && result.UsedVector && result.Fresh
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			for range 5 {
+				if result, err := service.Search(context.Background(), test.request); err != nil || !test.check(result) {
+					t.Fatalf("warm result=%+v err=%v", result, err)
+				}
+			}
+			durations := make([]time.Duration, 20)
+			for i := range durations {
+				started := time.Now()
+				result, err := service.Search(context.Background(), test.request)
+				durations[i] = time.Since(started)
+				if err != nil || !test.check(result) {
+					t.Fatalf("sample %d result=%+v err=%v", i, result, err)
+				}
+			}
+			if p95 := durationP95(durations); p95 > 200*time.Millisecond {
+				t.Fatalf("warm candidate search p95=%v, want <=200ms (samples=%v)", p95, durations)
+			} else {
+				t.Logf("warm candidate search p95: %v (samples=%v)", p95, durations)
+			}
+		})
+	}
+}
+
+func durationP95(samples []time.Duration) time.Duration {
+	sorted := append([]time.Duration(nil), samples...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted[(len(sorted)*95+99)/100-1]
+}
+
 func BenchmarkExactSearch(b *testing.B) {
 	workspace, store := newDaemonBenchmarkWorkspace(b, "func ExactSearchCandidate() {}\n")
 	defer workspace.Close()
@@ -1181,7 +1240,7 @@ func BenchmarkWorkspaceBarrierTwoWorkspaceIsolation(b *testing.B) {
 	b.StopTimer()
 }
 
-func newDaemonBenchmarkWorkspace(b *testing.B, body string) (*workspaceState, *codestore.Store) {
+func newDaemonBenchmarkWorkspace(b testing.TB, body string) (*workspaceState, *codestore.Store) {
 	b.Helper()
 	root, err := filepath.Abs(b.TempDir())
 	if err != nil {
