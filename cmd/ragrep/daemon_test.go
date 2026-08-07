@@ -748,12 +748,13 @@ func TestWorkspaceRegistryCloseDeadlineRemovesDiscoveryAndClosesLateRestore(t *t
 	r.RestoreExplicitAsync()
 	<-entered
 	discoveryPath := filepath.Join(t.TempDir(), "daemon.json")
-	if err := os.WriteFile(discoveryPath, []byte("{}"), 0o600); err != nil {
+	discovery := daemonDiscovery{Endpoint: "http://127.0.0.1:7377", Token: "secret", PID: 42}
+	if err := writeDaemonDiscovery(discoveryPath, discovery); err != nil {
 		t.Fatal(err)
 	}
 	cleaned := make(chan struct{})
 	go func() {
-		cleanupDaemon(discoveryPath, r)
+		cleanupDaemon(discoveryPath, discovery, r)
 		close(cleaned)
 	}()
 	select {
@@ -950,17 +951,18 @@ func TestDaemonStopOutlastsBlockedRestoreCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeDaemonDiscovery(discoveryPath, daemonDiscovery{
+	discovery := daemonDiscovery{
 		Endpoint: "http://" + listener.Addr().String(),
 		Token:    "secret",
 		PID:      42,
-	}); err != nil {
+	}
+	if err := writeDaemonDiscovery(discoveryPath, discovery); err != nil {
 		t.Fatal(err)
 	}
 	served := make(chan error, 1)
 	go func() {
 		err := server.Serve(listener)
-		cleanupDaemon(discoveryPath, listener, service, registry)
+		cleanupDaemon(discoveryPath, discovery, listener, service, registry)
 		served <- err
 	}()
 	registry.RestoreExplicitAsync()
@@ -1021,7 +1023,8 @@ func TestDaemonServerForcesCloseAfterShutdownDeadline(t *testing.T) {
 
 func TestCleanupDaemonRemovesDiscoveryAfterResourcesClose(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.json")
-	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+	discovery := daemonDiscovery{Endpoint: "http://127.0.0.1:7377", Token: "secret", PID: 42}
+	if err := writeDaemonDiscovery(path, discovery); err != nil {
 		t.Fatal(err)
 	}
 	var order []string
@@ -1034,12 +1037,28 @@ func TestCleanupDaemonRemovesDiscoveryAfterResourcesClose(t *testing.T) {
 			return nil
 		}
 	}
-	cleanupDaemon(path, closer("listener"), closer("service"), closer("registry"))
+	cleanupDaemon(path, discovery, closer("listener"), closer("service"), closer("registry"))
 	if got := strings.Join(order, ","); got != "listener,service,registry" {
 		t.Fatalf("cleanup order=%s", got)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("discovery remains after cleanup: %v", err)
+	}
+}
+
+func TestCleanupDaemonPreservesNewerDiscovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.json")
+	old := daemonDiscovery{Endpoint: "http://127.0.0.1:7377", Token: "old", PID: 1}
+	newer := daemonDiscovery{Endpoint: "http://127.0.0.1:7378", Token: "new", PID: 2}
+	if err := writeDaemonDiscovery(path, old); err != nil {
+		t.Fatal(err)
+	}
+	cleanupDaemon(path, old, closeFunc(func() error {
+		return writeDaemonDiscovery(path, newer)
+	}))
+	got, err := readDaemonDiscovery(path)
+	if err != nil || got != newer {
+		t.Fatalf("discovery=%+v err=%v, want newer daemon", got, err)
 	}
 }
 

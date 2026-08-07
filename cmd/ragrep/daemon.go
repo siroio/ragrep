@@ -941,7 +941,8 @@ func serveDaemon() error {
 	}
 	service := newCodeServiceForDB(registry.ResolveCode, nil, nil)
 	cleanupPath := ""
-	defer func() { cleanupDaemon(cleanupPath, listener, service, registry) }()
+	cleanupDiscovery := daemonDiscovery{}
+	defer func() { cleanupDaemon(cleanupPath, cleanupDiscovery, listener, service, registry) }()
 	token, err := newDaemonToken()
 	if err != nil {
 		return err
@@ -951,6 +952,7 @@ func serveDaemon() error {
 		return err
 	}
 	cleanupPath = discoveryPath
+	cleanupDiscovery = discovery
 	registry.RestoreExplicitAsync()
 	stop := make(chan struct{}, 1)
 	server := newDaemonHTTPServer(newDaemonServerHandler(service, token, registry, func() {
@@ -970,11 +972,11 @@ func serveDaemon() error {
 	return err
 }
 
-func cleanupDaemon(discoveryPath string, resources ...io.Closer) {
+func cleanupDaemon(discoveryPath string, owned daemonDiscovery, resources ...io.Closer) {
 	for _, resource := range resources {
 		_ = resource.Close()
 	}
-	if discoveryPath != "" {
+	if current, err := readDaemonDiscovery(discoveryPath); err == nil && current == owned {
 		_ = os.Remove(discoveryPath)
 	}
 }
