@@ -29,6 +29,8 @@ Usage:
   ragrep add [--tag t]... <path>            (reads content from stdin)
   ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
   ragrep code index|search|get|expand|pack|verify ...  code symbol indexing/search (see 'ragrep code -h')
+  ragrep daemon start|stop|status|serve
+  ragrep workspace add|remove|list [path]
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
@@ -80,6 +82,10 @@ func run(args []string) int {
 		return cmdEval(rest)
 	case "code":
 		return cmdCode(rest)
+	case "daemon":
+		return cmdDaemon(rest)
+	case "workspace":
+		return cmdWorkspace(rest)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return 1

@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/siroio/ragrep/internal/store"
 )
@@ -43,6 +45,43 @@ func newTestStore(t *testing.T) *store.Store {
 func TestHelpExitsZero(t *testing.T) {
 	if code := run([]string{"search", "-h"}); code != 0 {
 		t.Fatalf("search -h exit=%d, want 0", code)
+	}
+}
+
+func TestRunDaemonAndWorkspaceTopLevelExitCodes(t *testing.T) {
+	if code := run([]string{"daemon", "unknown"}); code != 1 {
+		t.Fatalf("daemon unknown exit=%d, want 1", code)
+	}
+	if code := run([]string{"workspace", "unknown"}); code != 1 {
+		t.Fatalf("workspace unknown exit=%d, want 1", code)
+	}
+}
+
+func TestRunWorkspaceCleanNegativeExitsTwo(t *testing.T) {
+	cache := t.TempDir()
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	registry, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Minute, testWorkspaceOpener(map[string]*workspaceState{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	h := newDaemonServerHandler(nil, "secret", registry, nil)
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	path, err := daemonDiscoveryPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonDiscovery(path, daemonDiscovery{Endpoint: ts.URL, Token: "secret", PID: os.Getpid()}); err != nil {
+		t.Fatal(err)
+	}
+	root := testWorkspaceRoot(t)
+	if code := run([]string{"workspace", "remove", root}); code != 2 {
+		t.Fatalf("workspace remove missing exit=%d, want 2", code)
+	}
+	if code := run([]string{"workspace", "list"}); code != 2 {
+		t.Fatalf("workspace list empty exit=%d, want 2", code)
 	}
 }
 
