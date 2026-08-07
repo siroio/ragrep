@@ -768,6 +768,36 @@ func TestListPathsAndDeleteSymbolsForPath(t *testing.T) {
 	}
 }
 
+func TestDeleteSymbolsForPathIfLiveHashDoesNotDeleteNewerDurableFile(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+	newer := sym("newer-key", "NewerHandler", "NewerHandler", "", "func NewerHandler() {}")
+	newer.Path = "service.go"
+	newer.EmbeddingText = codeindex.RenderEmbeddingText(newer)
+	fe.register(newer, []float32{1, 0, 0})
+
+	if err := s.PutLiveDeletion("service.go", "hash-old", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutLiveFile("service.go", "hash-new", newer.Body, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertSymbols("service.go", "hash-new", []codeindex.Symbol{newer}, 0, fe.embed); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := s.RemoveLiveFileIfHash("service.go", "hash-new"); err != nil || !removed {
+		t.Fatalf("RemoveLiveFileIfHash(new)=%v, %v", removed, err)
+	}
+
+	deleted, err := s.DeleteSymbolsForPathIfLiveHash("service.go", "hash-old")
+	if err != nil || deleted {
+		t.Fatalf("DeleteSymbolsForPathIfLiveHash(old)=%v, %v", deleted, err)
+	}
+	if got, err := s.GetSymbol(newer.Key); err != nil || got.Body != newer.Body {
+		t.Fatalf("newer durable symbol=%+v, %v", got, err)
+	}
+}
+
 // --- LatestIndexRun: the read counterpart to RecordIndexRun, for a caller
 // (cmd/ragrep's `code pack`) that needs the index's current identity
 // without tracking a specific run id itself ---

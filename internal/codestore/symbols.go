@@ -77,6 +77,10 @@ type existingSymbolRow struct {
 	bodyHash, fileHash                                  string
 }
 
+type symbolRowsQueryer interface {
+	Query(string, ...any) (*sql.Rows, error)
+}
+
 // UpsertSymbols replaces path's stored symbols with symbols, in one
 // transaction.
 //
@@ -160,7 +164,11 @@ func (s *Store) UpsertSymbols(path, fileHash string, symbols []codeindex.Symbol,
 }
 
 func (s *Store) existingSymbolRows(path string) (map[string]existingSymbolRow, error) {
-	rows, err := s.db.Query(`
+	return existingSymbolRows(s.db, path)
+}
+
+func existingSymbolRows(q symbolRowsQueryer, path string) (map[string]existingSymbolRow, error) {
+	rows, err := q.Query(`
 		SELECT key, id, name, qualified_name, signature, documentation, body, body_hash, file_hash
 		FROM symbols WHERE path=?`, path)
 	if err != nil {
@@ -489,6 +497,43 @@ func (s *Store) DeleteSymbolsForPath(path string) error {
 	}
 
 	return tx.Commit()
+}
+
+// DeleteSymbolsForPathIfLiveHash removes path's durable symbols and deletion
+// tombstone only while the tombstone still matches expectedHash.
+func (s *Store) DeleteSymbolsForPathIfLiveHash(path, expectedHash string) (bool, error) {
+	path = filepath.ToSlash(path)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var hash string
+	var deleted bool
+	err = tx.QueryRow(`SELECT hash, deleted FROM live_files WHERE path=?`, path).Scan(&hash, &deleted)
+	if err == sql.ErrNoRows || err == nil && (hash != expectedHash || !deleted) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	existing, err := existingSymbolRows(tx, path)
+	if err != nil {
+		return false, err
+	}
+	for key, old := range existing {
+		if err := deleteSymbolRow(tx, key, old); err != nil {
+			return false, err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM live_files WHERE path=? AND hash=? AND deleted`, path, expectedHash); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // GetSymbol returns the full stored record for key, including Body.
@@ -1030,6 +1075,30 @@ func (s *Store) SearchSymbolsText(query string, k int) ([]SymbolHit, error) {
 	return s.symbolHitsByIDs(ids, ftsRank, nil, nil, scores)
 }
 
+// SearchSymbolsTextExact ranks by FTS while pinning and marking exact symbol
+// names and qualified names ahead of non-exact hits.
+func (s *Store) SearchSymbolsTextExact(query string, k int) ([]SymbolHit, error) {
+	exactIDs, err := s.exactMatchIDs(query)
+	if err != nil {
+		return nil, err
+	}
+	return s.searchSymbolsTextExact(query, k, exactIDs)
+}
+
+func (s *Store) searchSymbolsTextExact(query string, k int, exactIDs []int64) ([]SymbolHit, error) {
+	textIDs, err := s.searchSymbolsTextIDs(query, rrfFetch)
+	if err != nil {
+		return nil, err
+	}
+	textRanks := rankMap(textIDs)
+	scores := make(map[int64]float64, len(textIDs))
+	for id, rank := range textRanks {
+		scores[id] = 1.0 / float64(rank)
+	}
+	ordered, exact := prioritizeExactIDs(exactIDs, textIDs, scores, k)
+	return s.symbolHitsByIDs(ordered, textRanks, nil, exact, scores)
+}
+
 // SearchSymbolsAuto skips vector search for an exact symbol name or qualified
 // name match, otherwise using the same hybrid search as semantic queries.
 func (s *Store) SearchSymbolsAuto(query string, k int, vector func() ([]float32, error)) ([]SymbolHit, bool, error) {
@@ -1038,17 +1107,7 @@ func (s *Store) SearchSymbolsAuto(query string, k int, vector func() ([]float32,
 		return nil, false, err
 	}
 	if len(exactIDs) > 0 {
-		textIDs, err := s.searchSymbolsTextIDs(query, rrfFetch)
-		if err != nil {
-			return nil, false, err
-		}
-		textRanks := rankMap(textIDs)
-		scores := make(map[int64]float64, len(textIDs))
-		for id, rank := range textRanks {
-			scores[id] = 1.0 / float64(rank)
-		}
-		ordered, exact := prioritizeExactIDs(exactIDs, textIDs, scores, k)
-		hits, err := s.symbolHitsByIDs(ordered, textRanks, nil, exact, scores)
+		hits, err := s.searchSymbolsTextExact(query, k, exactIDs)
 		return hits, false, err
 	}
 

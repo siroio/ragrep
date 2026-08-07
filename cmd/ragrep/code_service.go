@@ -98,12 +98,12 @@ func (s *codeService) Search(ctx context.Context, req searchRequest) (searchResp
 			}
 		}
 		if textOnly {
-			durable, err = ws.store.SearchSymbolsText(req.Query, 50)
+			durable, err = ws.store.SearchSymbolsTextExact(req.Query, 50)
 		} else {
 			durable, usedVector, err = ws.store.SearchSymbolsAuto(req.Query, 50, vector)
 		}
 	case "text":
-		durable, err = ws.store.SearchSymbolsText(req.Query, 50)
+		durable, err = ws.store.SearchSymbolsTextExact(req.Query, 50)
 	case "vector":
 		var v []float32
 		v, err = vector()
@@ -121,7 +121,7 @@ func (s *codeService) Search(ctx context.Context, req searchRequest) (searchResp
 	}
 	degraded := ""
 	if err != nil && vectorErr != nil {
-		durable, err = ws.store.SearchSymbolsText(req.Query, 50)
+		durable, err = ws.store.SearchSymbolsTextExact(req.Query, 50)
 		degraded = "vector_unavailable"
 		usedVector = false
 	}
@@ -165,6 +165,8 @@ func (s *codeService) ConfirmPath(ctx context.Context, root, path, expectedHash 
 	if err != nil {
 		return err
 	}
+	unlock := ws.lockConfirmation(path)
+	defer unlock()
 	file, err := ws.store.GetLiveFileByPath(path, expectedHash)
 	if errors.Is(err, codestore.ErrStaleLiveKey) {
 		return nil
@@ -173,10 +175,7 @@ func (s *codeService) ConfirmPath(ctx context.Context, root, path, expectedHash 
 		return err
 	}
 	if file.Deleted {
-		if err := ws.store.DeleteSymbolsForPath(file.Path); err != nil {
-			return err
-		}
-		_, err = ws.store.RemoveLiveFileIfHash(file.Path, expectedHash)
+		_, err = ws.store.DeleteSymbolsForPathIfLiveHash(file.Path, expectedHash)
 		return err
 	}
 

@@ -173,6 +173,18 @@ func TestCodeServiceSearchExactDurableHitSkipsEmbedding(t *testing.T) {
 	}
 }
 
+func TestCodeServiceSearchMarksLiveAndDurableExactHits(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	durableBody := "func SharedExact() {}"
+	putServiceSymbol(t, ws.store, serviceSymbol("durable.go", "SharedExact", durableBody), ws.save(t, "durable.go", durableBody))
+	ws.save(t, "live.go", "package service\nfunc SharedExact() { changed() }")
+
+	resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "SharedExact"})
+	if err != nil || len(resp.Hits) != 2 || !resp.Hits[0].ExactMatch || !resp.Hits[1].ExactMatch || embedder.calls.Load() != 0 {
+		t.Fatalf("resp=%+v embed calls=%d err=%v", resp, embedder.calls.Load(), err)
+	}
+}
+
 func TestCodeServiceSearchExistingPathSkipsEmbedding(t *testing.T) {
 	svc, ws, embedder := newTestCodeService(t)
 	body := "func PathHandler() {}"
@@ -289,8 +301,20 @@ import (
 	"net/textproto"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 )
+
+var writeMu sync.Mutex
+var documentRequests atomic.Int32
+
+func reply(id json.RawMessage, result string) {
+	resp := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}", id, result)
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(resp), resp)
+}
 
 func main() {
 	tp := textproto.NewReader(bufio.NewReader(os.Stdin))
@@ -312,15 +336,20 @@ func main() {
 		case "initialize":
 			result = ` + "`" + `{"capabilities":{"documentSymbolProvider":true}}` + "`" + `
 		case "textDocument/documentSymbol":
-			_ = os.WriteFile("document-symbol.started", []byte("started"), 0644)
-			for {
-				if _, err := os.Stat("document-symbol.continue"); err == nil { break }
-				time.Sleep(5 * time.Millisecond)
-			}
-			result = ` + "`" + `[{"name":"PromotedHandler","kind":12,"range":{"start":{"line":2,"character":0},"end":{"line":4,"character":1}},"selectionRange":{"start":{"line":2,"character":5},"end":{"line":2,"character":20}}}]` + "`" + `
+			first := documentRequests.Add(1) == 1
+			go func() {
+				if first {
+					_ = os.WriteFile("document-symbol.started", []byte("started"), 0644)
+					for {
+						if _, err := os.Stat("document-symbol.continue"); err == nil { break }
+						time.Sleep(5 * time.Millisecond)
+					}
+				}
+				reply(id, ` + "`" + `[{"name":"PromotedHandler","kind":12,"range":{"start":{"line":2,"character":0},"end":{"line":4,"character":1}},"selectionRange":{"start":{"line":2,"character":5},"end":{"line":2,"character":20}}}]` + "`" + `)
+			}()
+			continue
 		}
-		resp := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}", id, result)
-		fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(resp), resp)
+		reply(id, result)
 	}
 }
 `
@@ -351,38 +380,48 @@ func waitForTestPath(t *testing.T, path string) {
 	t.Fatalf("timed out waiting for %s", path)
 }
 
-func TestConfirmPathDoesNotRemoveNewerLiveVersion(t *testing.T) {
+func TestConfirmPathOlderPromotionCannotOverwriteNewerCompletion(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
 	bodyA := "package service\n\nfunc PromotedHandler() {\n\t// version A\n}"
 	bodyB := "package service\n\nfunc PromotedHandler() {\n\t// version B\n}"
 	hashA := ws.save(t, "service.go", bodyA)
-	gen := barrierGeneration(t, ws.workspaceState)
+	barrierGeneration(t, ws.workspaceState)
 
-	confirmed := make(chan error, 1)
+	confirmedA := make(chan error, 1)
 	go func() {
-		confirmed <- svc.ConfirmPath(context.Background(), ws.root, "service.go", hashA)
+		confirmedA <- svc.ConfirmPath(context.Background(), ws.root, "service.go", hashA)
 	}()
 	waitForTestPath(t, started)
 	ws.save(t, "service.go", bodyB)
 	if err := ws.refreshPaths([]string{filepath.Join(ws.root, "service.go")}); err != nil {
 		t.Fatal(err)
 	}
+	confirmedB := make(chan error, 1)
+	go func() {
+		confirmedB <- svc.ConfirmPath(context.Background(), ws.root, "service.go", codeindex.FileHash([]byte(bodyB)))
+	}()
+	bFinished := false
+	select {
+	case err := <-confirmedB:
+		if err != nil {
+			t.Fatal(err)
+		}
+		bFinished = true
+	case <-time.After(100 * time.Millisecond):
+	}
 	if err := os.WriteFile(release, []byte("continue"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-confirmed; err != nil {
+	if err := <-confirmedA; err != nil {
 		t.Fatal(err)
+	}
+	if !bFinished {
+		if err := <-confirmedB; err != nil {
+			t.Fatal(err)
+		}
 	}
 	live, err := ws.store.SearchLiveText("PromotedHandler", 5)
-	if err != nil || len(live) != 1 || live[0].ContentHash != codeindex.FileHash([]byte(bodyB)) || live[0].Generation != gen+1 {
-		t.Fatalf("live after A confirmation=%+v err=%v", live, err)
-	}
-
-	if err := svc.ConfirmPath(context.Background(), ws.root, "service.go", codeindex.FileHash([]byte(bodyB))); err != nil {
-		t.Fatal(err)
-	}
-	live, err = ws.store.SearchLiveText("PromotedHandler", 5)
 	if err != nil || len(live) != 0 {
 		t.Fatalf("live after B confirmation=%+v err=%v", live, err)
 	}

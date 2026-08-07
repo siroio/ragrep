@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -211,6 +212,30 @@ func TestWorkspaceFullRefreshRequestDuringRefreshSurvivesUntilNextBarrier(t *tes
 	}
 	if err := w.refreshPaths(nil); err != nil {
 		t.Fatalf("refreshPaths after next Barrier: %v", err)
+	}
+}
+
+func TestWorkspaceFullRefreshRequestAfterFlightCreationSurvivesUntilNextBarrier(t *testing.T) {
+	w := newTestWorkspace(t, "func BeforeFlightRequest() {}")
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := w.Barrier(ctx); !errors.Is(err, ErrWorkspaceSyncing) {
+		t.Fatalf("canceled Barrier err=%v, want ErrWorkspaceSyncing", err)
+	}
+	w.mu.Lock()
+	refresh := w.refresh
+	w.mu.Unlock()
+	if refresh == nil {
+		t.Fatal("refresh flight completed before request could be recorded")
+	}
+	w.requireFullRefresh()
+	<-refresh.done
+
+	if err := w.refreshPaths(nil); !errors.Is(err, ErrWorkspaceSyncing) {
+		t.Fatalf("refreshPaths before next Barrier err=%v, want ErrWorkspaceSyncing", err)
 	}
 }
 

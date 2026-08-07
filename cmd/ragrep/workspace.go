@@ -42,12 +42,15 @@ type workspaceState struct {
 	refreshMu           sync.Mutex
 	refreshWG           sync.WaitGroup
 	watcherWG           sync.WaitGroup
+	confirmationMu      sync.Mutex
+	confirmationLocks   map[string]*sync.Mutex
 }
 
 type workspaceRefresh struct {
-	done       chan struct{}
-	generation uint64
-	err        error
+	done             chan struct{}
+	generation       uint64
+	fullRefreshEpoch uint64
+	err              error
 }
 
 type workspaceFile struct {
@@ -108,7 +111,7 @@ func (w *workspaceState) Barrier(ctx context.Context) (uint64, error) {
 		return 0, ErrWorkspaceSyncing
 	}
 	if w.refresh == nil {
-		w.refresh = &workspaceRefresh{done: make(chan struct{})}
+		w.refresh = &workspaceRefresh{done: make(chan struct{}), fullRefreshEpoch: w.fullRefreshEpoch}
 		w.refreshDone = w.refresh.done
 		w.refreshWG.Add(1)
 		go w.runFullRefresh(w.refresh)
@@ -126,9 +129,6 @@ func (w *workspaceState) Barrier(ctx context.Context) (uint64, error) {
 
 func (w *workspaceState) runFullRefresh(refresh *workspaceRefresh) {
 	defer w.refreshWG.Done()
-	w.mu.Lock()
-	fullRefreshEpoch := w.fullRefreshEpoch
-	w.mu.Unlock()
 	w.refreshMu.Lock()
 	err := w.refreshAll()
 	w.refreshMu.Unlock()
@@ -137,7 +137,7 @@ func (w *workspaceState) runFullRefresh(refresh *workspaceRefresh) {
 	refresh.generation = w.generation
 	refresh.err = err
 	w.refreshErr = err
-	if err == nil && w.fullRefreshEpoch == fullRefreshEpoch {
+	if err == nil && w.fullRefreshEpoch == refresh.fullRefreshEpoch {
 		w.fullRefreshRequired = false
 	}
 	if w.refresh == refresh {
@@ -390,6 +390,22 @@ func (w *workspaceState) scheduleConfirmation(path, hash string) {
 	if confirm != nil {
 		go confirm(path, hash)
 	}
+}
+
+func (w *workspaceState) lockConfirmation(path string) func() {
+	path = filepath.ToSlash(path)
+	w.confirmationMu.Lock()
+	if w.confirmationLocks == nil {
+		w.confirmationLocks = make(map[string]*sync.Mutex)
+	}
+	pathMu := w.confirmationLocks[path]
+	if pathMu == nil {
+		pathMu = new(sync.Mutex)
+		w.confirmationLocks[path] = pathMu
+	}
+	w.confirmationMu.Unlock()
+	pathMu.Lock()
+	return pathMu.Unlock
 }
 
 func (w *workspaceState) refreshPaths(paths []string) error {
