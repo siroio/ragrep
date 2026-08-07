@@ -35,6 +35,8 @@ type workspaceState struct {
 	refresh             *workspaceRefresh
 	fullRefreshRequired bool
 	closed              bool
+	shutdownDone        chan struct{}
+	shutdownErr         error
 	refreshMu           sync.Mutex
 	refreshWG           sync.WaitGroup
 	watcherWG           sync.WaitGroup
@@ -86,13 +88,14 @@ func newWorkspaceState(root string, store *codestore.Store, roots []string, lang
 		}
 	}
 	return &workspaceState{
-		root:       absRoot,
-		language:   language,
-		roots:      relRoots,
-		store:      store,
-		ext:        ext,
-		enumerate:  discoverCodeFiles,
-		generation: generation,
+		root:         absRoot,
+		language:     language,
+		roots:        relRoots,
+		store:        store,
+		ext:          ext,
+		enumerate:    discoverCodeFiles,
+		generation:   generation,
+		shutdownDone: make(chan struct{}),
 	}, nil
 }
 
@@ -265,7 +268,7 @@ func (w *workspaceState) addWatchRoots(watcher *fsnotify.Watcher) (map[string]bo
 			return watcher.Add(path)
 		})
 		if err != nil {
-			return nil, err
+			return added, err
 		}
 	}
 	return added, nil
@@ -421,8 +424,13 @@ func (w *workspaceState) refreshPaths(paths []string) error {
 func (w *workspaceState) Close() error {
 	w.mu.Lock()
 	if w.closed {
+		done := w.shutdownDone
 		w.mu.Unlock()
-		return nil
+		<-done
+		w.mu.Lock()
+		err := w.shutdownErr
+		w.mu.Unlock()
+		return err
 	}
 	w.closed = true
 	watcher := w.watcher
@@ -434,5 +442,9 @@ func (w *workspaceState) Close() error {
 	}
 	w.refreshWG.Wait()
 	w.watcherWG.Wait()
+	w.mu.Lock()
+	w.shutdownErr = err
+	close(w.shutdownDone)
+	w.mu.Unlock()
 	return err
 }

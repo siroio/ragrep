@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
 	"github.com/siroio/ragrep/internal/codestore"
 )
 
@@ -330,4 +332,86 @@ func waitForFullRefreshRequired(t *testing.T, w *workspaceState) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("full refresh was not required")
+}
+
+func TestWorkspaceConcurrentCloseWaitsForInFlightRefresh(t *testing.T) {
+	w := newTestWorkspace(t, "func ConcurrentClose() {}")
+	unblock := make(chan struct{})
+	original := w.enumerate
+	w.enumerate = func(root, ext string) ([]string, error) {
+		<-unblock
+		return original(root, ext)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := w.Barrier(ctx); !errors.Is(err, ErrWorkspaceSyncing) {
+		t.Fatalf("Barrier timeout err=%v, want ErrWorkspaceSyncing", err)
+	}
+	closed := make(chan error, 2)
+	go func() { closed <- w.Close() }()
+	waitForWorkspaceClosed(t, w.workspaceState)
+	go func() { closed <- w.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("concurrent Close returned before refresh completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(unblock)
+	for range 2 {
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Close did not return after refresh completed")
+		}
+	}
+}
+
+func TestWorkspaceAddWatchRootsReturnsPartialSuccess(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "valid"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := codestore.Open(filepath.Join(t.TempDir(), "code.db"), "test-model", codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	w, err := newWorkspaceState(root, store, []string{"valid", "missing"}, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { watcher.Close() })
+	added, err := w.addWatchRoots(watcher)
+	if err == nil {
+		t.Fatal("addWatchRoots err=nil, want missing-root error")
+	}
+	valid := filepath.Join(root, "valid")
+	if len(watcher.WatchList()) != 1 || !added[valid] {
+		t.Fatalf("watch list=%v added=%v err=%v, want valid root recorded", watcher.WatchList(), added, err)
+	}
+}
+
+func waitForWorkspaceClosed(t *testing.T, w *workspaceState) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		closed := w.closed
+		w.mu.Unlock()
+		if closed {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("workspace did not begin closing")
 }
