@@ -31,6 +31,7 @@ type daemonStatus struct {
 
 type daemonSearchRequest struct {
 	Root  string `json:"root"`
+	DB    string `json:"db"`
 	Query string `json:"query"`
 	Mode  string `json:"mode,omitempty"`
 	K     int    `json:"k,omitempty"`
@@ -46,18 +47,21 @@ type daemonSearchResponse struct {
 
 type daemonGetRequest struct {
 	Root string `json:"root"`
+	DB   string `json:"db"`
 	Key  string `json:"key"`
 	Body bool   `json:"body"`
 }
 
 type daemonIndexRequest struct {
 	Root     string   `json:"root"`
+	DB       string   `json:"db"`
 	Language string   `json:"language"`
 	Roots    []string `json:"roots"`
 }
 
 type daemonExpandRequest struct {
 	Root     string `json:"root"`
+	DB       string `json:"db"`
 	Key      string `json:"key"`
 	Relation string `json:"relation"`
 }
@@ -132,7 +136,7 @@ func (h *daemonHandler) index(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
 		return
 	}
-	release, ok := h.acquireWorkspace(w, req.Root)
+	release, ok := h.acquireWorkspace(w, req.Root, req.DB)
 	if !ok {
 		return
 	}
@@ -142,7 +146,7 @@ func (h *daemonHandler) index(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
 		return
 	}
-	result, err := indexer.Index(r.Context(), indexRequest{Root: req.Root, Language: req.Language, Roots: req.Roots})
+	result, err := indexer.Index(r.Context(), indexRequest{Root: req.Root, DB: req.DB, Language: req.Language, Roots: req.Roots})
 	if err != nil {
 		status, apiErr := classifyAPIError(err)
 		writeAPIError(w, status, apiErr)
@@ -157,7 +161,7 @@ func (h *daemonHandler) expand(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
 		return
 	}
-	release, ok := h.acquireWorkspace(w, req.Root)
+	release, ok := h.acquireWorkspace(w, req.Root, req.DB)
 	if !ok {
 		return
 	}
@@ -167,7 +171,7 @@ func (h *daemonHandler) expand(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
 		return
 	}
-	targets, err := expander.Expand(r.Context(), expandRequest{Root: req.Root, Key: req.Key, Relation: req.Relation})
+	targets, err := expander.Expand(r.Context(), expandRequest{Root: req.Root, DB: req.DB, Key: req.Key, Relation: req.Relation})
 	if err != nil {
 		status, apiErr := classifyAPIError(err)
 		writeAPIError(w, status, apiErr)
@@ -182,7 +186,7 @@ func (h *daemonHandler) get(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
 		return
 	}
-	release, ok := h.acquireWorkspace(w, req.Root)
+	release, ok := h.acquireWorkspace(w, req.Root, req.DB)
 	if !ok {
 		return
 	}
@@ -192,7 +196,7 @@ func (h *daemonHandler) get(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
 		return
 	}
-	symbol, err := getter.Get(r.Context(), getRequest{Root: req.Root, Key: req.Key, Body: req.Body})
+	symbol, err := getter.Get(r.Context(), getRequest{Root: req.Root, DB: req.DB, Key: req.Key, Body: req.Body})
 	if err != nil {
 		status, apiErr := classifyAPIError(err)
 		writeAPIError(w, status, apiErr)
@@ -211,12 +215,12 @@ func (h *daemonHandler) search(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
 		return
 	}
-	release, ok := h.acquireWorkspace(w, req.Root)
+	release, ok := h.acquireWorkspace(w, req.Root, req.DB)
 	if !ok {
 		return
 	}
 	defer release()
-	resp, err := h.service.Search(r.Context(), searchRequest{Root: req.Root, Query: req.Query, Mode: req.Mode, K: req.K})
+	resp, err := h.service.Search(r.Context(), searchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: req.Mode, K: req.K})
 	if err != nil {
 		status, apiErr := classifyAPIError(err)
 		writeAPIError(w, status, apiErr)
@@ -228,11 +232,11 @@ func (h *daemonHandler) search(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *daemonHandler) acquireWorkspace(w http.ResponseWriter, root string) (func(), bool) {
+func (h *daemonHandler) acquireWorkspace(w http.ResponseWriter, root, db string) (func(), bool) {
 	if h.registry == nil {
 		return func() {}, true
 	}
-	release, err := h.registry.Acquire(root)
+	release, err := h.registry.AcquireCode(root, db)
 	if err != nil {
 		status, apiErr := classifyAPIError(err)
 		writeAPIError(w, status, apiErr)
@@ -362,25 +366,25 @@ func (c daemonClient) Search(ctx context.Context, req searchRequest) (searchResp
 		Degraded   string                `json:"degraded"`
 		UsedVector bool                  `json:"used_vector"`
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/code/search", daemonSearchRequest{Root: req.Root, Query: req.Query, Mode: req.Mode, K: req.K}, &wire)
+	err := c.do(ctx, http.MethodPost, "/v1/code/search", daemonSearchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: req.Mode, K: req.K}, &wire)
 	return searchResponse{Hits: wire.Hits, Fresh: wire.Fresh, Generation: wire.Generation, Degraded: wire.Degraded, UsedVector: wire.UsedVector}, err
 }
 
 func (c daemonClient) Get(ctx context.Context, req getRequest) (codeindex.Symbol, error) {
 	var symbol codeindex.Symbol
-	err := c.do(ctx, http.MethodPost, "/v1/code/get", daemonGetRequest{Root: req.Root, Key: req.Key, Body: req.Body}, &symbol)
+	err := c.do(ctx, http.MethodPost, "/v1/code/get", daemonGetRequest{Root: req.Root, DB: req.DB, Key: req.Key, Body: req.Body}, &symbol)
 	return symbol, err
 }
 
 func (c daemonClient) Index(ctx context.Context, req indexRequest) (indexResult, error) {
 	var result indexResult
-	err := c.do(ctx, http.MethodPost, "/v1/code/index", daemonIndexRequest{Root: req.Root, Language: req.Language, Roots: req.Roots}, &result)
+	err := c.do(ctx, http.MethodPost, "/v1/code/index", daemonIndexRequest{Root: req.Root, DB: req.DB, Language: req.Language, Roots: req.Roots}, &result)
 	return result, err
 }
 
 func (c daemonClient) Expand(ctx context.Context, req expandRequest) ([]codeExpandTarget, error) {
 	var targets []codeExpandTarget
-	err := c.do(ctx, http.MethodPost, "/v1/code/expand", daemonExpandRequest{Root: req.Root, Key: req.Key, Relation: req.Relation}, &targets)
+	err := c.do(ctx, http.MethodPost, "/v1/code/expand", daemonExpandRequest{Root: req.Root, DB: req.DB, Key: req.Key, Relation: req.Relation}, &targets)
 	return targets, err
 }
 

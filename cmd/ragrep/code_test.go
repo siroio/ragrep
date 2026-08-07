@@ -598,7 +598,7 @@ func TestCmdCodeSearchDaemonText(t *testing.T) {
 		Path: "pkg/foo.go", StartLine: 4, EndLine: 8, Score: 0.25, FTSRank: 1, VecRank: 2, ExactMatch: true,
 	}
 	client := fakeCodeDaemonClient{search: func(_ context.Context, req searchRequest) (searchResponse, error) {
-		if req.Root != filepath.Clean(root) || req.Query != "Foo" || req.Mode != "text" || req.K != 3 {
+		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Query != "Foo" || req.Mode != "text" || req.K != 3 {
 			t.Fatalf("request=%+v", req)
 		}
 		return searchResponse{Hits: []codestore.SymbolHit{hit}, Fresh: true, Generation: 9, Degraded: "vector_unavailable"}, nil
@@ -713,7 +713,7 @@ func TestCmdCodeGetDaemon(t *testing.T) {
 	db := filepath.Join(root, ".ragrep", "code.db")
 	sym := testSymbol()
 	client := fakeCodeDaemonClient{get: func(_ context.Context, req getRequest) (codeindex.Symbol, error) {
-		if req.Root != filepath.Clean(root) || req.Key != sym.Key || !req.Body {
+		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Key != sym.Key || !req.Body {
 			t.Fatalf("request=%+v", req)
 		}
 		return sym, nil
@@ -762,7 +762,7 @@ func TestCmdCodeIndexDaemonFormatsStructuredResult(t *testing.T) {
 	root := t.TempDir()
 	db := filepath.Join(root, ".ragrep", "code.db")
 	client := fakeCodeDaemonClient{index: func(_ context.Context, req indexRequest) (indexResult, error) {
-		if req.Root != filepath.Clean(root) || req.Language != "go" || !reflect.DeepEqual(req.Roots, []string{"."}) {
+		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Language != "go" || !reflect.DeepEqual(req.Roots, []string{"."}) {
 			t.Fatalf("request=%+v", req)
 		}
 		return indexResult{Indexed: []string{"a.go"}, Scanned: 2, Pruned: []string{"old.go"}}, nil
@@ -787,7 +787,7 @@ func TestCmdCodeExpandDaemonKeepsFormattingLocal(t *testing.T) {
 		{Relation: "references", Path: "missing.go", Line: 2},
 	}
 	client := fakeCodeDaemonClient{expand: func(_ context.Context, req expandRequest) ([]codeExpandTarget, error) {
-		if req.Root != filepath.Clean(root) || req.Key != "target" || req.Relation != "references" {
+		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Key != "target" || req.Relation != "references" {
 			t.Fatalf("request=%+v", req)
 		}
 		return targets, nil
@@ -801,6 +801,166 @@ func TestCmdCodeExpandDaemonKeepsFormattingLocal(t *testing.T) {
 	}
 	if _, err := os.Stat(db); !os.IsNotExist(err) {
 		t.Fatalf("CLI must not create code.db, stat err=%v", err)
+	}
+}
+
+func TestCodeCommandsUseCustomDBThroughWorkspaceRegistry(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "package p\n\nfunc Foo() {\n\n}\n"
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	docServer := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-custom-db-index", fakeLSPServerDocumentSymbolSrc)
+	writeRagrepConfig(t, root, `{"servers":{"go":"`+filepath.ToSlash(docServer)+`"}}`)
+
+	registry, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := newCodeServiceForDB(registry.ResolveCode, newEmbeddingPool(func() (textEmbedder, error) {
+		return new(serviceTestEmbedder), nil
+	}), nil)
+	server := httptest.NewServer(newDaemonServerHandler(svc, "test-token", registry, nil))
+	injectCodeDaemonClient(t, daemonClient{endpoint: server.URL, token: "test-token", client: server.Client()})
+	t.Cleanup(func() {
+		server.Close()
+		_ = svc.Close()
+		_ = registry.Close()
+	})
+
+	customDB := filepath.Join(root, "custom-code.db")
+	code, _, stderr := captureCodeCommand(t, []string{"code", "index", "--db", customDB, "--language", "go", root})
+	if code != 0 || stderr != "" {
+		t.Fatalf("custom index: exit=%d stderr=%q", code, stderr)
+	}
+	if _, err := os.Stat(customDB); err != nil {
+		t.Fatalf("custom DB was not created: %v", err)
+	}
+	defaultDB := filepath.Join(root, ".ragrep", "code.db")
+	if _, err := os.Stat(defaultDB); !os.IsNotExist(err) {
+		t.Fatalf("default DB must remain untouched, stat err=%v", err)
+	}
+
+	store, err := codestore.Open(customDB, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := store.FindByQualifiedName("Foo", "a.go")
+	_ = store.Close()
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("custom DB matches=%v err=%v", matches, err)
+	}
+	key := matches[0].Key
+
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "search", "--db", customDB, "Foo"})
+	if code != 0 || !strings.Contains(stdout, key) || stderr != "" {
+		t.Fatalf("custom search: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	code, stdout, stderr = captureCodeCommand(t, []string{"code", "get", "--db", customDB, "--symbol", key})
+	if code != 0 || !strings.Contains(stdout, key) || stderr != "" {
+		t.Fatalf("custom get: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	emptyServer := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-custom-db-expand", fakeLSPServerAllCapsEmptySrc)
+	writeRagrepConfig(t, root, `{"servers":{"go":"`+filepath.ToSlash(emptyServer)+`"}}`)
+	_ = svc.lsps.Close()
+	svc.lsps = newLSPPool(time.Hour, nil)
+	code, stdout, stderr = captureCodeCommand(t, []string{"code", "expand", "--db", customDB, "--symbol", key, "--relation", "references"})
+	if code != 2 || stdout != "" || stderr != "no results\n" {
+		t.Fatalf("custom expand: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestWorkspaceRegistryCustomDBLeaseControlsIdleEviction(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRagrepConfig(t, root, `{}`)
+	registry, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), 30*time.Millisecond, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = registry.Close() })
+	customDB := filepath.Join(root, "custom-code.db")
+	_, canonicalDB, _, err := codeWorkspacePaths(root, customDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := codeWorkspaceKey{root: root, db: canonicalDB}
+
+	release, err := registry.AcquireCode(root, customDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	registry.mu.Lock()
+	retainedWhileLeased := registry.codeEntries[key] != nil
+	persistentEntries := len(registry.entries)
+	registry.mu.Unlock()
+	if !retainedWhileLeased || persistentEntries != 0 {
+		t.Fatalf("retained while leased=%v persistent entries=%d", retainedWhileLeased, persistentEntries)
+	}
+	release()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		registry.mu.Lock()
+		_, exists := registry.codeEntries[key]
+		registry.mu.Unlock()
+		if !exists {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("custom DB entry was not evicted after lease release")
+}
+
+func TestWorkspaceRegistrySeparatesCustomDBsAndClosesActiveLeases(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRagrepConfig(t, root, `{}`)
+	registry, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbA := filepath.Join(root, "a-code.db")
+	dbB := filepath.Join(root, "b-code.db")
+	releaseA, err := registry.AcquireCode(root, dbA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseB, err := registry.AcquireCode(root, dbB)
+	if err != nil {
+		releaseA()
+		t.Fatal(err)
+	}
+	stateA, err := registry.ResolveCode(root, dbA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateB, err := registry.ResolveCode(root, dbB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateA == stateB || len(registry.codeEntries) != 2 || len(registry.entries) != 0 {
+		t.Fatalf("stateA==stateB: %v, custom entries=%d persistent entries=%d", stateA == stateB, len(registry.codeEntries), len(registry.entries))
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+	releaseA()
+	releaseB()
+	if len(registry.codeEntries) != 0 {
+		t.Fatalf("custom entries after Close=%d, want 0", len(registry.codeEntries))
+	}
+	if _, err := registry.ResolveCode(root, dbA); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("ResolveCode after Close error=%v, want closed error", err)
 	}
 }
 

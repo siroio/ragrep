@@ -4,16 +4,42 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/siroio/ragrep/internal/codeindex"
+	"github.com/siroio/ragrep/internal/codestore"
 )
+
+type cancelAfterErrCalls struct {
+	context.Context
+	after int32
+	calls atomic.Int32
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newCancelAfterErrCalls(after int32) *cancelAfterErrCalls {
+	return &cancelAfterErrCalls{Context: context.Background(), after: after, done: make(chan struct{})}
+}
+
+func (c *cancelAfterErrCalls) Done() <-chan struct{} { return c.done }
+
+func (c *cancelAfterErrCalls) Err() error {
+	if c.calls.Add(1) >= c.after {
+		c.once.Do(func() { close(c.done) })
+		return context.Canceled
+	}
+	return nil
+}
 
 // fakeLSPServerSrc is a standalone (no internal/lsp, no internal/lsp/testdata
 // -- both are off-limits to modify for this task, and testdata's fake server
@@ -201,6 +227,116 @@ func TestCodeServiceIndexPreservesIndexingSemantics(t *testing.T) {
 	paths, err := ws.store.ListPaths()
 	if err != nil || !reflect.DeepEqual(paths, []string{"a.go"}) {
 		t.Fatalf("paths=%v err=%v", paths, err)
+	}
+}
+
+func TestCodeServiceIndexCanceledBeforeStartDoesNotMutate(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	putServiceSymbol(t, ws.store, serviceSymbol("stale.go", "Stale", "func Stale() {}"), "stale-hash")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := svc.Index(ctx, indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Index error=%v, want context.Canceled", err)
+	}
+	if _, err := ws.store.LatestIndexRun(); !errors.Is(err, codestore.ErrNotFound) {
+		t.Fatalf("LatestIndexRun error=%v, want ErrNotFound", err)
+	}
+	paths, err := ws.store.ListPaths()
+	if err != nil || !reflect.DeepEqual(paths, []string{"stale.go"}) {
+		t.Fatalf("paths=%v err=%v", paths, err)
+	}
+}
+
+func TestCodeServiceIndexCanceledDuringDiscoveryDoesNotMutate(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	putServiceSymbol(t, ws.store, serviceSymbol("stale.go", "Stale", "func Stale() {}"), "stale-hash")
+	ws.save(t, "a.go", "package p\n")
+	ws.save(t, "b.go", "package p\n")
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"server-must-not-start"}}`)
+
+	_, err := svc.Index(newCancelAfterErrCalls(4), indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Index error=%v, want context.Canceled", err)
+	}
+	if _, err := ws.store.LatestIndexRun(); !errors.Is(err, codestore.ErrNotFound) {
+		t.Fatalf("LatestIndexRun error=%v, want ErrNotFound", err)
+	}
+	paths, err := ws.store.ListPaths()
+	if err != nil || !reflect.DeepEqual(paths, []string{"stale.go"}) {
+		t.Fatalf("paths=%v err=%v", paths, err)
+	}
+}
+
+func TestCodeServiceIndexCanceledBeforeIndexRunDoesNotMutate(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	ws.save(t, "a.go", "package p\n\nfunc Foo() {}\n")
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-cancel-run", fakeLSPServerDocumentSymbolSrc)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"`+filepath.ToSlash(exe)+`"}}`)
+
+	_, err := svc.Index(newCancelAfterErrCalls(5), indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Index error=%v, want context.Canceled", err)
+	}
+	if _, err := ws.store.LatestIndexRun(); !errors.Is(err, codestore.ErrNotFound) {
+		t.Fatalf("LatestIndexRun error=%v, want ErrNotFound", err)
+	}
+	paths, err := ws.store.ListPaths()
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("paths=%v err=%v, want no upsert", paths, err)
+	}
+}
+
+func TestCodeServiceIndexCanceledBeforeUpsertDoesNotMutateFile(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	putServiceSymbol(t, ws.store, serviceSymbol("stale.go", "Stale", "func Stale() {}"), "stale-hash")
+	ws.save(t, "a.go", "package p\n\nfunc Foo() {\n\n}\n")
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-cancel-upsert", fakeLSPServerDocumentSymbolSrc)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"`+filepath.ToSlash(exe)+`"}}`)
+
+	_, err := svc.Index(newCancelAfterErrCalls(8), indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Index error=%v, want context.Canceled", err)
+	}
+	paths, err := ws.store.ListPaths()
+	if err != nil || !reflect.DeepEqual(paths, []string{"stale.go"}) {
+		t.Fatalf("paths=%v err=%v, want no upsert or prune", paths, err)
+	}
+}
+
+func TestCodeServiceIndexCanceledBeforeDeleteDoesNotPrune(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	putServiceSymbol(t, ws.store, serviceSymbol("stale.go", "Stale", "func Stale() {}"), "stale-hash")
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"server-must-not-start"}}`)
+
+	_, err := svc.Index(newCancelAfterErrCalls(7), indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Index error=%v, want context.Canceled", err)
+	}
+	paths, err := ws.store.ListPaths()
+	if err != nil || !reflect.DeepEqual(paths, []string{"stale.go"}) {
+		t.Fatalf("paths=%v err=%v, want no prune", paths, err)
+	}
+}
+
+func TestCodeServiceIndexLSPErrorDoesNotPrune(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	putServiceSymbol(t, ws.store, serviceSymbol("stale.go", "Stale", "func Stale() {}"), "stale-hash")
+	ws.save(t, "a.go", "package p\n\nfunc Foo() {}\n")
+	src := strings.Replace(fakeLSPServerDocumentSymbolSrc,
+		`case "textDocument/documentSymbol":`,
+		`case "textDocument/documentSymbol":
+			return`, 1)
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-index-error", src)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"`+filepath.ToSlash(exe)+`"}}`)
+
+	if _, err := svc.Index(context.Background(), indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}}); err == nil {
+		t.Fatal("Index error=nil, want LSP failure")
+	}
+	paths, err := ws.store.ListPaths()
+	if err != nil || !reflect.DeepEqual(paths, []string{"stale.go"}) {
+		t.Fatalf("paths=%v err=%v, want no upsert or prune", paths, err)
 	}
 }
 

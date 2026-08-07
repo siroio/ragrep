@@ -120,6 +120,15 @@ func codeDBFlag(fs *flag.FlagSet) *string {
 	return fs.String("db", defaultCodeDBPath(), "code index database path")
 }
 
+func codeRequestPaths(db string) (root, canonicalDB string, err error) {
+	root, err = workspaceRoot(db)
+	if err != nil {
+		return "", "", err
+	}
+	canonicalDB, err = filepath.Abs(db)
+	return root, filepath.Clean(canonicalDB), err
+}
+
 func openCodeStoreAt(dbPath string) (*codestore.Store, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, err
@@ -175,8 +184,18 @@ func isGeneratedGoFile(path string) bool {
 // are included -- both are needed for later relation extraction
 // (tests-relation).
 func discoverCodeFiles(root, ext string) ([]string, error) {
+	return discoverCodeFilesContext(context.Background(), root, ext)
+}
+
+func discoverCodeFilesContext(ctx context.Context, root, ext string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var files []string
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			return err
 		}
@@ -304,7 +323,7 @@ func cmdCodeIndex(args []string) int {
 	if _, ok := codeLangExt[*language]; !ok {
 		return fail(fmt.Errorf("unsupported --language %q (supported: go)", *language))
 	}
-	wsRoot, err := workspaceRoot(*db)
+	wsRoot, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
 		return fail(err)
 	}
@@ -320,7 +339,7 @@ func cmdCodeIndex(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	result, err := client.Index(context.Background(), indexRequest{Root: wsRoot, Language: *language, Roots: relRoots})
+	result, err := client.Index(context.Background(), indexRequest{Root: wsRoot, DB: dbPath, Language: *language, Roots: relRoots})
 	if err != nil {
 		return codeDaemonError(err)
 	}
@@ -350,14 +369,27 @@ func pruneCodeSymbols(s *codestore.Store, relRoots []string, seen map[string]boo
 }
 
 func pruneCodeSymbolPaths(s *codestore.Store, relRoots []string, seen map[string]bool) ([]string, error) {
+	return pruneCodeSymbolPathsContext(context.Background(), s, relRoots, seen)
+}
+
+func pruneCodeSymbolPathsContext(ctx context.Context, s *codestore.Store, relRoots []string, seen map[string]bool) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	allPaths, err := s.ListPaths()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	var pruned []string
 	for _, p := range allPaths {
 		if seen[p] || !pathUnderAnyRoot(p, relRoots) {
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return pruned, err
 		}
 		if err := s.DeleteSymbolsForPath(p); err != nil {
 			return pruned, err
@@ -416,7 +448,7 @@ func cmdCodeSearch(args []string) int {
 	}
 	query := fs.Arg(0)
 
-	root, err := workspaceRoot(*db)
+	root, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
 		return fail(err)
 	}
@@ -424,7 +456,7 @@ func cmdCodeSearch(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	resp, err := client.Search(context.Background(), searchRequest{Root: root, Query: query, Mode: *mode, K: *k})
+	resp, err := client.Search(context.Background(), searchRequest{Root: root, DB: dbPath, Query: query, Mode: *mode, K: *k})
 	if err != nil {
 		return codeDaemonError(err)
 	}
@@ -527,7 +559,7 @@ func cmdCodeGet(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep code get --symbol <stable-key> [--body] [--json]"))
 	}
 
-	root, err := workspaceRoot(*db)
+	root, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
 		return fail(err)
 	}
@@ -535,7 +567,7 @@ func cmdCodeGet(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	sym, err := client.Get(context.Background(), getRequest{Root: root, Key: *symbolKey, Body: *body})
+	sym, err := client.Get(context.Background(), getRequest{Root: root, DB: dbPath, Key: *symbolKey, Body: *body})
 	if err != nil {
 		return codeDaemonError(err)
 	}
@@ -790,7 +822,7 @@ func cmdCodeExpand(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep code expand --symbol <stable-key> --relation definition|references|callers|callees|tests [--json]"))
 	}
 
-	wsRoot, err := workspaceRoot(*db)
+	wsRoot, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
 		return fail(err)
 	}
@@ -798,7 +830,7 @@ func cmdCodeExpand(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	targets, err := client.Expand(context.Background(), expandRequest{Root: wsRoot, Key: *symbolKey, Relation: *relation})
+	targets, err := client.Expand(context.Background(), expandRequest{Root: wsRoot, DB: dbPath, Key: *symbolKey, Relation: *relation})
 	if err != nil {
 		return codeDaemonError(err)
 	}

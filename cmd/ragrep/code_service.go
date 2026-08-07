@@ -20,8 +20,8 @@ import (
 var ErrStaleLiveKey = errors.New("stale_live_key")
 
 type searchRequest struct {
-	Root, Query, Mode string
-	K                 int
+	Root, DB, Query, Mode string
+	K                     int
 }
 
 type searchResponse struct {
@@ -33,13 +33,13 @@ type searchResponse struct {
 }
 
 type getRequest struct {
-	Root, Key string
-	Body      bool
+	Root, DB, Key string
+	Body          bool
 }
 
 type indexRequest struct {
-	Root, Language string
-	Roots          []string
+	Root, DB, Language string
+	Roots              []string
 }
 
 type indexResult struct {
@@ -49,7 +49,7 @@ type indexResult struct {
 }
 
 type expandRequest struct {
-	Root, Key, Relation string
+	Root, DB, Key, Relation string
 }
 
 type codeExpandUnsupportedError struct{ Server string }
@@ -59,9 +59,10 @@ func (e *codeExpandUnsupportedError) Error() string {
 }
 
 type workspaceResolver func(root string) (*workspaceState, error)
+type workspaceDBResolver func(root, db string) (*workspaceState, error)
 
 type codeService struct {
-	resolve    workspaceResolver
+	resolve    workspaceDBResolver
 	embeddings *embeddingPool
 	lsps       *lspPool
 	closeOnce  sync.Once
@@ -69,6 +70,14 @@ type codeService struct {
 }
 
 func newCodeService(resolve workspaceResolver, embeddings *embeddingPool, lsps *lspPool) *codeService {
+	var resolveDB workspaceDBResolver
+	if resolve != nil {
+		resolveDB = func(root, _ string) (*workspaceState, error) { return resolve(root) }
+	}
+	return newCodeServiceForDB(resolveDB, embeddings, lsps)
+}
+
+func newCodeServiceForDB(resolve workspaceDBResolver, embeddings *embeddingPool, lsps *lspPool) *codeService {
 	if embeddings == nil {
 		embeddings = newEmbeddingPool(nil)
 	}
@@ -79,12 +88,12 @@ func newCodeService(resolve workspaceResolver, embeddings *embeddingPool, lsps *
 }
 
 func (s *codeService) Search(ctx context.Context, req searchRequest) (searchResponse, error) {
-	ws, err := s.workspace(req.Root)
+	ws, err := s.workspace(req.Root, req.DB)
 	if err != nil {
 		return searchResponse{}, err
 	}
 	ws.setConfirmation(func(path, hash string) {
-		_ = s.ConfirmPath(context.Background(), ws.root, path, hash)
+		_ = s.confirmPathAtDB(context.Background(), ws.root, req.DB, path, hash)
 	})
 	barrierCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
@@ -161,7 +170,7 @@ func (s *codeService) Search(ctx context.Context, req searchRequest) (searchResp
 }
 
 func (s *codeService) Get(_ context.Context, req getRequest) (codeindex.Symbol, error) {
-	ws, err := s.workspace(req.Root)
+	ws, err := s.workspace(req.Root, req.DB)
 	if err != nil {
 		return codeindex.Symbol{}, err
 	}
@@ -184,7 +193,10 @@ func (s *codeService) Get(_ context.Context, req getRequest) (codeindex.Symbol, 
 }
 
 func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult, error) {
-	ws, err := s.workspace(req.Root)
+	if err := ctx.Err(); err != nil {
+		return indexResult{}, err
+	}
+	ws, err := s.workspace(req.Root, req.DB)
 	if err != nil {
 		return indexResult{}, err
 	}
@@ -203,7 +215,7 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 
 	var files []string
 	for _, root := range req.Roots {
-		found, err := discoverCodeFiles(filepath.Join(ws.root, filepath.FromSlash(root)), ext)
+		found, err := discoverCodeFilesContext(ctx, filepath.Join(ws.root, filepath.FromSlash(root)), ext)
 		if err != nil {
 			return indexResult{}, err
 		}
@@ -211,7 +223,10 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 	}
 	result := indexResult{Scanned: len(files)}
 	if len(files) == 0 {
-		result.Pruned, err = pruneCodeSymbolPaths(ws.store, req.Roots, nil)
+		if err := ctx.Err(); err != nil {
+			return indexResult{}, err
+		}
+		result.Pruned, err = pruneCodeSymbolPathsContext(ctx, ws.store, req.Roots, nil)
 		return result, err
 	}
 
@@ -222,6 +237,9 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 	defer release()
 	if !client.Supports(lsp.FeatureDocumentSymbol) {
 		return indexResult{}, fmt.Errorf("language server %q does not support textDocument/documentSymbol (required relation: document symbols for indexing)", serverCmd)
+	}
+	if err := ctx.Err(); err != nil {
+		return indexResult{}, err
 	}
 	runID, err := ws.store.RecordIndexRun("index:"+strings.Join(req.Roots, ","), gitRevision(ws.root), req.Language, serverName, serverVersion, codeModelID, time.Now())
 	if err != nil {
@@ -249,6 +267,9 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 		if err != nil {
 			return indexResult{}, err
 		}
+		if err := ctx.Err(); err != nil {
+			return indexResult{}, err
+		}
 		changed, err := ws.store.UpsertSymbols(rel, codeindex.FileHash(content), symbols, runID, func(text string) ([]float32, error) {
 			return s.embeddings.Embed(ctx, text)
 		})
@@ -259,7 +280,10 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 			result.Indexed = append(result.Indexed, rel)
 		}
 	}
-	result.Pruned, err = pruneCodeSymbolPaths(ws.store, req.Roots, seen)
+	if err := ctx.Err(); err != nil {
+		return indexResult{}, err
+	}
+	result.Pruned, err = pruneCodeSymbolPathsContext(ctx, ws.store, req.Roots, seen)
 	return result, err
 }
 
@@ -268,7 +292,7 @@ func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 	if !ok {
 		return nil, fmt.Errorf("unsupported relation %q", req.Relation)
 	}
-	ws, err := s.workspace(req.Root)
+	ws, err := s.workspace(req.Root, req.DB)
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +393,11 @@ func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 }
 
 func (s *codeService) ConfirmPath(ctx context.Context, root, path, expectedHash string) error {
-	ws, err := s.workspace(root)
+	return s.confirmPathAtDB(ctx, root, "", path, expectedHash)
+}
+
+func (s *codeService) confirmPathAtDB(ctx context.Context, root, db, path, expectedHash string) error {
+	ws, err := s.workspace(root, db)
 	if err != nil {
 		return err
 	}
@@ -416,11 +444,11 @@ func (s *codeService) ConfirmPath(ctx context.Context, root, path, expectedHash 
 	return err
 }
 
-func (s *codeService) workspace(root string) (*workspaceState, error) {
+func (s *codeService) workspace(root, db string) (*workspaceState, error) {
 	if s.resolve == nil {
 		return nil, errors.New("workspace resolver is nil")
 	}
-	return s.resolve(root)
+	return s.resolve(root, db)
 }
 
 func (s *codeService) Close() error {

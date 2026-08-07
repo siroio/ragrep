@@ -127,12 +127,17 @@ type workspaceRegistryEntry struct {
 	removing bool
 }
 
+type codeWorkspaceKey struct {
+	root, db string
+}
+
 type workspaceRegistry struct {
 	mu             sync.Mutex
 	file           string
 	idle           time.Duration
 	open           workspaceOpener
 	entries        map[string]*workspaceRegistryEntry
+	codeEntries    map[codeWorkspaceKey]*workspaceRegistryEntry
 	closed         bool
 	restore        sync.WaitGroup
 	restoreTimeout time.Duration
@@ -154,6 +159,7 @@ func newWorkspaceRegistry(file string, idle time.Duration, opener workspaceOpene
 		idle:           idle,
 		open:           opener,
 		entries:        make(map[string]*workspaceRegistryEntry),
+		codeEntries:    make(map[codeWorkspaceKey]*workspaceRegistryEntry),
 		restoreTimeout: workspaceRestoreCloseTimeout,
 	}
 	data, err := os.ReadFile(file)
@@ -391,6 +397,37 @@ func (r *workspaceRegistry) Resolve(path string) (*workspaceState, error) {
 	return entry.state, nil
 }
 
+func (r *workspaceRegistry) ResolveCode(path, db string) (*workspaceState, error) {
+	root, db, isDefault, err := codeWorkspacePaths(path, db)
+	if err != nil {
+		return nil, err
+	}
+	if isDefault {
+		return r.Resolve(root)
+	}
+	key := codeWorkspaceKey{root: root, db: db}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, errors.New("workspace registry is closed")
+	}
+	entry := r.codeEntries[key]
+	if entry == nil {
+		entry = &workspaceRegistryEntry{}
+		r.codeEntries[key] = entry
+	}
+	if entry.state == nil {
+		state, err := openDaemonWorkspaceAt(root, db)
+		if err != nil {
+			delete(r.codeEntries, key)
+			return nil, err
+		}
+		entry.state = state
+	}
+	r.scheduleCodeEvictionLocked(key, entry)
+	return entry.state, nil
+}
+
 func (r *workspaceRegistry) Acquire(path string) (func(), error) {
 	root, err := canonicalWorkspaceRoot(path)
 	if err != nil {
@@ -451,6 +488,87 @@ func (r *workspaceRegistry) Acquire(path string) (func(), error) {
 	}, nil
 }
 
+func (r *workspaceRegistry) AcquireCode(path, db string) (func(), error) {
+	root, db, isDefault, err := codeWorkspacePaths(path, db)
+	if err != nil {
+		return nil, err
+	}
+	if isDefault {
+		return r.Acquire(root)
+	}
+	key := codeWorkspaceKey{root: root, db: db}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errors.New("workspace registry is closed")
+	}
+	entry := r.codeEntries[key]
+	if entry == nil {
+		entry = &workspaceRegistryEntry{}
+		r.codeEntries[key] = entry
+	}
+	if entry.state == nil {
+		state, err := openDaemonWorkspaceAt(root, db)
+		if err != nil {
+			delete(r.codeEntries, key)
+			r.mu.Unlock()
+			return nil, err
+		}
+		entry.state = state
+	}
+	entry.leases++
+	entry.epoch++
+	if entry.timer != nil {
+		entry.timer.Stop()
+		entry.timer = nil
+	}
+	r.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if r.codeEntries[key] == entry && entry.leases > 0 {
+				entry.leases--
+				r.scheduleCodeEvictionLocked(key, entry)
+			}
+			r.mu.Unlock()
+		})
+	}, nil
+}
+
+func codeWorkspacePaths(path, db string) (root, canonicalDB string, isDefault bool, err error) {
+	root, err = canonicalWorkspaceRoot(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			err = ErrWorkspaceNotFound
+		}
+		return
+	}
+	cfg, err := config.Load(root)
+	if err != nil {
+		return "", "", false, err
+	}
+	defaultDB := filepath.FromSlash(cfg.CodeDB)
+	if !filepath.IsAbs(defaultDB) {
+		defaultDB = filepath.Join(root, defaultDB)
+	}
+	defaultDB, err = filepath.Abs(defaultDB)
+	if err != nil {
+		return "", "", false, err
+	}
+	if db == "" {
+		db = defaultDB
+	} else if !filepath.IsAbs(db) {
+		db = filepath.Join(root, db)
+	}
+	canonicalDB, err = filepath.Abs(db)
+	if err != nil {
+		return "", "", false, err
+	}
+	canonicalDB = filepath.Clean(canonicalDB)
+	return root, canonicalDB, canonicalDB == filepath.Clean(defaultDB), nil
+}
+
 func (r *workspaceRegistry) scheduleEvictionLocked(root string, entry *workspaceRegistryEntry) {
 	if entry.explicit || entry.leases > 0 || entry.removing {
 		return
@@ -461,6 +579,29 @@ func (r *workspaceRegistry) scheduleEvictionLocked(root string, entry *workspace
 	entry.epoch++
 	epoch := entry.epoch
 	entry.timer = time.AfterFunc(r.idle, func() { r.evict(root, entry, epoch) })
+}
+
+func (r *workspaceRegistry) scheduleCodeEvictionLocked(key codeWorkspaceKey, entry *workspaceRegistryEntry) {
+	if entry.leases > 0 {
+		return
+	}
+	if entry.timer != nil {
+		entry.timer.Stop()
+	}
+	entry.epoch++
+	epoch := entry.epoch
+	entry.timer = time.AfterFunc(r.idle, func() { r.evictCode(key, entry, epoch) })
+}
+
+func (r *workspaceRegistry) evictCode(key codeWorkspaceKey, entry *workspaceRegistryEntry, epoch uint64) {
+	r.mu.Lock()
+	if r.codeEntries[key] != entry || entry.leases > 0 || entry.epoch != epoch || r.closed {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.codeEntries, key)
+	r.mu.Unlock()
+	_ = closeWorkspaceEntry(entry)
 }
 
 func (r *workspaceRegistry) evict(root string, entry *workspaceRegistryEntry, epoch uint64) {
@@ -528,9 +669,17 @@ func (r *workspaceRegistry) Close() error {
 	r.closed = true
 	entries := r.entries
 	r.entries = make(map[string]*workspaceRegistryEntry)
+	codeEntries := r.codeEntries
+	r.codeEntries = make(map[codeWorkspaceKey]*workspaceRegistryEntry)
 	r.mu.Unlock()
 	var errs []error
 	for _, entry := range entries {
+		if entry.timer != nil {
+			entry.timer.Stop()
+		}
+		errs = append(errs, closeWorkspaceEntry(entry))
+	}
+	for _, entry := range codeEntries {
 		if entry.timer != nil {
 			entry.timer.Stop()
 		}
@@ -574,7 +723,11 @@ func openDaemonWorkspace(root string) (*workspaceState, error) {
 	if err != nil {
 		return nil, err
 	}
-	store, err := openCodeStoreAt(filepath.Join(root, filepath.FromSlash(cfg.CodeDB)))
+	return openDaemonWorkspaceAt(root, filepath.Join(root, filepath.FromSlash(cfg.CodeDB)))
+}
+
+func openDaemonWorkspaceAt(root, db string) (*workspaceState, error) {
+	store, err := openCodeStoreAt(db)
 	if err != nil {
 		return nil, err
 	}
@@ -765,7 +918,7 @@ func serveDaemon() error {
 		listener.Close()
 		return err
 	}
-	service := newCodeService(registry.Resolve, nil, nil)
+	service := newCodeServiceForDB(registry.ResolveCode, nil, nil)
 	cleanupPath := ""
 	defer func() { cleanupDaemon(cleanupPath, listener, service, registry) }()
 	token, err := newDaemonToken()
