@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/asg017/sqlite-vec-go-bindings v0.1.6
 	github.com/eliben/go-sentencepiece v0.7.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/ncruces/go-sqlite3 v0.19.0
 	github.com/yalue/onnxruntime_go v1.27.0
 )

@@ -1,0 +1,198 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/siroio/ragrep/internal/codestore"
+)
+
+type testWorkspace struct {
+	*workspaceState
+	root  string
+	store *codestore.Store
+	gen   uint64
+}
+
+func newTestWorkspace(t *testing.T, body string) *testWorkspace {
+	t.Helper()
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWorkspaceFile(t, root, "service.go", body)
+	store, err := codestore.Open(filepath.Join(t.TempDir(), "code.db"), "test-model", codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := newWorkspaceState(root, store, []string{"."}, "go")
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	w := &testWorkspace{workspaceState: state, root: root, store: store}
+	t.Cleanup(func() {
+		w.Close()
+		store.Close()
+	})
+	w.gen = barrierGeneration(t, w.workspaceState)
+	return w
+}
+
+func writeWorkspaceFile(t *testing.T, root, rel, body string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func barrierGeneration(t *testing.T, w *workspaceState) uint64 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	gen, err := w.Barrier(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gen
+}
+
+func TestWorkspaceBarrierSeesSaveBeforeWatcherDelivery(t *testing.T) {
+	w := newTestWorkspace(t, "func OldName() {}")
+	writeWorkspaceFile(t, w.root, "service.go", "func NewName() {}")
+	gen := barrierGeneration(t, w.workspaceState)
+	if gen != w.gen+1 {
+		t.Fatalf("generation=%d, want %d", gen, w.gen+1)
+	}
+	hits, err := w.store.SearchLiveText("NewName", 5)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+}
+
+func TestWorkspaceGenerationChangesOnlyWithVisibleContent(t *testing.T) {
+	w := newTestWorkspace(t, "func StableName() {}")
+	if w.gen == 0 {
+		t.Fatal("initial generation=0")
+	}
+	if got := barrierGeneration(t, w.workspaceState); got != w.gen {
+		t.Fatalf("unchanged generation=%d, want %d", got, w.gen)
+	}
+}
+
+func TestWorkspaceBarrierSeesAddedFile(t *testing.T) {
+	w := newTestWorkspace(t, "func ExistingName() {}")
+	writeWorkspaceFile(t, w.root, "added.go", "func AddedName() {}")
+	if got := barrierGeneration(t, w.workspaceState); got != w.gen+1 {
+		t.Fatalf("generation=%d, want %d", got, w.gen+1)
+	}
+	hits, err := w.store.SearchLiveText("AddedName", 5)
+	if err != nil || len(hits) != 1 || hits[0].Path != "added.go" {
+		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+}
+
+func TestWorkspaceBarrierSeesDeletedFile(t *testing.T) {
+	w := newTestWorkspace(t, "func DeletedName() {}")
+	if err := os.Remove(filepath.Join(w.root, "service.go")); err != nil {
+		t.Fatal(err)
+	}
+	if got := barrierGeneration(t, w.workspaceState); got != w.gen+1 {
+		t.Fatalf("generation=%d, want %d", got, w.gen+1)
+	}
+	hits, err := w.store.SearchLiveText("DeletedName", 5)
+	if err != nil || len(hits) != 0 {
+		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+	states, err := w.store.ListFileStates()
+	if err != nil || len(states) != 1 || states[0].Path != "service.go" || !states[0].Deleted {
+		t.Fatalf("states=%v err=%v", states, err)
+	}
+}
+
+func TestWorkspaceBarrierSeesRenamedFileInOneGeneration(t *testing.T) {
+	w := newTestWorkspace(t, "func RenamedName() {}")
+	if err := os.Rename(filepath.Join(w.root, "service.go"), filepath.Join(w.root, "renamed.go")); err != nil {
+		t.Fatal(err)
+	}
+	gen := barrierGeneration(t, w.workspaceState)
+	if gen != w.gen+1 {
+		t.Fatalf("generation=%d, want %d", gen, w.gen+1)
+	}
+	hits, err := w.store.SearchLiveText("RenamedName", 5)
+	if err != nil || len(hits) != 1 || hits[0].Path != "renamed.go" || hits[0].Generation != gen {
+		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+	states, err := w.store.ListFileStates()
+	if err != nil || len(states) != 2 || states[0].Path != "renamed.go" || states[0].Deleted || states[1].Path != "service.go" || !states[1].Deleted {
+		t.Fatalf("states=%v err=%v", states, err)
+	}
+}
+
+func TestWorkspaceStatesAreIsolated(t *testing.T) {
+	first := newTestWorkspace(t, "func SharedName() {}")
+	second := newTestWorkspace(t, "func SharedName() {}")
+	writeWorkspaceFile(t, first.root, "service.go", "func ChangedName() {}")
+	if got := barrierGeneration(t, first.workspaceState); got != first.gen+1 {
+		t.Fatalf("first generation=%d, want %d", got, first.gen+1)
+	}
+	if got := barrierGeneration(t, second.workspaceState); got != second.gen {
+		t.Fatalf("second generation=%d, want %d", got, second.gen)
+	}
+	hits, err := second.store.SearchLiveText("SharedName", 5)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("second hits=%v err=%v", hits, err)
+	}
+}
+
+func TestWorkspaceBarrierTimeoutDoesNotCancelRefresh(t *testing.T) {
+	w := newTestWorkspace(t, "func OldName() {}")
+	writeWorkspaceFile(t, w.root, "service.go", "func FreshName() {}")
+	unblock := make(chan struct{})
+	original := w.enumerate
+	w.enumerate = func(root, ext string) ([]string, error) {
+		<-unblock
+		return original(root, ext)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := w.Barrier(ctx); !errors.Is(err, ErrWorkspaceSyncing) {
+		t.Fatalf("Barrier timeout err=%v, want ErrWorkspaceSyncing", err)
+	}
+	close(unblock)
+	if got := barrierGeneration(t, w.workspaceState); got != w.gen+1 {
+		t.Fatalf("generation=%d, want %d", got, w.gen+1)
+	}
+	hits, err := w.store.SearchLiveText("FreshName", 5)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+}
+
+func TestWorkspaceWatcherRefreshesSavedPath(t *testing.T) {
+	w := newTestWorkspace(t, "func BeforeWatch() {}")
+	if err := w.StartWatcher(); err != nil {
+		t.Fatal(err)
+	}
+	writeWorkspaceFile(t, w.root, "service.go", "func AfterWatch() {}")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		hits, err := w.store.SearchLiveText("AfterWatch", 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) == 1 && hits[0].Generation == w.gen+1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("watcher did not refresh saved path")
+}
