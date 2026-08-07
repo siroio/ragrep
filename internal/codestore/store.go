@@ -21,7 +21,7 @@ import (
 
 // schemaVersion is stamped into PRAGMA user_version on creation. There is no
 // migration path across versions: bump this and require re-index instead.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // ErrReindexRequired is returned by Open when an existing code.db's schema
 // version or embedding model/dimension no longer matches what the caller
@@ -78,6 +78,22 @@ CREATE VIRTUAL TABLE symbol_fts USING fts5(
 
 CREATE VIRTUAL TABLE symbol_vec USING vec0(
     embedding float[%d]
+);
+
+CREATE TABLE live_files (
+    path TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    body TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    deleted INTEGER NOT NULL
+);
+
+CREATE VIRTUAL TABLE live_fts USING fts5(
+    path,
+    body,
+    content='live_files',
+    content_rowid='rowid',
+    tokenize='trigram'
 );
 
 CREATE TABLE symbol_edges (

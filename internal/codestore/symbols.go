@@ -3,9 +3,13 @@ package codestore
 import (
 	"database/sql"
 	"errors"
+	"path"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/ncruces"
 
@@ -14,6 +18,27 @@ import (
 
 // ErrNotFound is returned by GetSymbol when key isn't indexed.
 var ErrNotFound = errors.New("symbol not found")
+
+// ErrStaleLiveKey is returned when a live search key no longer names the
+// current unsaved version of its file.
+var ErrStaleLiveKey = errors.New("stale live file key")
+
+// LiveFile is the current unsaved state of one path.
+type LiveFile struct {
+	Key        string
+	Path       string
+	Hash       string
+	Body       string
+	Generation uint64
+	Deleted    bool
+}
+
+// FileState is the live overlay state used to reconcile files after save.
+type FileState struct {
+	Path    string
+	Hash    string
+	Deleted bool
+}
 
 // EmbedFunc mirrors internal/store's EmbedFunc (same shape, separate type
 // since the two packages don't import each other) so a caller can point one
@@ -34,10 +59,13 @@ type SymbolHit struct {
 	EndLine       int    `json:"end_line"`
 
 	// Score breakdown.
-	FTSRank    int     `json:"fts_rank,omitempty"` // 1-based rank in the FTS list, 0 if absent
-	VecRank    int     `json:"vec_rank,omitempty"` // 1-based rank in the vector list, 0 if absent
-	ExactMatch bool    `json:"exact_match,omitempty"`
-	Score      float64 `json:"score"`
+	FTSRank     int     `json:"fts_rank,omitempty"` // 1-based rank in the FTS list, 0 if absent
+	VecRank     int     `json:"vec_rank,omitempty"` // 1-based rank in the vector list, 0 if absent
+	ExactMatch  bool    `json:"exact_match,omitempty"`
+	Score       float64 `json:"score"`
+	Live        bool    `json:"live,omitempty"`
+	Generation  uint64  `json:"generation,omitempty"`
+	ContentHash string  `json:"content_hash,omitempty"`
 }
 
 // existingSymbolRow is one row already stored for a file, fetched before a
@@ -275,6 +303,117 @@ func (s *Store) ListPaths() ([]string, error) {
 	return paths, rows.Err()
 }
 
+// PutLiveFile stores the current unsaved content for path, suppressing its
+// durable symbols until the live state is removed after a matching save.
+func (s *Store) PutLiveFile(filePath, hash, body string, generation uint64) error {
+	return s.putLiveFile(LiveFile{
+		Path: filePath, Hash: hash, Body: body, Generation: generation,
+	})
+}
+
+// PutLiveDeletion stores a tombstone for a deleted unsaved path. Tombstones
+// have no FTS row, but still suppress durable symbols for their path.
+func (s *Store) PutLiveDeletion(filePath, previousHash string, generation uint64) error {
+	return s.putLiveFile(LiveFile{
+		Path: filePath, Hash: previousHash, Generation: generation, Deleted: true,
+	})
+}
+
+func (s *Store) putLiveFile(file LiveFile) error {
+	file.Path = filepath.ToSlash(file.Path)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var rowID int64
+	var oldPath, oldBody string
+	var oldDeleted bool
+	err = tx.QueryRow(`SELECT rowid, path, body, deleted FROM live_files WHERE path=?`, file.Path).Scan(&rowID, &oldPath, &oldBody, &oldDeleted)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if err == nil && !oldDeleted {
+		if _, err := tx.Exec(`INSERT INTO live_fts(live_fts, rowid, path, body) VALUES('delete', ?, ?, ?)`, rowID, oldPath, oldBody); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO live_files(path, hash, body, generation, deleted) VALUES(?,?,?,?,?)
+		ON CONFLICT(path) DO UPDATE SET hash=excluded.hash, body=excluded.body, generation=excluded.generation, deleted=excluded.deleted`,
+		file.Path, file.Hash, file.Body, file.Generation, file.Deleted); err != nil {
+		return err
+	}
+	if file.Deleted {
+		return tx.Commit()
+	}
+	if err := tx.QueryRow(`SELECT rowid FROM live_files WHERE path=?`, file.Path).Scan(&rowID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO live_fts(rowid, path, body) VALUES(?,?,?)`, rowID, file.Path, file.Body); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RemoveLiveFileIfHash removes a live overlay only if it still describes the
+// content identified by expectedHash.
+func (s *Store) RemoveLiveFileIfHash(filePath, expectedHash string) (bool, error) {
+	filePath = filepath.ToSlash(filePath)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var rowID int64
+	var storedPath, hash, body string
+	var deleted bool
+	err = tx.QueryRow(`SELECT rowid, path, hash, body, deleted FROM live_files WHERE path=?`, filePath).Scan(&rowID, &storedPath, &hash, &body, &deleted)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if hash != expectedHash {
+		return false, nil
+	}
+	if !deleted {
+		if _, err := tx.Exec(`INSERT INTO live_fts(live_fts, rowid, path, body) VALUES('delete', ?, ?, ?)`, rowID, storedPath, body); err != nil {
+			return false, err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM live_files WHERE rowid=?`, rowID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ListFileStates returns the live overlay state for every dirty path.
+func (s *Store) ListFileStates() ([]FileState, error) {
+	rows, err := s.db.Query(`SELECT path, hash, deleted FROM live_files ORDER BY path`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var states []FileState
+	for rows.Next() {
+		var state FileState
+		if err := rows.Scan(&state.Path, &state.Hash, &state.Deleted); err != nil {
+			return nil, err
+		}
+		states = append(states, state)
+	}
+	return states, rows.Err()
+}
+
 // DeleteSymbolsForPath removes every symbol stored for path -- each one's
 // symbols row, FTS entry, vec row, and any symbol_edges row it originates
 // (see deleteSymbolRow) -- in one transaction. A no-op, not an error, when
@@ -326,6 +465,26 @@ func (s *Store) GetSymbol(key string) (codeindex.Symbol, error) {
 	}
 	sym.EmbeddingText = codeindex.RenderEmbeddingText(sym)
 	return sym, nil
+}
+
+// GetLiveFile returns the current unsaved file for a provisional live key.
+func (s *Store) GetLiveFile(key string) (codeindex.Symbol, error) {
+	generation, hash, filePath, ok := parseLiveKey(key)
+	if !ok {
+		return codeindex.Symbol{}, ErrStaleLiveKey
+	}
+
+	var file LiveFile
+	err := s.db.QueryRow(`SELECT path, hash, body, generation, deleted FROM live_files WHERE path=?`, filePath).Scan(
+		&file.Path, &file.Hash, &file.Body, &file.Generation, &file.Deleted)
+	if err == sql.ErrNoRows || err == nil && (file.Deleted || file.Generation != generation || file.Hash != hash) {
+		return codeindex.Symbol{}, ErrStaleLiveKey
+	}
+	if err != nil {
+		return codeindex.Symbol{}, err
+	}
+	file.Key = key
+	return liveSymbol(file), nil
 }
 
 // ReplaceRelations replaces fromKey's edges of exactly the given kinds:
@@ -563,9 +722,104 @@ func ftsQuery(query string) string {
 	return strings.Join(words, " OR ")
 }
 
+// SearchLiveText finds current unsaved file content. Its hits describe the
+// whole file because no LSP symbol range exists for this provisional state.
+func (s *Store) SearchLiveText(query string, k int) ([]SymbolHit, error) {
+	rows, err := s.db.Query(`
+		SELECT lf.path, lf.hash, lf.body, lf.generation
+		FROM live_fts
+		JOIN live_files lf ON lf.rowid=live_fts.rowid
+		WHERE live_fts MATCH ? AND NOT lf.deleted
+		ORDER BY bm25(live_fts) LIMIT ?`, ftsQuery(query), k)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hits []SymbolHit
+	for rows.Next() {
+		var file LiveFile
+		if err := rows.Scan(&file.Path, &file.Hash, &file.Body, &file.Generation); err != nil {
+			return nil, err
+		}
+		file.Key = liveKey(file.Generation, file.Hash, file.Path)
+		hit := liveHit(file)
+		hit.ExactMatch = liveExactMatch(query, file.Path, file.Body)
+		hits = append(hits, hit)
+	}
+	return hits, rows.Err()
+}
+
+func liveKey(generation uint64, hash, filePath string) string {
+	return "live:" + strconv.FormatUint(generation, 10) + ":" + hash + ":" + filePath
+}
+
+func parseLiveKey(key string) (uint64, string, string, bool) {
+	parts := strings.SplitN(key, ":", 4)
+	if len(parts) != 4 || parts[0] != "live" || parts[2] == "" || parts[3] == "" {
+		return 0, "", "", false
+	}
+	generation, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, "", "", false
+	}
+	return generation, parts[2], parts[3], true
+}
+
+func liveHit(file LiveFile) SymbolHit {
+	return SymbolHit{
+		Key:         file.Key,
+		Kind:        "file",
+		Name:        path.Base(file.Path),
+		Path:        file.Path,
+		EndLine:     strings.Count(file.Body, "\n") + 1,
+		Live:        true,
+		Generation:  file.Generation,
+		ContentHash: file.Hash,
+	}
+}
+
+func liveSymbol(file LiveFile) codeindex.Symbol {
+	sym := codeindex.Symbol{
+		Key:           file.Key,
+		Kind:          "file",
+		Name:          path.Base(file.Path),
+		QualifiedName: file.Path,
+		Path:          file.Path,
+		Range: codeindex.Range{
+			End: codeindex.Position{Line: strings.Count(file.Body, "\n") + 1},
+		},
+		Body:     file.Body,
+		BodyHash: file.Hash,
+	}
+	sym.EmbeddingText = codeindex.RenderEmbeddingText(sym)
+	return sym
+}
+
+func liveExactMatch(query, filePath, body string) bool {
+	if len(strings.Fields(query)) != 1 {
+		return false
+	}
+	if query == filePath {
+		return true
+	}
+	for _, token := range strings.FieldsFunc(body, func(r rune) bool {
+		return r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if token == query {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) searchSymbolsTextIDs(query string, k int) ([]int64, error) {
 	rows, err := s.db.Query(`
-		SELECT rowid FROM symbol_fts WHERE symbol_fts MATCH ? ORDER BY bm25(symbol_fts) LIMIT ?`,
+		SELECT symbol_fts.rowid FROM symbol_fts
+		JOIN symbols s ON s.id=symbol_fts.rowid
+		WHERE symbol_fts MATCH ?
+			AND NOT EXISTS (SELECT 1 FROM live_files lf WHERE lf.path=s.path)
+		ORDER BY bm25(symbol_fts) LIMIT ?`,
 		ftsQuery(query), k)
 	if err != nil {
 		return nil, err
@@ -580,7 +834,12 @@ func (s *Store) searchSymbolsVectorIDs(vector []float32, k int) ([]int64, map[in
 		return nil, nil, err
 	}
 	rows, err := s.db.Query(`
-		SELECT rowid, distance FROM symbol_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?`,
+		SELECT symbol_vec.rowid, distance FROM symbol_vec
+		WHERE embedding MATCH ?
+			AND rowid IN (
+				SELECT s.id FROM symbols s
+				WHERE NOT EXISTS (SELECT 1 FROM live_files lf WHERE lf.path=s.path))
+		ORDER BY distance LIMIT ?`,
 		blob, k)
 	if err != nil {
 		return nil, nil, err
@@ -604,7 +863,10 @@ func (s *Store) searchSymbolsVectorIDs(vector []float32, k int) ([]int64, map[in
 // exactMatchIDs returns the ids of symbols whose name or qualified_name is
 // exactly query (case-sensitive).
 func (s *Store) exactMatchIDs(query string) ([]int64, error) {
-	rows, err := s.db.Query(`SELECT id FROM symbols WHERE name=? OR qualified_name=?`, query, query)
+	rows, err := s.db.Query(`
+		SELECT id FROM symbols s
+		WHERE (name=? OR qualified_name=?)
+			AND NOT EXISTS (SELECT 1 FROM live_files lf WHERE lf.path=s.path)`, query, query)
 	if err != nil {
 		return nil, err
 	}

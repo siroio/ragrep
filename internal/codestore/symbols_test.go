@@ -984,3 +984,208 @@ func TestFtsQuery(t *testing.T) {
 		}
 	}
 }
+
+func TestLiveFileSuppressesStoredSymbols(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+	old := sym("old", "OldName", "OldName", "", "func OldName() {}")
+	old.Path = "service.go"
+	old.EmbeddingText = codeindex.RenderEmbeddingText(old)
+	fe.register(old, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols(old.Path, "hash-old", []codeindex.Symbol{old}, 0, fe.embed); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PutLiveFile("service.go", "hash-new", "func NewName() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := s.SearchSymbolsText("OldName", 5)
+	if err != nil || len(stored) != 0 {
+		t.Fatalf("stored=%v err=%v", stored, err)
+	}
+	live, err := s.SearchLiveText("NewName", 5)
+	if err != nil || len(live) != 1 || live[0].Key != "live:7:hash-new:service.go" || !live[0].Live || live[0].Generation != 7 || live[0].ContentHash != "hash-new" || live[0].StartLine != 0 || live[0].EndLine != 1 {
+		t.Fatalf("live=%v err=%v", live, err)
+	}
+}
+
+func TestLiveFileSuppressesStoredVectorAndExactCandidates(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+	old := sym("old", "OldName", "OldName", "", "func OldName() {}")
+	old.Path = "service.go"
+	old.EmbeddingText = codeindex.RenderEmbeddingText(old)
+	fe.register(old, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols(old.Path, "hash-old", []codeindex.Symbol{old}, 0, fe.embed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutLiveFile("service.go", "hash-new", "func NewName() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+
+	vector, err := s.SearchSymbolsVector([]float32{1, 0, 0}, 5)
+	if err != nil || len(vector) != 0 {
+		t.Fatalf("vector=%v err=%v", vector, err)
+	}
+	exact, err := s.exactMatchIDs("OldName")
+	if err != nil || len(exact) != 0 {
+		t.Fatalf("exact=%v err=%v", exact, err)
+	}
+}
+
+func TestLiveFileCanonicalizesSlashPath(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+	old := sym("old", "OldName", "OldName", "", "func OldName() {}")
+	old.Path = "pkg/service.go"
+	old.EmbeddingText = codeindex.RenderEmbeddingText(old)
+	fe.register(old, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols(old.Path, "hash-old", []codeindex.Symbol{old}, 0, fe.embed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutLiveFile(`pkg\service.go`, "hash-new", "func NewName() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := s.SearchSymbolsText("OldName", 5)
+	if err != nil || len(stored) != 0 {
+		t.Fatalf("stored=%v err=%v", stored, err)
+	}
+	live, err := s.SearchLiveText("NewName", 1)
+	if err != nil || len(live) != 1 || live[0].Key != "live:7:hash-new:pkg/service.go" {
+		t.Fatalf("live=%v err=%v", live, err)
+	}
+}
+
+func TestLiveDeletionSuppressesStoredSymbols(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+	old := sym("old", "OldName", "OldName", "", "func OldName() {}")
+	old.Path = "service.go"
+	old.EmbeddingText = codeindex.RenderEmbeddingText(old)
+	fe.register(old, []float32{1, 0, 0})
+	if _, err := s.UpsertSymbols(old.Path, "hash-old", []codeindex.Symbol{old}, 0, fe.embed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutLiveFile("service.go", "hash-live", "func LiveName() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PutLiveDeletion("service.go", "hash-old", 8); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.SearchSymbolsText("OldName", 5)
+	if err != nil || len(stored) != 0 {
+		t.Fatalf("stored=%v err=%v", stored, err)
+	}
+	live, err := s.SearchLiveText("OldName", 5)
+	if err != nil || len(live) != 0 {
+		t.Fatalf("live=%v err=%v", live, err)
+	}
+	live, err = s.SearchLiveText("LiveName", 5)
+	if err != nil || len(live) != 0 {
+		t.Fatalf("live=%v err=%v", live, err)
+	}
+	states, err := s.ListFileStates()
+	if err != nil || !reflect.DeepEqual(states, []FileState{{Path: "service.go", Hash: "hash-old", Deleted: true}}) {
+		t.Fatalf("states=%v err=%v", states, err)
+	}
+}
+
+func TestGetLiveFileRejectsStaleKeyAfterSave(t *testing.T) {
+	s := openTestStore(t, 3)
+	if err := s.PutLiveFile("service.go", "hash-one", "func FirstName() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.SearchLiveText("FirstName", 1)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first=%v err=%v", first, err)
+	}
+	if err := s.PutLiveFile("service.go", "hash-two", "func SecondName() {}", 8); err != nil {
+		t.Fatal(err)
+	}
+	staleText, err := s.SearchLiveText("FirstName", 1)
+	if err != nil || len(staleText) != 0 {
+		t.Fatalf("staleText=%v err=%v", staleText, err)
+	}
+	if _, err := s.GetLiveFile(first[0].Key); !errors.Is(err, ErrStaleLiveKey) {
+		t.Fatalf("GetLiveFile(stale key): err=%v, want ErrStaleLiveKey", err)
+	}
+	for _, key := range []string{"live:7:hash-two:service.go", "live:8:hash-one:service.go"} {
+		if _, err := s.GetLiveFile(key); !errors.Is(err, ErrStaleLiveKey) {
+			t.Fatalf("GetLiveFile(%q): err=%v, want ErrStaleLiveKey", key, err)
+		}
+	}
+	current, err := s.SearchLiveText("SecondName", 1)
+	if err != nil || len(current) != 1 {
+		t.Fatalf("current=%v err=%v", current, err)
+	}
+	got, err := s.GetLiveFile(current[0].Key)
+	if err != nil || got.Path != "service.go" || got.Body != "func SecondName() {}" {
+		t.Fatalf("GetLiveFile(current key) = %+v, %v", got, err)
+	}
+}
+
+func TestRemoveLiveFileIfHashOnlyRemovesCurrentContent(t *testing.T) {
+	s := openTestStore(t, 3)
+	if err := s.PutLiveFile("service.go", "hash-current", "func CurrentName() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := s.RemoveLiveFileIfHash("service.go", "hash-old")
+	if err != nil || removed {
+		t.Fatalf("RemoveLiveFileIfHash(old hash) = %v, %v", removed, err)
+	}
+	removed, err = s.RemoveLiveFileIfHash("service.go", "hash-current")
+	if err != nil || !removed {
+		t.Fatalf("RemoveLiveFileIfHash(current hash) = %v, %v", removed, err)
+	}
+	states, err := s.ListFileStates()
+	if err != nil || len(states) != 0 {
+		t.Fatalf("states=%v err=%v", states, err)
+	}
+	live, err := s.SearchLiveText("CurrentName", 1)
+	if err != nil || len(live) != 0 {
+		t.Fatalf("live=%v err=%v", live, err)
+	}
+}
+
+func TestRemoveLiveFileIfHashPropagatesStoreError(t *testing.T) {
+	s := openTestStore(t, 3)
+	if _, err := s.db.Exec(`DROP TABLE live_files`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RemoveLiveFileIfHash("service.go", "hash-current"); err == nil {
+		t.Fatal("RemoveLiveFileIfHash after live_files drop: err=nil, want database error")
+	}
+}
+
+func TestLiveTextMarksWholeIdentifierAndPathExact(t *testing.T) {
+	s := openTestStore(t, 3)
+	if err := s.PutLiveFile("pkg/service.go", "hash-new", "func NewName() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+	name, err := s.SearchLiveText("NewName", 1)
+	if err != nil || len(name) != 1 || !name[0].ExactMatch {
+		t.Fatalf("name=%v err=%v", name, err)
+	}
+	path, err := s.SearchLiveText("pkg/service.go", 1)
+	if err != nil || len(path) != 1 || !path[0].ExactMatch {
+		t.Fatalf("path=%v err=%v", path, err)
+	}
+}
+
+func TestOpenVersionTwoRequiresReindex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "code.db")
+	s, err := Open(path, "test-model", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	bumpUserVersion(t, path, 2)
+	_, err = Open(path, "test-model", 3)
+	if !errors.Is(err, ErrReindexRequired) {
+		t.Fatalf("Open with schema version 2: err=%v, want ErrReindexRequired", err)
+	}
+}
