@@ -22,12 +22,17 @@ type testCodeServiceWorkspace struct {
 }
 
 type serviceTestEmbedder struct {
-	calls atomic.Int32
-	err   error
+	calls   atomic.Int32
+	err     error
+	started chan struct{}
+	release <-chan struct{}
 }
 
 func (e *serviceTestEmbedder) Embed(text string) ([]float32, error) {
-	e.calls.Add(1)
+	if e.calls.Add(1) == 1 && e.started != nil {
+		close(e.started)
+		<-e.release
+	}
 	if e.err != nil {
 		return nil, e.err
 	}
@@ -196,6 +201,32 @@ func TestCodeServiceSearchExistingPathSkipsEmbedding(t *testing.T) {
 	}
 }
 
+func TestCodeServiceSearchDurableExactPathReturnsPinnedSymbols(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	body := "func FirstPathHandler() {}\nfunc SecondPathHandler() {}"
+	first := serviceSymbol("pkg/service.go", "FirstPathHandler", "func FirstPathHandler() {}")
+	second := serviceSymbol("pkg/service.go", "SecondPathHandler", "func SecondPathHandler() {}")
+	second.Range = codeindex.Range{Start: codeindex.Position{Line: 1}, End: codeindex.Position{Line: 2}}
+	if _, err := ws.store.UpsertSymbols("pkg/service.go", ws.save(t, "pkg/service.go", body), []codeindex.Symbol{first, second}, 0, fakeCodeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "pkg/service.go"})
+	if err != nil || len(resp.Hits) != 2 || resp.Hits[0].Path != "pkg/service.go" || resp.Hits[1].Path != "pkg/service.go" || !resp.Hits[0].ExactMatch || !resp.Hits[1].ExactMatch || embedder.calls.Load() != 0 || resp.UsedVector {
+		t.Fatalf("resp=%+v embed calls=%d err=%v", resp, embedder.calls.Load(), err)
+	}
+}
+
+func TestCodeServiceSearchJapaneseLiveNaturalQueryUsesVector(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	ws.save(t, "service.go", "package service\n// 認証処理を確認する\nfunc ValidateToken() {}")
+
+	resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "認証処理を確認する"})
+	if err != nil || len(resp.Hits) != 1 || embedder.calls.Load() != 1 || !resp.UsedVector {
+		t.Fatalf("resp=%+v embed calls=%d err=%v", resp, embedder.calls.Load(), err)
+	}
+}
+
 func TestCodeServiceSearchMergesLiveAndDurableHits(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	body := "func DurableShared() { SharedOperation() }"
@@ -242,7 +273,7 @@ func TestCodeServiceSearchKeepsAdjacentDurableRanges(t *testing.T) {
 func TestCodeServiceGetRoutesLiveAndDurableKeys(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	durable := serviceSymbol("durable.go", "DurableGet", "func DurableGet() {}")
-	putServiceSymbol(t, ws.store, durable, "durable-hash")
+	putServiceSymbol(t, ws.store, durable, ws.save(t, durable.Path, durable.Body))
 	if got, err := svc.Get(context.Background(), getRequest{Root: ws.root, Key: durable.Key}); err != nil || got.Body != "" {
 		t.Fatalf("durable metadata-only got=%+v err=%v", got, err)
 	}
@@ -273,6 +304,64 @@ func TestCodeServiceGetMapsStaleLiveKeyWithoutFallback(t *testing.T) {
 	}
 	if _, err := svc.Get(context.Background(), getRequest{Root: ws.root, Key: first.Hits[0].Key, Body: true}); !errors.Is(err, ErrStaleLiveKey) {
 		t.Fatalf("Get stale key err=%v, want stale_live_key", err)
+	}
+}
+
+func TestCodeServiceGetRejectsDurableKeyAfterSave(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	body := "package service\nfunc DurableBeforeSave() {}"
+	durable := serviceSymbol("service.go", "DurableBeforeSave", "func DurableBeforeSave() {}")
+	putServiceSymbol(t, ws.store, durable, ws.save(t, "service.go", body))
+
+	search, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: durable.Name})
+	if err != nil || len(search.Hits) != 1 || search.Hits[0].Key != durable.Key {
+		t.Fatalf("search=%+v err=%v", search, err)
+	}
+	ws.save(t, "service.go", "package service\nfunc ChangedAfterSearch() {}")
+
+	if _, err := svc.Get(context.Background(), getRequest{Root: ws.root, Key: durable.Key, Body: true}); !errors.Is(err, ErrStaleLiveKey) {
+		t.Fatalf("Get durable key after save err=%v, want stale_live_key", err)
+	}
+}
+
+func TestCodeServiceSearchSnapshotBlocksPartialWatcherGeneration(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	oldBody := "package service\nfunc OldHandler() { SharedBehavior() }"
+	ws.save(t, "service.go", oldBody)
+	generation := barrierGeneration(t, ws.workspaceState)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	embedder.started = started
+	embedder.release = release
+
+	searched := make(chan struct {
+		resp searchResponse
+		err  error
+	}, 1)
+	go func() {
+		resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "SharedBehavior details"})
+		searched <- struct {
+			resp searchResponse
+			err  error
+		}{resp, err}
+	}()
+	<-started
+	ws.save(t, "service.go", "package service\nfunc NewHandler() {}")
+	refreshed := make(chan error, 1)
+	go func() { refreshed <- ws.refreshPaths([]string{filepath.Join(ws.root, "service.go")}) }()
+	select {
+	case err := <-refreshed:
+		close(release)
+		t.Fatalf("watcher refresh crossed active search snapshot: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	result := <-searched
+	if result.err != nil || result.resp.Generation != generation || len(result.resp.Hits) != 1 || result.resp.Hits[0].Generation != generation {
+		t.Fatalf("resp=%+v err=%v generation=%d", result.resp, result.err, generation)
+	}
+	if err := <-refreshed; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -459,6 +548,40 @@ func TestConfirmPathDeletionRemovesDurableSymbolsAndTombstone(t *testing.T) {
 	}
 }
 
+func TestConfirmPathMutationWaitsForActiveSnapshot(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
+	body := "package service\n\nfunc PromotedHandler() {\n\t// current\n}"
+	hash := codeindex.FileHash([]byte(body))
+	if err := ws.store.PutLiveFile("service.go", hash, body, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	ws.updateMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			ws.updateMu.Unlock()
+		}
+	}()
+	confirmed := make(chan error, 1)
+	go func() { confirmed <- svc.ConfirmPath(context.Background(), ws.root, "service.go", hash) }()
+	waitForTestPath(t, started)
+	if err := os.WriteFile(release, []byte("continue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-confirmed:
+		t.Fatalf("confirmation mutated store during active snapshot: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	ws.updateMu.Unlock()
+	locked = false
+	if err := <-confirmed; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCodeServiceSearchSchedulesConfirmationWithoutBlockingBarrier(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
@@ -489,4 +612,52 @@ func TestCodeServiceSearchSchedulesConfirmationWithoutBlockingBarrier(t *testing
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("scheduled confirmation did not promote live file")
+}
+
+func TestCodeServiceFailedConfirmationRetriesOnNextRead(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-confirm-retry", fakeLSPServerDocumentSymbolSrc)
+	_ = svc.lsps.Close()
+	var attempts atomic.Int32
+	svc.lsps = newLSPPool(time.Hour, func(ctx context.Context, root, _ string) (*pooledLanguageServer, error) {
+		if attempts.Add(1) == 1 {
+			return nil, errors.New("transient LSP start failure")
+		}
+		client, _, err := startLanguageServer(exe, root)
+		if err != nil {
+			return nil, err
+		}
+		return &pooledLanguageServer{client: client, close: client.Close}, nil
+	})
+	ws.save(t, "service.go", "package service\nfunc Foo() {\n}\n")
+
+	first, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "Foo"})
+	if err != nil || len(first.Hits) != 1 || !first.Hits[0].Live {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for attempts.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "Foo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		durable, err := ws.store.SearchSymbolsText("Foo", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		live, err := ws.store.SearchLiveText("Foo", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempts.Load() == 2 && len(durable) == 1 && len(live) == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("failed confirmation was not retried: attempts=%d", attempts.Load())
 }

@@ -30,21 +30,24 @@ type workspaceState struct {
 	refreshErr     error
 	watcher        *fsnotify.Watcher
 
-	ext                 string
-	enumerate           func(string, string) ([]string, error)
-	refresh             *workspaceRefresh
-	fullRefreshRequired bool
-	fullRefreshEpoch    uint64
-	confirmPath         func(string, string)
-	closed              bool
-	shutdownDone        chan struct{}
-	shutdownErr         error
-	refreshMu           sync.Mutex
-	refreshWG           sync.WaitGroup
-	watcherWG           sync.WaitGroup
-	confirmationMu      sync.Mutex
-	confirmationLocks   map[string]*sync.Mutex
+	ext                  string
+	enumerate            func(string, string) ([]string, error)
+	refresh              *workspaceRefresh
+	fullRefreshRequired  bool
+	fullRefreshEpoch     uint64
+	confirmPath          func(string, string) error
+	closed               bool
+	shutdownDone         chan struct{}
+	shutdownErr          error
+	updateMu             sync.Mutex
+	refreshWG            sync.WaitGroup
+	watcherWG            sync.WaitGroup
+	confirmationMu       sync.Mutex
+	confirmationLocks    map[string]*sync.Mutex
+	pendingConfirmations map[workspaceConfirmation]struct{}
 }
+
+type workspaceConfirmation struct{ path, hash string }
 
 type workspaceRefresh struct {
 	done             chan struct{}
@@ -82,25 +85,28 @@ func newWorkspaceState(root string, store *codestore.Store, roots []string, lang
 		}
 		relRoots = append(relRoots, rel)
 	}
-	states, err := store.ListWorkspaceFileStates()
+	states, err := store.ListFileStates()
 	if err != nil {
 		return nil, err
 	}
 	var generation uint64
+	pendingConfirmations := make(map[workspaceConfirmation]struct{}, len(states))
 	for _, state := range states {
 		if state.Generation > generation {
 			generation = state.Generation
 		}
+		pendingConfirmations[workspaceConfirmation{path: state.Path, hash: state.Hash}] = struct{}{}
 	}
 	return &workspaceState{
-		root:         absRoot,
-		language:     language,
-		roots:        relRoots,
-		store:        store,
-		ext:          ext,
-		enumerate:    discoverCodeFiles,
-		generation:   generation,
-		shutdownDone: make(chan struct{}),
+		root:                 absRoot,
+		language:             language,
+		roots:                relRoots,
+		store:                store,
+		ext:                  ext,
+		enumerate:            discoverCodeFiles,
+		generation:           generation,
+		pendingConfirmations: pendingConfirmations,
+		shutdownDone:         make(chan struct{}),
 	}, nil
 }
 
@@ -127,11 +133,27 @@ func (w *workspaceState) Barrier(ctx context.Context) (uint64, error) {
 	}
 }
 
+func (w *workspaceState) Snapshot(ctx context.Context) (uint64, func(), error) {
+	if _, err := w.Barrier(ctx); err != nil {
+		return 0, nil, err
+	}
+	w.updateMu.Lock()
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		w.updateMu.Unlock()
+		return 0, nil, ErrWorkspaceSyncing
+	}
+	generation := w.generation
+	w.mu.Unlock()
+	return generation, w.updateMu.Unlock, nil
+}
+
 func (w *workspaceState) runFullRefresh(refresh *workspaceRefresh) {
 	defer w.refreshWG.Done()
-	w.refreshMu.Lock()
+	w.updateMu.Lock()
 	err := w.refreshAll()
-	w.refreshMu.Unlock()
+	w.updateMu.Unlock()
 
 	w.mu.Lock()
 	refresh.generation = w.generation
@@ -358,9 +380,7 @@ func (w *workspaceState) watch(watcher *fsnotify.Watcher, watched map[string]boo
 				}
 			}
 			if len(paths) != 0 {
-				w.refreshMu.Lock()
 				err := w.refreshPaths(paths)
-				w.refreshMu.Unlock()
 				if err != nil {
 					w.requireFullRefresh()
 				}
@@ -377,18 +397,40 @@ func (w *workspaceState) requireFullRefresh() {
 	w.mu.Unlock()
 }
 
-func (w *workspaceState) setConfirmation(confirm func(string, string)) {
+func (w *workspaceState) setConfirmation(confirm func(string, string) error) {
 	w.mu.Lock()
 	w.confirmPath = confirm
+	pending := w.pendingConfirmations
+	w.pendingConfirmations = nil
 	w.mu.Unlock()
+	for confirmation := range pending {
+		go w.runConfirmation(confirm, confirmation)
+	}
 }
 
 func (w *workspaceState) scheduleConfirmation(path, hash string) {
 	w.mu.Lock()
 	confirm := w.confirmPath
+	if confirm == nil {
+		if w.pendingConfirmations == nil {
+			w.pendingConfirmations = make(map[workspaceConfirmation]struct{})
+		}
+		w.pendingConfirmations[workspaceConfirmation{path: path, hash: hash}] = struct{}{}
+	}
 	w.mu.Unlock()
 	if confirm != nil {
-		go confirm(path, hash)
+		go w.runConfirmation(confirm, workspaceConfirmation{path: path, hash: hash})
+	}
+}
+
+func (w *workspaceState) runConfirmation(confirm func(string, string) error, confirmation workspaceConfirmation) {
+	if err := confirm(confirmation.path, confirmation.hash); err != nil {
+		w.mu.Lock()
+		if w.pendingConfirmations == nil {
+			w.pendingConfirmations = make(map[workspaceConfirmation]struct{})
+		}
+		w.pendingConfirmations[confirmation] = struct{}{}
+		w.mu.Unlock()
 	}
 }
 
@@ -409,6 +451,9 @@ func (w *workspaceState) lockConfirmation(path string) func() {
 }
 
 func (w *workspaceState) refreshPaths(paths []string) error {
+	w.updateMu.Lock()
+	defer w.updateMu.Unlock()
+
 	w.mu.Lock()
 	fullRefreshRequired := w.fullRefreshRequired
 	w.mu.Unlock()

@@ -356,6 +356,36 @@ func TestSearchSymbolsAutoUsesVectorForNonExactQuery(t *testing.T) {
 	}
 }
 
+func TestSearchSymbolsAutoPinsEverySymbolAtExactPath(t *testing.T) {
+	s := openTestStore(t, 3)
+	fe := newFakeEmbedder(t)
+	first := sym("first", "First", "pkg.First", "", "func First() {}")
+	first.Path = "pkg/service.go"
+	first.EmbeddingText = codeindex.RenderEmbeddingText(first)
+	second := sym("second", "Second", "pkg.Second", "", "func Second() {}")
+	second.Path = "pkg/service.go"
+	second.EmbeddingText = codeindex.RenderEmbeddingText(second)
+	fe.register(first, []float32{1, 0, 0})
+	fe.register(second, []float32{0, 1, 0})
+	if _, err := s.UpsertSymbols(first.Path, "path-hash", []codeindex.Symbol{first, second}, 0, fe.embed); err != nil {
+		t.Fatal(err)
+	}
+
+	vectorCalls := 0
+	hits, used, err := s.SearchSymbolsAuto("pkg/service.go", 5, func() ([]float32, error) {
+		vectorCalls++
+		return []float32{1, 0, 0}, nil
+	})
+	if err != nil || used || vectorCalls != 0 || len(hits) != 2 {
+		t.Fatalf("hits=%+v used=%v vectorCalls=%d err=%v", hits, used, vectorCalls, err)
+	}
+	for _, hit := range hits {
+		if hit.Path != "pkg/service.go" || !hit.ExactMatch {
+			t.Fatalf("hit=%+v, want pinned exact path", hit)
+		}
+	}
+}
+
 // TestSearchSymbolsHybridExactMatchBeatsSemanticSimilarity constructs a case
 // where the exact-name match would actually LOSE under plain RRF fusion (no
 // exact-match pin), so the assertion is falsifiable rather than

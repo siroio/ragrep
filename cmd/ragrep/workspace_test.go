@@ -11,6 +11,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/siroio/ragrep/internal/codeindex"
 	"github.com/siroio/ragrep/internal/codestore"
 )
 
@@ -78,6 +79,56 @@ func TestWorkspaceBarrierSeesSaveBeforeWatcherDelivery(t *testing.T) {
 	hits, err := w.store.SearchLiveText("NewName", 5)
 	if err != nil || len(hits) != 1 {
 		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+}
+
+func TestWorkspaceQueuesConfirmationBeforeCallbackRegistration(t *testing.T) {
+	w := newTestWorkspace(t, "func QueuedConfirmation() {}")
+	confirmed := make(chan string, 1)
+	w.setConfirmation(func(path, hash string) error {
+		confirmed <- path + ":" + hash
+		return nil
+	})
+	select {
+	case got := <-confirmed:
+		if want := "service.go:" + codeindex.FileHash([]byte("func QueuedConfirmation() {}")); got != want {
+			t.Fatalf("confirmation=%q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("confirmation scheduled before callback registration was dropped")
+	}
+}
+
+func TestWorkspaceQueuesPersistedLiveConfirmationAtStartup(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := codestore.Open(filepath.Join(t.TempDir(), "code.db"), "test-model", codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.PutLiveFile("service.go", "persisted-hash", "func Persisted() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+	w, err := newWorkspaceState(root, store, []string{"."}, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Close() })
+	confirmed := make(chan string, 1)
+	w.setConfirmation(func(path, hash string) error {
+		confirmed <- path + ":" + hash
+		return nil
+	})
+	select {
+	case got := <-confirmed:
+		if got != "service.go:persisted-hash" {
+			t.Fatalf("confirmation=%q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("persisted live confirmation was not resumed")
 	}
 }
 

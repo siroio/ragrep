@@ -558,6 +558,23 @@ func (s *Store) GetSymbol(key string) (codeindex.Symbol, error) {
 	return sym, nil
 }
 
+// GetVisibleSymbol returns a durable symbol only while its path has no live
+// replacement or deletion tombstone.
+func (s *Store) GetVisibleSymbol(key string) (codeindex.Symbol, error) {
+	sym, err := s.GetSymbol(key)
+	if err != nil {
+		return codeindex.Symbol{}, err
+	}
+	var stale bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM live_files WHERE path=?)`, sym.Path).Scan(&stale); err != nil {
+		return codeindex.Symbol{}, err
+	}
+	if stale {
+		return codeindex.Symbol{}, ErrStaleLiveKey
+	}
+	return sym, nil
+}
+
 // GetLiveFile returns the current unsaved file for a provisional live key.
 func (s *Store) GetLiveFile(key string) (codeindex.Symbol, error) {
 	generation, hash, filePath, ok := parseLiveKey(key)
@@ -891,7 +908,7 @@ func liveExactMatch(query, filePath, body string) bool {
 	if query == filePath {
 		return true
 	}
-	if len(strings.Fields(query)) != 1 {
+	if !asciiIdentifier(query) {
 		return false
 	}
 	for _, token := range strings.FieldsFunc(body, func(r rune) bool {
@@ -902,6 +919,15 @@ func liveExactMatch(query, filePath, body string) bool {
 		}
 	}
 	return false
+}
+
+func asciiIdentifier(query string) bool {
+	for i, r := range query {
+		if r > unicode.MaxASCII || !(r == '_' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || i > 0 && '0' <= r && r <= '9') {
+			return false
+		}
+	}
+	return query != ""
 }
 
 func (s *Store) searchSymbolsTextIDs(query string, k int) ([]int64, error) {
@@ -951,13 +977,13 @@ func (s *Store) searchSymbolsVectorIDs(vector []float32, k int) ([]int64, map[in
 	return ids, dists, rows.Err()
 }
 
-// exactMatchIDs returns the ids of symbols whose name or qualified_name is
-// exactly query (case-sensitive).
+// exactMatchIDs returns symbols whose name, qualified name, or path exactly
+// matches query (case-sensitive).
 func (s *Store) exactMatchIDs(query string) ([]int64, error) {
 	rows, err := s.db.Query(`
 		SELECT id FROM symbols s
-		WHERE (name=? OR qualified_name=?)
-			AND NOT EXISTS (SELECT 1 FROM live_files lf WHERE lf.path=s.path)`, query, query)
+		WHERE (name=? OR qualified_name=? OR path=?)
+			AND NOT EXISTS (SELECT 1 FROM live_files lf WHERE lf.path=s.path)`, query, query, filepath.ToSlash(query))
 	if err != nil {
 		return nil, err
 	}

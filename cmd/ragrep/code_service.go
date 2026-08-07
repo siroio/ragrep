@@ -104,14 +104,22 @@ func (s *codeService) Search(ctx context.Context, req searchRequest) (searchResp
 	if err != nil {
 		return searchResponse{}, err
 	}
-	ws.setConfirmation(func(path, hash string) {
-		_ = s.confirmPathAtDB(context.Background(), ws.root, req.DB, path, hash)
-	})
-	generation, err := codeServiceBarrier(ctx, ws)
+	s.enableConfirmation(ws, req.DB)
+	generation, unlock, err := codeServiceSnapshot(ctx, ws)
 	if err != nil {
 		return searchResponse{}, err
 	}
+	defer unlock()
+	return s.searchSnapshot(ctx, ws, req, generation)
+}
 
+func (s *codeService) enableConfirmation(ws *workspaceState, db string) {
+	ws.setConfirmation(func(path, hash string) error {
+		return s.confirmPathAtDB(context.Background(), ws.root, db, path, hash)
+	})
+}
+
+func (s *codeService) searchSnapshot(ctx context.Context, ws *workspaceState, req searchRequest, generation uint64) (searchResponse, error) {
 	k := req.K
 	if k <= 0 || k > 5 {
 		k = 5
@@ -183,16 +191,22 @@ func (s *codeService) Pack(ctx context.Context, req packRequest) (codePackOutput
 	if len(req.SelectedKeys) > 3 {
 		return codePackOutput{}, fmt.Errorf("selected keys accepts at most 3 keys, got %d", len(req.SelectedKeys))
 	}
-	search, err := s.Search(ctx, searchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: "hybrid", K: req.K})
-	if err != nil {
-		return codePackOutput{}, err
-	}
 	ws, err := s.workspace(req.Root, req.DB)
 	if err != nil {
 		return codePackOutput{}, err
 	}
+	s.enableConfirmation(ws, req.DB)
+	generation, unlock, err := codeServiceSnapshot(ctx, ws)
+	if err != nil {
+		return codePackOutput{}, err
+	}
+	defer unlock()
+	search, err := s.searchSnapshot(ctx, ws, searchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: "auto", K: req.K}, generation)
+	if err != nil {
+		return codePackOutput{}, err
+	}
 	out, err := runCodePack(ws.store, search.Hits, req.Budget, req.SelectedKeys, func(key string) (codeindex.Symbol, error) {
-		return s.Get(ctx, getRequest{Root: req.Root, DB: req.DB, Key: key, Body: true})
+		return getSnapshot(ws, getRequest{Root: req.Root, DB: req.DB, Key: key, Body: true})
 	})
 	if err != nil {
 		return codePackOutput{}, err
@@ -207,14 +221,20 @@ func (s *codeService) Verify(ctx context.Context, req verifyRequest) (codeVerify
 	if err != nil {
 		return codeVerifyOutput{}, err
 	}
-	if _, err := codeServiceBarrier(ctx, ws); err != nil {
+	s.enableConfirmation(ws, req.DB)
+	_, unlock, err := codeServiceSnapshot(ctx, ws)
+	if err != nil {
 		return codeVerifyOutput{}, err
 	}
+	defer unlock()
 	return runCodeVerify(ctx, req.Manifest, func(path string) ([]byte, error) {
 		return os.ReadFile(filepath.Join(ws.root, filepath.FromSlash(path)))
 	}, func(ref coderetrieval.SymbolRef) (coderetrieval.SymbolRef, error) {
 		getSymbol := func(key string) (codeindex.Symbol, error) {
-			return s.Get(ctx, getRequest{Root: req.Root, DB: req.DB, Key: key})
+			if strings.HasPrefix(key, "live:") {
+				return getSnapshot(ws, getRequest{Root: req.Root, DB: req.DB, Key: key})
+			}
+			return ws.store.GetSymbol(key)
 		}
 		if strings.HasPrefix(ref.Key, "live:") {
 			sym, err := getSymbol(ref.Key)
@@ -231,25 +251,36 @@ func (s *codeService) Verify(ctx context.Context, req verifyRequest) (codeVerify
 	})
 }
 
-func codeServiceBarrier(ctx context.Context, ws *workspaceState) (uint64, error) {
+func codeServiceSnapshot(ctx context.Context, ws *workspaceState) (uint64, func(), error) {
 	barrierCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
-	return ws.Barrier(barrierCtx)
+	return ws.Snapshot(barrierCtx)
 }
 
-func (s *codeService) Get(_ context.Context, req getRequest) (codeindex.Symbol, error) {
+func (s *codeService) Get(ctx context.Context, req getRequest) (codeindex.Symbol, error) {
 	ws, err := s.workspace(req.Root, req.DB)
 	if err != nil {
 		return codeindex.Symbol{}, err
 	}
+	s.enableConfirmation(ws, req.DB)
+	_, unlock, err := codeServiceSnapshot(ctx, ws)
+	if err != nil {
+		return codeindex.Symbol{}, err
+	}
+	defer unlock()
+	return getSnapshot(ws, req)
+}
+
+func getSnapshot(ws *workspaceState, req getRequest) (codeindex.Symbol, error) {
 	var sym codeindex.Symbol
+	var err error
 	if strings.HasPrefix(req.Key, "live:") {
 		sym, err = ws.store.GetLiveFile(req.Key)
-		if errors.Is(err, codestore.ErrStaleLiveKey) {
-			return codeindex.Symbol{}, ErrStaleLiveKey
-		}
 	} else {
-		sym, err = ws.store.GetSymbol(req.Key)
+		sym, err = ws.store.GetVisibleSymbol(req.Key)
+	}
+	if errors.Is(err, codestore.ErrStaleLiveKey) {
+		return codeindex.Symbol{}, ErrStaleLiveKey
 	}
 	if err != nil {
 		return codeindex.Symbol{}, err
@@ -294,6 +325,8 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 		if err := ctx.Err(); err != nil {
 			return indexResult{}, err
 		}
+		ws.updateMu.Lock()
+		defer ws.updateMu.Unlock()
 		result.Pruned, err = pruneCodeSymbolPathsContext(ctx, ws.store, req.Roots, nil)
 		return result, err
 	}
@@ -309,11 +342,11 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 	if err := ctx.Err(); err != nil {
 		return indexResult{}, err
 	}
-	runID, err := ws.store.RecordIndexRun("index:"+strings.Join(req.Roots, ","), gitRevision(ws.root), req.Language, serverName, serverVersion, codeModelID, time.Now())
-	if err != nil {
-		return indexResult{}, err
+	type preparedIndexFile struct {
+		path, hash string
+		symbols    []codeindex.Symbol
 	}
-
+	prepared := make([]preparedIndexFile, 0, len(files))
 	seen := make(map[string]bool, len(files))
 	for _, path := range files {
 		rel, err := normPath(path, ws.root)
@@ -338,14 +371,34 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 		if err := ctx.Err(); err != nil {
 			return indexResult{}, err
 		}
-		changed, err := ws.store.UpsertSymbols(rel, codeindex.FileHash(content), symbols, runID, func(text string) ([]float32, error) {
+		prepared = append(prepared, preparedIndexFile{path: rel, hash: codeindex.FileHash(content), symbols: symbols})
+	}
+	if err := ctx.Err(); err != nil {
+		return indexResult{}, err
+	}
+
+	revision := gitRevision(ws.root)
+	ws.updateMu.Lock()
+	defer ws.updateMu.Unlock()
+	runID, err := ws.store.RecordIndexRun("index:"+strings.Join(req.Roots, ","), revision, req.Language, serverName, serverVersion, codeModelID, time.Now())
+	if err != nil {
+		return indexResult{}, err
+	}
+	for _, file := range prepared {
+		if err := ctx.Err(); err != nil {
+			return indexResult{}, err
+		}
+		changed, err := ws.store.UpsertSymbols(file.path, file.hash, file.symbols, runID, func(text string) ([]float32, error) {
 			return s.embeddings.Embed(ctx, text)
 		})
 		if err != nil {
-			return indexResult{}, fmt.Errorf("%s: %w", rel, err)
+			return indexResult{}, fmt.Errorf("%s: %w", file.path, err)
 		}
 		if changed {
-			result.Indexed = append(result.Indexed, rel)
+			result.Indexed = append(result.Indexed, file.path)
+		}
+		if _, err := ws.store.RemoveLiveFileIfHash(file.path, file.hash); err != nil {
+			return indexResult{}, fmt.Errorf("%s: %w", file.path, err)
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -364,7 +417,16 @@ func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 	if err != nil {
 		return nil, err
 	}
-	sym, err := ws.store.GetSymbol(req.Key)
+	s.enableConfirmation(ws, req.DB)
+	_, unlock, err := codeServiceSnapshot(ctx, ws)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	sym, err := ws.store.GetVisibleSymbol(req.Key)
+	if errors.Is(err, codestore.ErrStaleLiveKey) {
+		return nil, ErrStaleLiveKey
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -479,6 +541,8 @@ func (s *codeService) confirmPathAtDB(ctx context.Context, root, db, path, expec
 		return err
 	}
 	if file.Deleted {
+		ws.updateMu.Lock()
+		defer ws.updateMu.Unlock()
 		_, err = ws.store.DeleteSymbolsForPathIfLiveHash(file.Path, expectedHash)
 		return err
 	}
@@ -501,6 +565,13 @@ func (s *codeService) confirmPathAtDB(ctx context.Context, root, db, path, expec
 	}
 	symbols, err := codeindex.Extract(ws.language, rel, []byte(file.Body), documentSymbols)
 	if err != nil {
+		return err
+	}
+	ws.updateMu.Lock()
+	defer ws.updateMu.Unlock()
+	if _, err := ws.store.GetLiveFileByPath(file.Path, expectedHash); errors.Is(err, codestore.ErrStaleLiveKey) {
+		return nil
+	} else if err != nil {
 		return err
 	}
 	if _, err := ws.store.UpsertSymbols(rel, file.Hash, symbols, 0, func(text string) ([]float32, error) {

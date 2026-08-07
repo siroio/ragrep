@@ -1075,7 +1075,8 @@ func expandTestSymbol(t *testing.T, root string) (db, key string) {
 	if err := os.MkdirAll(ragrepDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+	content := []byte("package main\n\nfunc main() {}\n")
+	if err := os.WriteFile(filepath.Join(root, "main.go"), content, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	db = filepath.Join(ragrepDir, "code.db")
@@ -1096,7 +1097,7 @@ func expandTestSymbol(t *testing.T, root string) (db, key string) {
 		Body: "func main() {}",
 	}
 	sym.EmbeddingText = codeindex.RenderEmbeddingText(sym)
-	if _, err := s.UpsertSymbols(sym.Path, "hash1", []codeindex.Symbol{sym}, 0, fakeCodeEmbed); err != nil {
+	if _, err := s.UpsertSymbols(sym.Path, codeindex.FileHash(content), []codeindex.Symbol{sym}, 0, fakeCodeEmbed); err != nil {
 		t.Fatal(err)
 	}
 	return db, sym.Key
@@ -1362,7 +1363,8 @@ func TestCmdCodeExpandDedupsRelationsAndSkipsUnresolved(t *testing.T) {
 		t.Fatal(err)
 	}
 	mainGo := filepath.Join(root, "main.go")
-	if err := os.WriteFile(mainGo, []byte("package main\n\nfunc Callee() {}\n\nfunc Caller() {\n\tCallee()\n\tCallee()\n}\n"), 0o644); err != nil {
+	content := []byte("package main\n\nfunc Callee() {}\n\nfunc Caller() {\n\tCallee()\n\tCallee()\n}\n")
+	if err := os.WriteFile(mainGo, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1393,7 +1395,7 @@ func TestCmdCodeExpandDedupsRelationsAndSkipsUnresolved(t *testing.T) {
 		Body: "func Caller() {\n\tCallee()\n\tCallee()\n}",
 	}
 	caller.EmbeddingText = codeindex.RenderEmbeddingText(caller)
-	if _, err := s.UpsertSymbols("main.go", "hash1", []codeindex.Symbol{target, caller}, 0, fakeCodeEmbed); err != nil {
+	if _, err := s.UpsertSymbols("main.go", codeindex.FileHash(content), []codeindex.Symbol{target, caller}, 0, fakeCodeEmbed); err != nil {
 		s.Close()
 		t.Fatal(err)
 	}
@@ -1783,6 +1785,70 @@ func TestCodeServicePackReturnsFreshLiveBodyAndCapsCandidates(t *testing.T) {
 	if string(wrapper["fresh"]) != "true" || string(wrapper["generation"]) != "1" ||
 		bytes.Contains(wrapper["manifest"], []byte(`"fresh"`)) || bytes.Contains(wrapper["manifest"], []byte(`"generation"`)) {
 		t.Fatalf("freshness must be on the outer wrapper, not the manifest: %s", b)
+	}
+}
+
+func TestCodeServicePackUsesAutoModeForExactSymbol(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	body := "package service\nfunc ExactPackHandler() {}"
+	sym := serviceSymbol("service.go", "ExactPackHandler", "func ExactPackHandler() {}")
+	putServiceSymbol(t, ws.store, sym, ws.save(t, "service.go", body))
+
+	out, err := svc.Pack(context.Background(), packRequest{Root: ws.root, Query: sym.Name, Budget: 100_000})
+	if err != nil || len(out.Pack.Candidates) != 1 || out.Pack.Candidates[0].Key != sym.Key || embedder.calls.Load() != 0 {
+		t.Fatalf("out=%+v embed calls=%d err=%v", out, embedder.calls.Load(), err)
+	}
+}
+
+func TestCodeServicePackUsesSingleGenerationSnapshot(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	oldBody := "package service\nfunc OldPackHandler() { SharedOperation() }"
+	ws.save(t, "service.go", oldBody)
+	generation := barrierGeneration(t, ws.workspaceState)
+	live, err := ws.store.SearchLiveText("OldPackHandler", 1)
+	if err != nil || len(live) != 1 {
+		t.Fatalf("live=%+v err=%v", live, err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	embedder.started = started
+	embedder.release = release
+
+	packed := make(chan struct {
+		out codePackOutput
+		err error
+	}, 1)
+	go func() {
+		out, err := svc.Pack(context.Background(), packRequest{
+			Root: ws.root, Query: "SharedOperation details", Budget: 100_000, SelectedKeys: []string{live[0].Key},
+		})
+		packed <- struct {
+			out codePackOutput
+			err error
+		}{out, err}
+	}()
+	<-started
+	ws.save(t, "service.go", "package service\nfunc NewPackHandler() {}")
+	refreshed := make(chan error, 1)
+	go func() { refreshed <- ws.refreshPaths([]string{filepath.Join(ws.root, "service.go")}) }()
+	prematureRefresh := false
+	select {
+	case err := <-refreshed:
+		if err != nil {
+			t.Fatal(err)
+		}
+		prematureRefresh = true
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	result := <-packed
+	if prematureRefresh || result.err != nil || result.out.Generation != generation || len(result.out.Pack.Symbols) != 1 || result.out.Pack.Symbols[0].Body != oldBody {
+		t.Fatalf("prematureRefresh=%v out=%+v err=%v", prematureRefresh, result.out, result.err)
+	}
+	if !prematureRefresh {
+		if err := <-refreshed; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

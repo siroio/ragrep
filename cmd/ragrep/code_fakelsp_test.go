@@ -340,6 +340,83 @@ func TestCodeServiceIndexLSPErrorDoesNotPrune(t *testing.T) {
 	}
 }
 
+func TestCodeServiceIndexRemovesMatchingLiveOverlayUnderUpdateLock(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"injected-test-server"}}`)
+	body := "package service\n\nfunc PromotedHandler() {\n\t// indexed\n}"
+	hash := ws.save(t, "service.go", body)
+	if err := ws.store.PutLiveFile("service.go", hash, body, 1); err != nil {
+		t.Fatal(err)
+	}
+	ws.setGeneration(1)
+
+	indexed := make(chan error, 1)
+	go func() {
+		_, err := svc.Index(context.Background(), indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+		indexed <- err
+	}()
+	waitForTestPath(t, started)
+	ws.updateMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			ws.updateMu.Unlock()
+		}
+	}()
+	if err := os.WriteFile(release, []byte("continue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-indexed:
+		t.Fatalf("Index mutated store during active snapshot: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	ws.updateMu.Unlock()
+	locked = false
+	if err := <-indexed; err != nil {
+		t.Fatal(err)
+	}
+	states, err := ws.store.ListFileStates()
+	if err != nil || len(states) != 0 {
+		t.Fatalf("live states after matching Index=%+v err=%v", states, err)
+	}
+}
+
+func TestCodeServiceIndexKeepsNewerLiveOverlay(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"injected-test-server"}}`)
+	oldBody := "package service\n\nfunc PromotedHandler() {\n\t// old\n}"
+	oldHash := ws.save(t, "service.go", oldBody)
+	if err := ws.store.PutLiveFile("service.go", oldHash, oldBody, 1); err != nil {
+		t.Fatal(err)
+	}
+	ws.setGeneration(1)
+
+	indexed := make(chan error, 1)
+	go func() {
+		_, err := svc.Index(context.Background(), indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+		indexed <- err
+	}()
+	waitForTestPath(t, started)
+	newBody := "package service\n\nfunc PromotedHandler() {\n\t// newer\n}"
+	newHash := ws.save(t, "service.go", newBody)
+	if err := ws.refreshPaths([]string{filepath.Join(ws.root, "service.go")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("continue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-indexed; err != nil {
+		t.Fatal(err)
+	}
+	file, err := ws.store.GetLiveFileByPath("service.go", newHash)
+	if err != nil || file.Body != newBody {
+		t.Fatalf("newer live file=%+v err=%v", file, err)
+	}
+}
+
 func TestCodeServiceExpandPreservesRelationSemantics(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	body := "package main\n\nfunc Callee() {}\n\nfunc Caller() {\n\tCallee()\n\tCallee()\n}\n"
@@ -384,5 +461,24 @@ func TestCodeServiceExpandPreservesRelationSemantics(t *testing.T) {
 	after, err := ws.store.LatestIndexRun()
 	if err != nil || after.ID != indexRun {
 		t.Fatalf("latest index run=%+v err=%v, want id %d", after, err, indexRun)
+	}
+}
+
+func TestCodeServiceExpandRejectsDurableKeyAfterSave(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	body := "package service\nfunc DurableBeforeExpand() {}"
+	sym := serviceSymbol("service.go", "DurableBeforeExpand", "func DurableBeforeExpand() {}")
+	putServiceSymbol(t, ws.store, sym, ws.save(t, "service.go", body))
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-stale-expand", fakeLSPServerDocumentSymbolSrc)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"`+filepath.ToSlash(exe)+`"}}`)
+
+	search, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: sym.Name})
+	if err != nil || len(search.Hits) != 1 || search.Hits[0].Key != sym.Key {
+		t.Fatalf("search=%+v err=%v", search, err)
+	}
+	ws.save(t, "service.go", "package service\nfunc ChangedBeforeExpand() {}")
+
+	if _, err := svc.Expand(context.Background(), expandRequest{Root: ws.root, Key: sym.Key, Relation: "references"}); !errors.Is(err, ErrStaleLiveKey) {
+		t.Fatalf("Expand durable key after save err=%v, want stale_live_key", err)
 	}
 }
