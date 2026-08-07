@@ -512,7 +512,12 @@ func cmdCodeSearch(args []string) int {
 		return code
 	}
 	if fs.NArg() != 1 {
-		return fail(fmt.Errorf("usage: ragrep code search [--json] [-k N] <query>"))
+		return fail(fmt.Errorf("usage: ragrep code search [--json] [--mode auto|text|hybrid] [-k N] <query>"))
+	}
+	switch *mode {
+	case "auto", "text", "hybrid":
+	default:
+		return fail(fmt.Errorf("usage: ragrep code search [--json] [--mode auto|text|hybrid] [-k N] <query>"))
 	}
 	query := fs.Arg(0)
 
@@ -544,6 +549,9 @@ func cmdCodeSearch(args []string) int {
 	}
 	if err != nil {
 		return fail(err)
+	}
+	if !*asJSON && resp.Degraded != "" {
+		fmt.Fprintf(os.Stderr, "degraded: %s\n", resp.Degraded)
 	}
 	return 0
 }

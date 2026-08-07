@@ -526,14 +526,23 @@ func captureCodeCommand(t *testing.T, args []string) (int, string, string) {
 	}
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
 		t.Fatal(err)
 	}
 	oldStdout, oldStderr := os.Stdout, os.Stderr
+	defer func() {
+		os.Stdout, os.Stderr = oldStdout, oldStderr
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
+	}()
 	os.Stdout, os.Stderr = stdoutW, stderrW
 	code := run(args)
+	os.Stdout, os.Stderr = oldStdout, oldStderr
 	stdoutW.Close()
 	stderrW.Close()
-	os.Stdout, os.Stderr = oldStdout, oldStderr
 	var stdout, stderr bytes.Buffer
 	_, _ = stdout.ReadFrom(stdoutR)
 	_, _ = stderr.ReadFrom(stderrR)
@@ -556,7 +565,7 @@ func TestCmdCodeSearchDaemonText(t *testing.T) {
 	calls := injectCodeDaemonClient(t, client)
 
 	code, stdout, stderr := captureCodeCommand(t, []string{"code", "search", "--mode", "text", "-k", "3", "--db", db, "Foo"})
-	if code != 0 || stderr != "" || *calls != 1 {
+	if code != 0 || stderr != "degraded: vector_unavailable\n" || *calls != 1 {
 		t.Fatalf("exit=%d factory calls=%d stdout=%q stderr=%q", code, *calls, stdout, stderr)
 	}
 	want := "key-1\tfunction\tpkg.Foo\tfunc Foo()\tpkg/foo.go:4-8\tscore=0.2500 (fts=1 vec=2 exact=true)\n"
@@ -591,6 +600,43 @@ func TestCmdCodeSearchDaemonJSONDefaultsToAutoFive(t *testing.T) {
 	var hits []codestore.SymbolHit
 	if err := json.Unmarshal(got["hits"], &hits); err != nil || !reflect.DeepEqual(hits, []codestore.SymbolHit{hit}) {
 		t.Fatalf("hits=%+v err=%v", hits, err)
+	}
+}
+
+func TestCmdCodeSearchDaemonModes(t *testing.T) {
+	for _, mode := range []string{"auto", "text", "hybrid"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			db := filepath.Join(root, ".ragrep", "code.db")
+			client := fakeCodeDaemonClient{search: func(_ context.Context, req searchRequest) (searchResponse, error) {
+				if req.Mode != mode {
+					t.Fatalf("mode=%q, want %q", req.Mode, mode)
+				}
+				return searchResponse{Hits: []codestore.SymbolHit{{Key: "key-1"}}, Fresh: true}, nil
+			}}
+			injectCodeDaemonClient(t, client)
+			code, _, stderr := captureCodeCommand(t, []string{"code", "search", "--mode", mode, "--db", db, "Foo"})
+			if code != 0 || stderr != "" {
+				t.Fatalf("exit=%d stderr=%q", code, stderr)
+			}
+		})
+	}
+}
+
+func TestCmdCodeSearchDaemonRejectsInvalidModeBeforeClient(t *testing.T) {
+	for _, mode := range []string{"", "vector", "bogus"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			db := filepath.Join(root, ".ragrep", "code.db")
+			client := fakeCodeDaemonClient{search: func(context.Context, searchRequest) (searchResponse, error) {
+				return searchResponse{Hits: []codestore.SymbolHit{{Key: "unexpected"}}}, nil
+			}}
+			calls := injectCodeDaemonClient(t, client)
+			code, stdout, stderr := captureCodeCommand(t, []string{"code", "search", "--mode=" + mode, "--db", db, "Foo"})
+			if code != 1 || *calls != 0 || stdout != "" || !strings.Contains(stderr, "usage: ragrep code search") {
+				t.Fatalf("mode=%q exit=%d factory calls=%d stdout=%q stderr=%q", mode, code, *calls, stdout, stderr)
+			}
+		})
 	}
 }
 
