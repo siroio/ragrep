@@ -144,25 +144,32 @@ func newWorkspaceState(root string, store *codestore.Store, roots []string, lang
 }
 
 func (w *workspaceState) Barrier(ctx context.Context) (uint64, error) {
-	w.mu.Lock()
-	if w.closed {
+	for {
+		w.mu.Lock()
+		if w.closed {
+			w.mu.Unlock()
+			return 0, ErrWorkspaceSyncing
+		}
+		if w.refresh == nil {
+			w.refresh = &workspaceRefresh{done: make(chan struct{}), fullRefreshEpoch: w.fullRefreshEpoch}
+			w.refreshDone = w.refresh.done
+			w.refreshWG.Add(1)
+			go w.runFullRefresh(w.refresh)
+		}
+		refresh := w.refresh
 		w.mu.Unlock()
-		return 0, ErrWorkspaceSyncing
-	}
-	if w.refresh == nil {
-		w.refresh = &workspaceRefresh{done: make(chan struct{}), fullRefreshEpoch: w.fullRefreshEpoch}
-		w.refreshDone = w.refresh.done
-		w.refreshWG.Add(1)
-		go w.runFullRefresh(w.refresh)
-	}
-	refresh := w.refresh
-	w.mu.Unlock()
 
-	select {
-	case <-refresh.done:
-		return refresh.generation, refresh.err
-	case <-ctx.Done():
-		return 0, ErrWorkspaceSyncing
+		select {
+		case <-refresh.done:
+			w.mu.Lock()
+			stable := refresh.fullRefreshEpoch == w.fullRefreshEpoch
+			w.mu.Unlock()
+			if refresh.err != nil || stable {
+				return refresh.generation, refresh.err
+			}
+		case <-ctx.Done():
+			return 0, ErrWorkspaceSyncing
+		}
 	}
 }
 

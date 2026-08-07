@@ -1257,6 +1257,27 @@ func TestLiveTextMarksWholeIdentifierAndPathExact(t *testing.T) {
 	}
 }
 
+func TestSearchLiveTextDirectlyPinsWindowsExactPath(t *testing.T) {
+	s := openTestStore(t, 3)
+	const path = "dir/file.go"
+	const body = "func CurrentPathHandler() {}"
+	if err := s.PutLiveFile(path, "hash-live", body, 7); err != nil {
+		t.Fatal(err)
+	}
+	var rowID int64
+	if err := s.db.QueryRow(`SELECT rowid FROM live_files WHERE path=?`, path).Scan(&rowID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO live_fts(live_fts, rowid, path, body) VALUES('delete', ?, ?, ?)`, rowID, path, body); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := s.SearchLiveText(filepath.Join("dir", "file.go"), 1)
+	if err != nil || len(hits) != 1 || hits[0].Path != path || !hits[0].ExactMatch || !hits[0].Live {
+		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+}
+
 func TestOpenVersionTwoRequiresReindex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "code.db")
 	s, err := Open(path, "test-model", 3)

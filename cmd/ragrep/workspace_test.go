@@ -270,14 +270,18 @@ func TestWorkspaceSnapshotStopsWaitingForUpdateLockWhenContextExpires(t *testing
 	}
 }
 
-func TestWorkspaceFullRefreshRequestDuringRefreshSurvivesUntilNextBarrier(t *testing.T) {
+func TestWorkspaceFullRefreshRequestDuringRefreshRetriesCurrentBarrier(t *testing.T) {
 	w := newTestWorkspace(t, "func BeforeRefreshRequest() {}")
 	started := make(chan struct{})
 	unblock := make(chan struct{})
 	original := w.enumerate
+	first := true
 	w.enumerate = func(root, ext string) ([]string, error) {
-		close(started)
-		<-unblock
+		if first {
+			first = false
+			close(started)
+			<-unblock
+		}
 		return original(root, ext)
 	}
 
@@ -292,16 +296,50 @@ func TestWorkspaceFullRefreshRequestDuringRefreshSurvivesUntilNextBarrier(t *tes
 	if err := <-refreshed; err != nil {
 		t.Fatal(err)
 	}
-	if err := w.refreshPaths(nil); !errors.Is(err, ErrWorkspaceSyncing) {
-		t.Fatalf("refreshPaths before next Barrier err=%v, want ErrWorkspaceSyncing", err)
+	if err := w.refreshPaths(nil); err != nil {
+		t.Fatalf("refreshPaths after stable Barrier: %v", err)
+	}
+}
+
+func TestWorkspaceBarrierRetriesRefreshWhenEpochChangesAfterEnumeration(t *testing.T) {
+	w := newTestWorkspace(t, "func BeforeRefreshRequest() {}")
+	firstEnumerated := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	original := w.enumerate
+	calls := 0
+	w.enumerate = func(root, ext string) ([]string, error) {
+		found, err := original(root, ext)
+		calls++
+		if calls == 1 {
+			close(firstEnumerated)
+			<-releaseFirst
+		}
+		return found, err
 	}
 
-	w.enumerate = original
-	if _, err := w.Barrier(context.Background()); err != nil {
-		t.Fatal(err)
+	refreshed := make(chan struct {
+		generation uint64
+		err        error
+	}, 1)
+	go func() {
+		generation, err := w.Barrier(context.Background())
+		refreshed <- struct {
+			generation uint64
+			err        error
+		}{generation, err}
+	}()
+	<-firstEnumerated
+	writeWorkspaceFile(t, w.root, "added.go", "func AddedAfterEnumeration() {}")
+	w.requireFullRefresh()
+	close(releaseFirst)
+
+	result := <-refreshed
+	if result.err != nil || calls != 2 || result.generation != w.gen+1 {
+		t.Fatalf("Barrier generation=%d calls=%d err=%v, want stable second refresh generation %d", result.generation, calls, result.err, w.gen+1)
 	}
-	if err := w.refreshPaths(nil); err != nil {
-		t.Fatalf("refreshPaths after next Barrier: %v", err)
+	hits, err := w.store.SearchLiveText("AddedAfterEnumeration", 1)
+	if err != nil || len(hits) != 1 || hits[0].Generation != result.generation {
+		t.Fatalf("hits=%v err=%v generation=%d", hits, err, result.generation)
 	}
 }
 

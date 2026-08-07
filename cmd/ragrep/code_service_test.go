@@ -167,6 +167,21 @@ func TestCodeServiceSearchDegradesToTextWhenEmbeddingFails(t *testing.T) {
 	}
 }
 
+func TestCodeServiceSearchPropagatesEmbeddingContextErrors(t *testing.T) {
+	for _, wantErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(wantErr.Error(), func(t *testing.T) {
+			svc, ws, embedder := newTestCodeService(t)
+			embedder.err = wantErr
+			ws.save(t, "service.go", "package service\nfunc HandleRequest() { ValidateToken() }")
+
+			resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "Handle request"})
+			if !errors.Is(err, wantErr) || resp.Fresh || resp.Degraded != "" || len(resp.Hits) != 0 || embedder.calls.Load() != 1 {
+				t.Fatalf("resp=%+v embed calls=%d err=%v, want %v without text fallback", resp, embedder.calls.Load(), err, wantErr)
+			}
+		})
+	}
+}
+
 func TestCodeServiceSearchExactDurableHitSkipsEmbedding(t *testing.T) {
 	svc, ws, embedder := newTestCodeService(t)
 	body := "func DurableHandler() {}"
@@ -213,6 +228,18 @@ func TestCodeServiceSearchDurableExactPathReturnsPinnedSymbols(t *testing.T) {
 
 	resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "pkg/service.go"})
 	if err != nil || len(resp.Hits) != 2 || resp.Hits[0].Path != "pkg/service.go" || resp.Hits[1].Path != "pkg/service.go" || !resp.Hits[0].ExactMatch || !resp.Hits[1].ExactMatch || embedder.calls.Load() != 0 || resp.UsedVector {
+		t.Fatalf("resp=%+v embed calls=%d err=%v", resp, embedder.calls.Load(), err)
+	}
+}
+
+func TestCodeServiceSearchWindowsLivePathReturnsPinnedLiveHit(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	oldBody := "func OldPathHandler() {}"
+	putServiceSymbol(t, ws.store, serviceSymbol("dir/file.go", "OldPathHandler", oldBody), "old-hash")
+	ws.save(t, "dir/file.go", "package service\nfunc CurrentPathHandler() {}")
+
+	resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: filepath.Join("dir", "file.go")})
+	if err != nil || len(resp.Hits) != 1 || !resp.Hits[0].Live || resp.Hits[0].Path != "dir/file.go" || !resp.Hits[0].ExactMatch || embedder.calls.Load() != 0 || resp.UsedVector {
 		t.Fatalf("resp=%+v embed calls=%d err=%v", resp, embedder.calls.Load(), err)
 	}
 }

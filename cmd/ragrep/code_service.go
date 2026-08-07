@@ -171,6 +171,9 @@ func (s *codeService) searchSnapshot(ctx context.Context, ws *workspaceState, re
 	}
 	degraded := ""
 	if err != nil && vectorErr != nil {
+		if errors.Is(vectorErr, context.Canceled) || errors.Is(vectorErr, context.DeadlineExceeded) {
+			return searchResponse{}, vectorErr
+		}
 		durable, err = ws.store.SearchSymbolsTextExact(req.Query, 50)
 		degraded = "vector_unavailable"
 		usedVector = false

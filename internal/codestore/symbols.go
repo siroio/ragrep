@@ -831,18 +831,40 @@ func ftsQuery(query string) string {
 // SearchLiveText finds current unsaved file content. Its hits describe the
 // whole file because no LSP symbol range exists for this provisional state.
 func (s *Store) SearchLiveText(query string, k int) ([]SymbolHit, error) {
+	if k <= 0 {
+		return nil, nil
+	}
+	exactPath := filepath.ToSlash(query)
+	var exact LiveFile
+	err := s.db.QueryRow(`
+		SELECT path, hash, body, generation
+		FROM live_files WHERE path=? AND NOT deleted`, exactPath).Scan(
+		&exact.Path, &exact.Hash, &exact.Body, &exact.Generation)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	var hits []SymbolHit
+	if err == nil {
+		exact.Key = liveKey(exact.Generation, exact.Hash, exact.Path)
+		hit := liveHit(exact)
+		hit.ExactMatch = true
+		hits = append(hits, hit)
+		if len(hits) == k {
+			return hits, nil
+		}
+	}
+
 	rows, err := s.db.Query(`
 		SELECT lf.path, lf.hash, lf.body, lf.generation
 		FROM live_fts
 		JOIN live_files lf ON lf.rowid=live_fts.rowid
-		WHERE live_fts MATCH ? AND NOT lf.deleted
-		ORDER BY bm25(live_fts) LIMIT ?`, ftsQuery(query), k)
+		WHERE live_fts MATCH ? AND NOT lf.deleted AND lf.path<>?
+		ORDER BY bm25(live_fts) LIMIT ?`, ftsQuery(query), exact.Path, k-len(hits))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var hits []SymbolHit
 	for rows.Next() {
 		var file LiveFile
 		if err := rows.Scan(&file.Path, &file.Hash, &file.Body, &file.Generation); err != nil {
