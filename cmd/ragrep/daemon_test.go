@@ -817,6 +817,84 @@ func TestWaitForDaemonStopTimesOutWhileDiscoveryRemains(t *testing.T) {
 	}
 }
 
+func TestDaemonStopOutlastsBlockedRestoreCleanup(t *testing.T) {
+	cache := t.TempDir()
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	root := testWorkspaceRoot(t)
+	registryFile := filepath.Join(t.TempDir(), "workspaces.json")
+	data, err := json.Marshal(workspaceRegistryFile{Roots: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	registry, err := newWorkspaceRegistry(registryFile, time.Minute, func(string) (*workspaceState, error) {
+		close(entered)
+		<-unblock
+		return nil, errors.New("restore failed")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newCodeService(registry.Resolve, nil, nil)
+	stop := make(chan struct{}, 1)
+	server := newDaemonHTTPServer(newDaemonServerHandler(service, "secret", registry, func() {
+		select {
+		case stop <- struct{}{}:
+		default:
+		}
+	}))
+	go func() {
+		<-stop
+		shutdownDaemonServer(server, daemonShutdownTimeout)
+	}()
+	discoveryPath, err := daemonDiscoveryPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonDiscovery(discoveryPath, daemonDiscovery{
+		Endpoint: "http://" + listener.Addr().String(),
+		Token:    "secret",
+		PID:      42,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() {
+		err := server.Serve(listener)
+		cleanupDaemon(discoveryPath, listener, service, registry)
+		served <- err
+	}()
+	registry.RestoreExplicitAsync()
+	<-entered
+	code := daemonStop()
+	_, discoveryErr := os.Stat(discoveryPath)
+	close(unblock)
+	registry.restore.Wait()
+	select {
+	case err := <-served:
+		if !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("serve error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("daemon cleanup did not finish after restore unblocked")
+	}
+	if code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if !errors.Is(discoveryErr, os.ErrNotExist) {
+		t.Fatalf("discovery existed when stop returned: %v", discoveryErr)
+	}
+}
+
 func TestDaemonServerForcesCloseAfterShutdownDeadline(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

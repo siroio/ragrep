@@ -21,10 +21,13 @@ import (
 )
 
 const (
-	daemonAddress        = "127.0.0.1:7377"
-	daemonEndpoint       = "http://" + daemonAddress
-	daemonStartTimeout   = 3 * time.Second
-	workspaceIdleTimeout = 30 * time.Minute
+	daemonAddress                = "127.0.0.1:7377"
+	daemonEndpoint               = "http://" + daemonAddress
+	daemonStartTimeout           = 3 * time.Second
+	daemonShutdownTimeout        = 2 * time.Second
+	workspaceRestoreCloseTimeout = 2 * time.Second
+	daemonStopTimeout            = daemonShutdownTimeout + workspaceRestoreCloseTimeout + time.Second
+	workspaceIdleTimeout         = 30 * time.Minute
 )
 
 var ErrWorkspaceNotFound = errors.New("workspace not found")
@@ -151,7 +154,7 @@ func newWorkspaceRegistry(file string, idle time.Duration, opener workspaceOpene
 		idle:           idle,
 		open:           opener,
 		entries:        make(map[string]*workspaceRegistryEntry),
-		restoreTimeout: daemonStartTimeout,
+		restoreTimeout: workspaceRestoreCloseTimeout,
 	}
 	data, err := os.ReadFile(file)
 	if errors.Is(err, os.ErrNotExist) {
@@ -545,7 +548,7 @@ func (r *workspaceRegistry) waitForRestore() {
 	}()
 	timeout := r.restoreTimeout
 	if timeout <= 0 {
-		timeout = daemonStartTimeout
+		timeout = workspaceRestoreCloseTimeout
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -678,7 +681,7 @@ func daemonStop() int {
 	if err != nil {
 		return fail(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), daemonStartTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), daemonStopTimeout)
 	defer cancel()
 	if err := client.Stop(ctx); err != nil {
 		return fail(err)
@@ -772,7 +775,7 @@ func serveDaemon() error {
 	}))
 	go func() {
 		<-stop
-		shutdownDaemonServer(server, daemonStartTimeout)
+		shutdownDaemonServer(server, daemonShutdownTimeout)
 	}()
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
