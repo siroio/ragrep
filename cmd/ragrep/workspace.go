@@ -34,6 +34,8 @@ type workspaceState struct {
 	enumerate           func(string, string) ([]string, error)
 	refresh             *workspaceRefresh
 	fullRefreshRequired bool
+	fullRefreshEpoch    uint64
+	confirmPath         func(string, string)
 	closed              bool
 	shutdownDone        chan struct{}
 	shutdownErr         error
@@ -77,7 +79,7 @@ func newWorkspaceState(root string, store *codestore.Store, roots []string, lang
 		}
 		relRoots = append(relRoots, rel)
 	}
-	states, err := store.ListFileStates()
+	states, err := store.ListWorkspaceFileStates()
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +126,9 @@ func (w *workspaceState) Barrier(ctx context.Context) (uint64, error) {
 
 func (w *workspaceState) runFullRefresh(refresh *workspaceRefresh) {
 	defer w.refreshWG.Done()
+	w.mu.Lock()
+	fullRefreshEpoch := w.fullRefreshEpoch
+	w.mu.Unlock()
 	w.refreshMu.Lock()
 	err := w.refreshAll()
 	w.refreshMu.Unlock()
@@ -132,7 +137,7 @@ func (w *workspaceState) runFullRefresh(refresh *workspaceRefresh) {
 	refresh.generation = w.generation
 	refresh.err = err
 	w.refreshErr = err
-	if err == nil {
+	if err == nil && w.fullRefreshEpoch == fullRefreshEpoch {
 		w.fullRefreshRequired = false
 	}
 	if w.refresh == refresh {
@@ -167,7 +172,7 @@ func (w *workspaceState) refreshAll() error {
 		}
 	}
 
-	states, err := w.store.ListFileStates()
+	states, err := w.store.ListWorkspaceFileStates()
 	if err != nil {
 		return err
 	}
@@ -207,6 +212,12 @@ func (w *workspaceState) refreshAll() error {
 		}
 	}
 	w.setGeneration(generation)
+	for _, path := range changed {
+		w.scheduleConfirmation(path, files[path].hash)
+	}
+	for _, path := range deleted {
+		w.scheduleConfirmation(path, previous[path].Hash)
+	}
 	return nil
 }
 
@@ -362,7 +373,23 @@ func (w *workspaceState) watch(watcher *fsnotify.Watcher, watched map[string]boo
 func (w *workspaceState) requireFullRefresh() {
 	w.mu.Lock()
 	w.fullRefreshRequired = true
+	w.fullRefreshEpoch++
 	w.mu.Unlock()
+}
+
+func (w *workspaceState) setConfirmation(confirm func(string, string)) {
+	w.mu.Lock()
+	w.confirmPath = confirm
+	w.mu.Unlock()
+}
+
+func (w *workspaceState) scheduleConfirmation(path, hash string) {
+	w.mu.Lock()
+	confirm := w.confirmPath
+	w.mu.Unlock()
+	if confirm != nil {
+		go confirm(path, hash)
+	}
 }
 
 func (w *workspaceState) refreshPaths(paths []string) error {
@@ -372,7 +399,7 @@ func (w *workspaceState) refreshPaths(paths []string) error {
 	if fullRefreshRequired {
 		return ErrWorkspaceSyncing
 	}
-	states, err := w.store.ListFileStates()
+	states, err := w.store.ListWorkspaceFileStates()
 	if err != nil {
 		return err
 	}
@@ -418,6 +445,12 @@ func (w *workspaceState) refreshPaths(paths []string) error {
 		}
 	}
 	w.setGeneration(generation)
+	for path, file := range files {
+		w.scheduleConfirmation(path, file.hash)
+	}
+	for _, path := range deleted {
+		w.scheduleConfirmation(path, previous[path].Hash)
+	}
 	return nil
 }
 

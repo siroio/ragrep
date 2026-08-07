@@ -179,6 +179,41 @@ func TestWorkspaceBarrierTimeoutDoesNotCancelRefresh(t *testing.T) {
 	}
 }
 
+func TestWorkspaceFullRefreshRequestDuringRefreshSurvivesUntilNextBarrier(t *testing.T) {
+	w := newTestWorkspace(t, "func BeforeRefreshRequest() {}")
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	original := w.enumerate
+	w.enumerate = func(root, ext string) ([]string, error) {
+		close(started)
+		<-unblock
+		return original(root, ext)
+	}
+
+	refreshed := make(chan error, 1)
+	go func() {
+		_, err := w.Barrier(context.Background())
+		refreshed <- err
+	}()
+	<-started
+	w.requireFullRefresh()
+	close(unblock)
+	if err := <-refreshed; err != nil {
+		t.Fatal(err)
+	}
+	if err := w.refreshPaths(nil); !errors.Is(err, ErrWorkspaceSyncing) {
+		t.Fatalf("refreshPaths before next Barrier err=%v, want ErrWorkspaceSyncing", err)
+	}
+
+	w.enumerate = original
+	if _, err := w.Barrier(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.refreshPaths(nil); err != nil {
+		t.Fatalf("refreshPaths after next Barrier: %v", err)
+	}
+}
+
 func TestWorkspaceWatcherRefreshesSavedPath(t *testing.T) {
 	w := newTestWorkspace(t, "func BeforeWatch() {}")
 	if err := w.StartWatcher(); err != nil {

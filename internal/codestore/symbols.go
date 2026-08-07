@@ -304,6 +304,13 @@ func (s *Store) ListPaths() ([]string, error) {
 	return paths, rows.Err()
 }
 
+// HasSymbolsForPath reports whether path has a durable symbol.
+func (s *Store) HasSymbolsForPath(path string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM symbols WHERE path=?)`, filepath.ToSlash(path)).Scan(&exists)
+	return exists, err
+}
+
 // PutLiveFile stores the current unsaved content for path, suppressing its
 // durable symbols until the live state is removed after a matching save.
 func (s *Store) PutLiveFile(filePath, hash, body string, generation uint64) error {
@@ -396,6 +403,24 @@ func (s *Store) RemoveLiveFileIfHash(filePath, expectedHash string) (bool, error
 	return true, nil
 }
 
+// GetLiveFileByPath returns path's live snapshot only when its hash still
+// matches expectedHash.
+func (s *Store) GetLiveFileByPath(filePath, expectedHash string) (LiveFile, error) {
+	var file LiveFile
+	err := s.db.QueryRow(`SELECT path, hash, body, generation, deleted FROM live_files WHERE path=?`, filepath.ToSlash(filePath)).Scan(
+		&file.Path, &file.Hash, &file.Body, &file.Generation, &file.Deleted)
+	if err == sql.ErrNoRows || err == nil && file.Hash != expectedHash {
+		return LiveFile{}, ErrStaleLiveKey
+	}
+	if err != nil {
+		return LiveFile{}, err
+	}
+	if !file.Deleted {
+		file.Key = liveKey(file.Generation, file.Hash, file.Path)
+	}
+	return file, nil
+}
+
 // ListFileStates returns the live overlay state for every dirty path.
 func (s *Store) ListFileStates() ([]FileState, error) {
 	rows, err := s.db.Query(`SELECT path, hash, generation, deleted FROM live_files ORDER BY path`)
@@ -403,7 +428,27 @@ func (s *Store) ListFileStates() ([]FileState, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanFileStates(rows)
+}
 
+// ListWorkspaceFileStates returns the visible hash baseline used by a
+// workspace refresh. A live row overrides durable symbols for the same path.
+func (s *Store) ListWorkspaceFileStates() ([]FileState, error) {
+	rows, err := s.db.Query(`
+		SELECT path, hash, generation, deleted FROM live_files
+		UNION ALL
+		SELECT path, MIN(file_hash), 0, false FROM symbols s
+		WHERE NOT EXISTS (SELECT 1 FROM live_files lf WHERE lf.path=s.path)
+		GROUP BY path
+		ORDER BY path`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFileStates(rows)
+}
+
+func scanFileStates(rows *sql.Rows) ([]FileState, error) {
 	var states []FileState
 	for rows.Next() {
 		var state FileState
