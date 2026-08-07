@@ -1173,6 +1173,13 @@ func TestLiveTextMarksWholeIdentifierAndPathExact(t *testing.T) {
 	if err != nil || len(path) != 1 || !path[0].ExactMatch {
 		t.Fatalf("path=%v err=%v", path, err)
 	}
+	if err := s.PutLiveFile("dir with spaces/service.go", "hash-space", "func OtherName() {}", 8); err != nil {
+		t.Fatal(err)
+	}
+	path, err = s.SearchLiveText("dir with spaces/service.go", 1)
+	if err != nil || len(path) != 1 || !path[0].ExactMatch {
+		t.Fatalf("space path=%v err=%v", path, err)
+	}
 }
 
 func TestOpenVersionTwoRequiresReindex(t *testing.T) {

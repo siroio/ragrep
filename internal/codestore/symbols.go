@@ -797,11 +797,11 @@ func liveSymbol(file LiveFile) codeindex.Symbol {
 }
 
 func liveExactMatch(query, filePath, body string) bool {
-	if len(strings.Fields(query)) != 1 {
-		return false
-	}
 	if query == filePath {
 		return true
+	}
+	if len(strings.Fields(query)) != 1 {
+		return false
 	}
 	for _, token := range strings.FieldsFunc(body, func(r rune) bool {
 		return r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
