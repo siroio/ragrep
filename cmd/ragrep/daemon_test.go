@@ -813,6 +813,128 @@ func TestWorkspaceRegistryRestoresExplicitRootsAsynchronouslyPerRoot(t *testing.
 	}
 }
 
+func TestWorkspaceRegistryRestoreSharesOpenWithResolveAndAcquire(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	data, err := json.Marshal(workspaceRegistryFile{Roots: []string{root}})
+	if err != nil || os.WriteFile(file, data, 0o600) != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	var unblockOnce sync.Once
+	releaseOpen := func() { unblockOnce.Do(func() { close(unblock) }) }
+	var opens atomic.Int32
+	r, err := newWorkspaceRegistry(file, time.Minute, func(root string) (*workspaceState, error) {
+		if opens.Add(1) == 1 {
+			close(entered)
+		}
+		<-unblock
+		return &workspaceState{root: root, shutdownDone: make(chan struct{})}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer releaseOpen()
+
+	r.RestoreExplicitAsync()
+	<-entered
+	resolved := make(chan error, 1)
+	acquired := make(chan error, 1)
+	go func() {
+		_, err := r.Resolve(root)
+		resolved <- err
+	}()
+	go func() {
+		release, err := r.Acquire(root)
+		if err == nil {
+			release()
+		}
+		acquired <- err
+	}()
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for opens.Load() == 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("concurrent restore, Resolve, and Acquire opened workspace %d times, want 1", got)
+	}
+	releaseOpen()
+	if err := <-resolved; err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := <-acquired; err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+}
+
+func TestWorkspaceRegistryRestoreSharesOpenWithAdd(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	data, err := json.Marshal(workspaceRegistryFile{Roots: []string{root}})
+	if err != nil || os.WriteFile(file, data, 0o600) != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	var unblockOnce sync.Once
+	releaseOpen := func() { unblockOnce.Do(func() { close(unblock) }) }
+	states := make(chan *workspaceState, 2)
+	var opens atomic.Int32
+	r, err := newWorkspaceRegistry(file, time.Minute, func(root string) (*workspaceState, error) {
+		state := &workspaceState{root: root, shutdownDone: make(chan struct{})}
+		states <- state
+		if opens.Add(1) == 1 {
+			close(entered)
+		}
+		<-unblock
+		return state, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer releaseOpen()
+
+	r.RestoreExplicitAsync()
+	<-entered
+	added := make(chan error, 1)
+	go func() {
+		_, err := r.Add(root)
+		added <- err
+	}()
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for opens.Load() == 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("concurrent restore and Add opened workspace %d times, want 1", got)
+	}
+	releaseOpen()
+	if err := <-added; err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	state := <-states
+	resolved, err := r.Resolve(root)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved != state {
+		t.Fatal("Add did not reuse the restore result")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-state.shutdownDone:
+	default:
+		t.Fatal("shared restore state was not closed")
+	}
+}
+
 func TestWorkspaceRegistryCloseWaitsForAsyncRestore(t *testing.T) {
 	root := testWorkspaceRoot(t)
 	file := filepath.Join(t.TempDir(), "workspaces.json")

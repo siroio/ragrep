@@ -144,8 +144,14 @@ func validatedDaemonListenAddress() (string, error) {
 type workspaceOpener func(string) (*workspaceState, error)
 type codeWorkspaceOpener func(string, string) (*workspaceState, error)
 
+type workspaceRestore struct {
+	done chan struct{}
+	err  error
+}
+
 type workspaceRegistryEntry struct {
 	state    *workspaceState
+	restore  *workspaceRestore
 	explicit bool
 	timer    *time.Timer
 	epoch    uint64
@@ -263,6 +269,23 @@ func (r *workspaceRegistry) Add(path string) (string, error) {
 	oldState := entry.state
 	oldRemoving := entry.removing
 	if entry.state == nil {
+		if err := r.waitForRestoreLocked(entry); err != nil {
+			if !existed && r.entries[root] == entry {
+				delete(r.entries, root)
+			}
+			r.mu.Unlock()
+			return "", err
+		}
+		if r.closed {
+			r.mu.Unlock()
+			return "", errors.New("workspace registry is closed")
+		}
+		if r.entries[root] != entry {
+			r.mu.Unlock()
+			return "", ErrWorkspaceNotFound
+		}
+	}
+	if entry.state == nil {
 		state, err := r.open(root)
 		if err != nil {
 			if !existed {
@@ -372,19 +395,48 @@ func (r *workspaceRegistry) RestoreExplicitAsync() {
 }
 
 func (r *workspaceRegistry) restoreExplicit(root string) {
-	state, err := r.open(root)
-	if err != nil {
-		return
-	}
 	r.mu.Lock()
 	entry := r.entries[root]
-	if r.closed || entry == nil || !entry.explicit || entry.state != nil {
+	if r.closed || entry == nil || !entry.explicit || entry.state != nil || entry.restore != nil {
 		r.mu.Unlock()
-		_ = closeWorkspaceEntry(&workspaceRegistryEntry{state: state})
 		return
 	}
-	entry.state = state
+	restore := &workspaceRestore{done: make(chan struct{})}
+	entry.restore = restore
 	r.mu.Unlock()
+
+	state, err := r.open(root)
+	r.mu.Lock()
+	restore.err = err
+	if err == nil {
+		switch {
+		case r.closed:
+			restore.err = errors.New("workspace registry is closed")
+		case r.entries[root] != entry || !entry.explicit || entry.removing:
+			restore.err = ErrWorkspaceNotFound
+		default:
+			entry.state = state
+		}
+	}
+	if entry.restore == restore {
+		entry.restore = nil
+	}
+	close(restore.done)
+	r.mu.Unlock()
+	if restore.err != nil && state != nil {
+		_ = closeWorkspaceEntry(&workspaceRegistryEntry{state: state})
+	}
+}
+
+func (r *workspaceRegistry) waitForRestoreLocked(entry *workspaceRegistryEntry) error {
+	restore := entry.restore
+	if restore == nil {
+		return nil
+	}
+	r.mu.Unlock()
+	<-restore.done
+	r.mu.Lock()
+	return restore.err
 }
 
 func (r *workspaceRegistry) Resolve(path string) (*workspaceState, error) {
@@ -408,6 +460,15 @@ func (r *workspaceRegistry) resolveLocked(root string) (*workspaceState, error) 
 	if entry == nil {
 		entry = &workspaceRegistryEntry{}
 		r.entries[root] = entry
+	}
+	if err := r.waitForRestoreLocked(entry); err != nil {
+		return nil, err
+	}
+	if r.closed {
+		return nil, errors.New("workspace registry is closed")
+	}
+	if r.entries[root] != entry {
+		return nil, ErrWorkspaceNotFound
 	}
 	if entry.removing {
 		if entry.leases > 0 && entry.state != nil {
@@ -492,6 +553,15 @@ func (r *workspaceRegistry) acquireLocked(root string) (*workspaceRegistryEntry,
 	if entry == nil {
 		entry = &workspaceRegistryEntry{}
 		r.entries[root] = entry
+	}
+	if err := r.waitForRestoreLocked(entry); err != nil {
+		return nil, err
+	}
+	if r.closed {
+		return nil, errors.New("workspace registry is closed")
+	}
+	if r.entries[root] != entry {
+		return nil, ErrWorkspaceNotFound
 	}
 	if entry.removing {
 		return nil, ErrWorkspaceNotFound
@@ -1052,21 +1122,32 @@ func cleanupDaemon(discoveryPath string, owned daemonDiscovery, resources ...io.
 	if discoveryPath == "" {
 		return
 	}
-	claim, err := claimDaemonDiscovery(discoveryPath)
-	if err != nil {
-		return
+	cleanupDaemonDiscovery(discoveryPath, owned, nil, nil)
+}
+
+func cleanupDaemonDiscovery(discoveryPath string, owned daemonDiscovery, claimsListed, ownedClaimRead func()) {
+	for {
+		claim, err := claimDaemonDiscovery(discoveryPath)
+		if err == nil {
+			finishDaemonDiscoveryClaim(claim, discoveryPath, owned)
+			return
+		}
+		if !errors.Is(err, os.ErrNotExist) || !removeOwnedDaemonDiscoveryClaims(discoveryPath, owned, claimsListed, ownedClaimRead) {
+			return
+		}
+		claimsListed = nil
+		ownedClaimRead = nil
 	}
-	finishDaemonDiscoveryClaim(claim, discoveryPath, owned)
 }
 
 func finishDaemonDiscoveryClaim(claim, discoveryPath string, owned daemonDiscovery) {
 	current, err := readDaemonDiscovery(claim)
 	if err == nil && current == owned {
-		removeDaemonDiscoveryClaim(claim)
+		_ = removeDaemonDiscoveryClaim(claim)
 		return
 	}
 	if err := os.Link(claim, discoveryPath); err == nil || errors.Is(err, os.ErrExist) {
-		removeDaemonDiscoveryClaim(claim)
+		_ = removeDaemonDiscoveryClaim(claim)
 	}
 }
 
@@ -1083,9 +1164,41 @@ func claimDaemonDiscovery(path string) (string, error) {
 	return claim, nil
 }
 
-func removeDaemonDiscoveryClaim(claim string) {
-	_ = os.Remove(claim)
+func removeDaemonDiscoveryClaim(claim string) error {
+	err := os.Remove(claim)
 	_ = os.Remove(filepath.Dir(claim))
+	return err
+}
+
+func removeOwnedDaemonDiscoveryClaims(discoveryPath string, owned daemonDiscovery, claimsListed, ownedClaimRead func()) bool {
+	dir := filepath.Dir(discoveryPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	if claimsListed != nil {
+		claimsListed()
+	}
+	retry := false
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".daemon-cleanup-") {
+			continue
+		}
+		claim := filepath.Join(dir, entry.Name(), "daemon.json")
+		current, err := readDaemonDiscovery(claim)
+		if errors.Is(err, os.ErrNotExist) {
+			dirErr := os.Remove(filepath.Dir(claim))
+			retry = retry || dirErr == nil || errors.Is(dirErr, os.ErrNotExist)
+		} else if err == nil && current == owned {
+			if ownedClaimRead != nil {
+				ownedClaimRead()
+				ownedClaimRead = nil
+			}
+			removeErr := removeDaemonDiscoveryClaim(claim)
+			retry = retry || removeErr == nil || errors.Is(removeErr, os.ErrNotExist)
+		}
+	}
+	return retry
 }
 
 func newDaemonHTTPServer(handler http.Handler) *http.Server {
