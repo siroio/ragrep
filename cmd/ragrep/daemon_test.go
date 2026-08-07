@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -367,6 +368,37 @@ func testWorkspaceOpener(opened map[string]*workspaceState) workspaceOpener {
 	}
 }
 
+func countWorkspaceOpeners(r *workspaceRegistry) *atomic.Int32 {
+	var opens atomic.Int32
+	openDefault := r.open
+	openCustom := r.openCode
+	r.open = func(root string) (*workspaceState, error) {
+		opens.Add(1)
+		return openDefault(root)
+	}
+	r.openCode = func(root, db string) (*workspaceState, error) {
+		opens.Add(1)
+		return openCustom(root, db)
+	}
+	return &opens
+}
+
+func makeDatabaseSymlink(t *testing.T, target, alias string) {
+	t.Helper()
+	if err := os.Symlink(target, alias); err != nil {
+		unsupported := errors.Is(err, os.ErrPermission)
+		if runtime.GOOS == "windows" {
+			unsupported = unsupported || errors.Is(err, syscall.Errno(50)) || errors.Is(err, syscall.Errno(1314))
+		} else {
+			unsupported = unsupported || errors.Is(err, syscall.Errno(38)) || errors.Is(err, syscall.Errno(45)) || errors.Is(err, syscall.Errno(95))
+		}
+		if unsupported {
+			t.Skipf("cannot create database symlink: %v", err)
+		}
+		t.Fatalf("create database symlink: %v", err)
+	}
+}
+
 func TestWorkspaceRegistryPersistsOnlyExplicitRoots(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "workspaces.json")
 	explicitRoot := testWorkspaceRoot(t)
@@ -408,34 +440,32 @@ func TestWorkspaceRegistryReusesSameFileDatabaseAliases(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer r.Close()
+		opens := countWorkspaceOpeners(r)
 		first, err := r.ResolveCode(root, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		alias := filepath.Join(root, "code-alias.db")
-		if err := os.Symlink(filepath.Join(root, ".ragrep", "code.db"), alias); err != nil {
-			t.Skipf("cannot create database symlink: %v", err)
-		}
+		makeDatabaseSymlink(t, filepath.Join(root, ".ragrep", "code.db"), alias)
 		second, err := r.ResolveCode(root, alias)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if first != second || len(r.entries) != 1 || len(r.codeEntries) != 0 {
-			t.Fatalf("same state=%v default entries=%d custom entries=%d", first == second, len(r.entries), len(r.codeEntries))
+		if first != second || len(r.entries) != 1 || len(r.codeEntries) != 0 || opens.Load() != 1 {
+			t.Fatalf("same state=%v default entries=%d custom entries=%d opens=%d", first == second, len(r.entries), len(r.codeEntries), opens.Load())
 		}
 	})
 
 	t.Run("custom alias then default", func(t *testing.T) {
 		root := testWorkspaceRoot(t)
 		alias := filepath.Join(root, "code-alias.db")
-		if err := os.Symlink(filepath.Join(root, ".ragrep", "code.db"), alias); err != nil {
-			t.Skipf("cannot create database symlink: %v", err)
-		}
+		makeDatabaseSymlink(t, filepath.Join(root, ".ragrep", "code.db"), alias)
 		r, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Hour, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer r.Close()
+		opens := countWorkspaceOpeners(r)
 		first, err := r.ResolveCode(root, alias)
 		if err != nil {
 			t.Fatal(err)
@@ -449,9 +479,9 @@ func TestWorkspaceRegistryReusesSameFileDatabaseAliases(t *testing.T) {
 			release()
 			t.Fatal(err)
 		}
-		if first != second || len(r.entries) != 0 || len(r.codeEntries) != 1 {
+		if first != second || len(r.entries) != 0 || len(r.codeEntries) != 1 || opens.Load() != 1 {
 			release()
-			t.Fatalf("same state=%v default entries=%d custom entries=%d", first == second, len(r.entries), len(r.codeEntries))
+			t.Fatalf("same state=%v default entries=%d custom entries=%d opens=%d", first == second, len(r.entries), len(r.codeEntries), opens.Load())
 		}
 		for _, entry := range r.codeEntries {
 			if entry.leases != 1 {
@@ -477,21 +507,20 @@ func TestWorkspaceRegistryReusesSameFileDatabaseAliases(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer r.Close()
+		opens := countWorkspaceOpeners(r)
 		db := filepath.Join(root, "custom.db")
 		first, err := r.ResolveCode(root, db)
 		if err != nil {
 			t.Fatal(err)
 		}
 		alias := filepath.Join(root, "custom-alias.db")
-		if err := os.Symlink(db, alias); err != nil {
-			t.Skipf("cannot create database symlink: %v", err)
-		}
+		makeDatabaseSymlink(t, db, alias)
 		second, err := r.ResolveCode(root, alias)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if first != second || len(r.codeEntries) != 1 {
-			t.Fatalf("same state=%v custom entries=%d", first == second, len(r.codeEntries))
+		if first != second || len(r.codeEntries) != 1 || opens.Load() != 1 {
+			t.Fatalf("same state=%v custom entries=%d opens=%d", first == second, len(r.codeEntries), opens.Load())
 		}
 	})
 }

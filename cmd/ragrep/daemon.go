@@ -142,6 +142,7 @@ func validatedDaemonListenAddress() (string, error) {
 }
 
 type workspaceOpener func(string) (*workspaceState, error)
+type codeWorkspaceOpener func(string, string) (*workspaceState, error)
 
 type workspaceRegistryEntry struct {
 	state    *workspaceState
@@ -161,6 +162,7 @@ type workspaceRegistry struct {
 	file           string
 	idle           time.Duration
 	open           workspaceOpener
+	openCode       codeWorkspaceOpener
 	entries        map[string]*workspaceRegistryEntry
 	codeEntries    map[codeWorkspaceKey]*workspaceRegistryEntry
 	closed         bool
@@ -183,6 +185,7 @@ func newWorkspaceRegistry(file string, idle time.Duration, opener workspaceOpene
 		file:           file,
 		idle:           idle,
 		open:           opener,
+		openCode:       openDaemonWorkspaceAt,
 		entries:        make(map[string]*workspaceRegistryEntry),
 		codeEntries:    make(map[codeWorkspaceKey]*workspaceRegistryEntry),
 		restoreTimeout: workspaceRestoreCloseTimeout,
@@ -453,7 +456,7 @@ func (r *workspaceRegistry) ResolveCode(path, db string) (*workspaceState, error
 		r.codeEntries[key] = entry
 	}
 	if entry.state == nil {
-		state, err := openDaemonWorkspaceAt(root, db)
+		state, err := r.openCode(root, db)
 		if err != nil {
 			delete(r.codeEntries, key)
 			return nil, err
@@ -544,7 +547,7 @@ func (r *workspaceRegistry) AcquireCode(path, db string) (func(), error) {
 		r.codeEntries[key] = entry
 	}
 	if entry.state == nil {
-		state, err := openDaemonWorkspaceAt(root, db)
+		state, err := r.openCode(root, db)
 		if err != nil {
 			delete(r.codeEntries, key)
 			r.mu.Unlock()

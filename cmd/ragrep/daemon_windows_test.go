@@ -47,6 +47,7 @@ func TestWorkspaceRegistryReusesWindowsDatabaseAliases(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer r.Close()
+		opens := countWorkspaceOpeners(r)
 		first, err := r.ResolveCode(root, "")
 		if err != nil {
 			t.Fatal(err)
@@ -56,8 +57,8 @@ func TestWorkspaceRegistryReusesWindowsDatabaseAliases(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if first != second || len(r.entries) != 1 || len(r.codeEntries) != 0 {
-			t.Fatalf("same state=%v default entries=%d custom entries=%d", first == second, len(r.entries), len(r.codeEntries))
+		if first != second || len(r.entries) != 1 || len(r.codeEntries) != 0 || opens.Load() != 1 {
+			t.Fatalf("same state=%v default entries=%d custom entries=%d opens=%d", first == second, len(r.entries), len(r.codeEntries), opens.Load())
 		}
 	})
 
@@ -68,6 +69,7 @@ func TestWorkspaceRegistryReusesWindowsDatabaseAliases(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer r.Close()
+		opens := countWorkspaceOpeners(r)
 		alias := strings.ToUpper(filepath.ToSlash(filepath.Join(root, ".ragrep", "code.db")))
 		first, err := r.ResolveCode(root, alias)
 		if err != nil {
@@ -82,8 +84,8 @@ func TestWorkspaceRegistryReusesWindowsDatabaseAliases(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if first != second || len(r.entries)+len(r.codeEntries) != 1 {
-			t.Fatalf("same state=%v default entries=%d custom entries=%d", first == second, len(r.entries), len(r.codeEntries))
+		if first != second || len(r.entries)+len(r.codeEntries) != 1 || opens.Load() != 1 {
+			t.Fatalf("same state=%v default entries=%d custom entries=%d opens=%d", first == second, len(r.entries), len(r.codeEntries), opens.Load())
 		}
 		entry := r.entries[root]
 		if entry == nil {
