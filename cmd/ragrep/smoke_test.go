@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -112,7 +114,7 @@ func TestSmokeDaemonLiveSearchIsFreshAndIsolated(t *testing.T) {
 		exeName += ".exe"
 	}
 	executable := filepath.Join(t.TempDir(), exeName)
-	build := exec.Command(goBin, "build", "-o", executable, ".")
+	build := exec.Command(goBin, "build", "-ldflags", "-X=main.daemonBindAddress=127.0.0.1:0", "-o", executable, ".")
 	build.Dir = packageDir
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build daemon: %v\n%s", err, output)
@@ -123,15 +125,30 @@ func TestSmokeDaemonLiveSearchIsFreshAndIsolated(t *testing.T) {
 	firstRoot := daemonSmokeWorkspace(t, "func OldWorkspaceSymbol() {}\n")
 	secondRoot := daemonSmokeWorkspace(t, "func SecondWorkspaceOnly() {}\n")
 	var daemonPID int
+	var daemonEndpointAddress string
 	stopped := false
+	discoveryPath := daemonSmokeDiscoveryPath(environmentRoot, runtime.GOOS)
 	t.Cleanup(func() {
 		if stopped {
 			return
+		}
+		if discovery, discoveryErr := readDaemonDiscovery(discoveryPath); discoveryErr == nil {
+			if daemonPID == 0 {
+				daemonPID = discovery.PID
+			}
+			if daemonEndpointAddress == "" {
+				daemonEndpointAddress = strings.TrimPrefix(discovery.Endpoint, "http://")
+			}
 		}
 		_, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "stop")
 		if err != nil && daemonPID > 0 {
 			if process, findErr := os.FindProcess(daemonPID); findErr == nil {
 				_ = process.Kill()
+			}
+		}
+		if daemonPID > 0 && daemonEndpointAddress != "" {
+			if waitErr := waitForDaemonSmokeCleanup(daemonPID, daemonEndpointAddress, 3*time.Second); waitErr != nil {
+				t.Errorf("daemon cleanup wait: %v", waitErr)
 			}
 		}
 		if err != nil {
@@ -146,6 +163,19 @@ func TestSmokeDaemonLiveSearchIsFreshAndIsolated(t *testing.T) {
 	daemonPID, err = strconv.Atoi(strings.TrimSpace(stdout))
 	if err != nil || daemonPID <= 0 {
 		t.Fatalf("daemon PID=%q err=%v", stdout, err)
+	}
+	discovery, err := readDaemonDiscovery(discoveryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemonEndpointAddress = strings.TrimPrefix(discovery.Endpoint, "http://")
+	host, portText, err := net.SplitHostPort(daemonEndpointAddress)
+	if err != nil {
+		t.Fatalf("daemon endpoint=%q: %v", discovery.Endpoint, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() || port == 0 || daemonEndpointAddress == daemonAddress {
+		t.Fatalf("daemon endpoint=%q host=%q port=%d err=%v, want allocated loopback", discovery.Endpoint, host, port, err)
 	}
 	secondStart, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "start")
 	if err != nil || strings.TrimSpace(secondStart) != strconv.Itoa(daemonPID) {
@@ -191,12 +221,10 @@ func TestSmokeDaemonLiveSearchIsFreshAndIsolated(t *testing.T) {
 	if _, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "stop"); err != nil {
 		t.Fatalf("daemon stop: %v: %s", err, stderr)
 	}
-	stopped = true
-	listener, err := net.Listen("tcp", daemonAddress)
-	if err != nil {
-		t.Fatalf("daemon process still owns %s: %v", daemonAddress, err)
+	if err := waitForDaemonSmokeCleanup(daemonPID, daemonEndpointAddress, 3*time.Second); err != nil {
+		t.Fatal(err)
 	}
-	_ = listener.Close()
+	stopped = true
 	t.Logf("save visibility: %v", visibility)
 }
 
@@ -218,9 +246,36 @@ func daemonSmokeWorkspace(t *testing.T, body string) string {
 	return root
 }
 
+func TestSmokeDaemonIsolationCoversDarwinUserDirs(t *testing.T) {
+	root := t.TempDir()
+	values := make(map[string]string)
+	for _, value := range isolatedDaemonEnvironment(root) {
+		name, value, ok := strings.Cut(value, "=")
+		if ok {
+			values[strings.ToUpper(name)] = value
+		}
+	}
+	wantHome := filepath.Join(root, "home")
+	if values["HOME"] != wantHome {
+		t.Fatalf("HOME=%q, want %q", values["HOME"], wantHome)
+	}
+	wantDiscovery := filepath.Join(wantHome, "Library", "Caches", "ragrep", "daemon.json")
+	if got := daemonSmokeDiscoveryPath(root, "darwin"); got != wantDiscovery {
+		t.Fatalf("darwin discovery=%q, want %q", got, wantDiscovery)
+	}
+}
+
+func daemonSmokeDiscoveryPath(root, goos string) string {
+	cache := filepath.Join(root, "cache")
+	if goos == "darwin" {
+		cache = filepath.Join(root, "home", "Library", "Caches")
+	}
+	return filepath.Join(cache, "ragrep", "daemon.json")
+}
+
 func isolatedDaemonEnvironment(root string) []string {
-	names := map[string]bool{"APPDATA": true, "LOCALAPPDATA": true, "XDG_CACHE_HOME": true, "XDG_CONFIG_HOME": true}
-	environment := make([]string, 0, len(os.Environ())+4)
+	names := map[string]bool{"APPDATA": true, "LOCALAPPDATA": true, "XDG_CACHE_HOME": true, "XDG_CONFIG_HOME": true, "HOME": true}
+	environment := make([]string, 0, len(os.Environ())+5)
 	for _, value := range os.Environ() {
 		name, _, _ := strings.Cut(value, "=")
 		if !names[strings.ToUpper(name)] {
@@ -232,6 +287,7 @@ func isolatedDaemonEnvironment(root string) []string {
 		"LOCALAPPDATA="+filepath.Join(root, "cache"),
 		"XDG_CACHE_HOME="+filepath.Join(root, "cache"),
 		"XDG_CONFIG_HOME="+filepath.Join(root, "config"),
+		"HOME="+filepath.Join(root, "home"),
 	)
 }
 
@@ -243,6 +299,37 @@ func runBuiltRagrep(executable, directory string, environment []string, args ...
 	command.Stdout, command.Stderr = &stdout, &stderr
 	err := command.Run()
 	return stdout.String(), stderr.String(), err
+}
+
+func waitForDaemonSmokeCleanup(pid int, address string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		running := daemonSmokeProcessRunning(pid)
+		listener, listenErr := net.Listen("tcp", address)
+		if listenErr == nil {
+			_ = listener.Close()
+		}
+		if !running && listenErr == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("daemon cleanup timed out: pid=%d running=%v address=%s listen=%v", pid, running, address, listenErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func daemonSmokeProcessRunning(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	defer process.Release()
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	err = process.Signal(syscall.Signal(0))
+	return err == nil || !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH)
 }
 
 func daemonSmokeSearch(t *testing.T, executable, root string, environment []string, query string) daemonSmokeSearchResult {

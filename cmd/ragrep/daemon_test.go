@@ -232,6 +232,34 @@ func TestDaemonTokenAndDiscoveryFile(t *testing.T) {
 	}
 }
 
+func TestDaemonListenAddressDefaultsAndAllowsOnlyLoopback(t *testing.T) {
+	original := daemonBindAddress
+	t.Cleanup(func() { daemonBindAddress = original })
+	daemonBindAddress = daemonAddress
+	address, err := validatedDaemonListenAddress()
+	if err != nil || address != daemonAddress {
+		t.Fatalf("default address=%q err=%v, want %q", address, err, daemonAddress)
+	}
+
+	for _, address := range []string{"127.0.0.1:0", "[::1]:0"} {
+		t.Run("allows_"+address, func(t *testing.T) {
+			daemonBindAddress = address
+			got, err := validatedDaemonListenAddress()
+			if err != nil || got != address {
+				t.Fatalf("address=%q err=%v, want %q", got, err, address)
+			}
+		})
+	}
+	for _, address := range []string{"0.0.0.0:0", "192.0.2.1:7377", "localhost:0", ":0", "not-an-address"} {
+		t.Run("rejects_"+address, func(t *testing.T) {
+			daemonBindAddress = address
+			if got, err := validatedDaemonListenAddress(); err == nil {
+				t.Fatalf("address=%q unexpectedly accepted as %q", address, got)
+			}
+		})
+	}
+}
+
 func TestDaemonListenerIsSingleton(t *testing.T) {
 	first, err := listenDaemon("127.0.0.1:0")
 	if err != nil {
@@ -1028,6 +1056,7 @@ func BenchmarkWorkspaceBarrier(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+	b.StopTimer()
 }
 
 func BenchmarkExactSearch(b *testing.B) {
@@ -1060,7 +1089,7 @@ func BenchmarkHybridSearch(b *testing.B) {
 	defer workspace.Close()
 	defer store.Close()
 	symbol := serviceSymbol("service.go", "ValidateRequest", "func ValidateRequest() {}")
-	if _, err := store.UpsertSymbols(symbol.Path, codeindex.FileHash([]byte(symbol.Body)), []codeindex.Symbol{symbol}, 0, fakeCodeEmbed); err != nil {
+	if _, err := store.UpsertSymbols(symbol.Path, codeindex.FileHash([]byte("package sample\n"+symbol.Body+"\n")), []codeindex.Symbol{symbol}, 0, fakeCodeEmbed); err != nil {
 		b.Fatal(err)
 	}
 	service := newCodeService(func(string) (*workspaceState, error) { return workspace, nil }, newEmbeddingPool(func() (textEmbedder, error) {
@@ -1073,10 +1102,11 @@ func BenchmarkHybridSearch(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		result, err := service.Search(context.Background(), searchRequest{Root: workspace.root, Query: "request validation", Mode: "hybrid"})
-		if err != nil || len(result.Hits) == 0 || !result.UsedVector || !result.Fresh {
+		if err != nil || len(result.Hits) == 0 || result.Hits[0].Key != symbol.Key || result.Hits[0].Live || result.Hits[0].VecRank == 0 || !result.UsedVector || !result.Fresh {
 			b.Fatalf("result=%+v err=%v", result, err)
 		}
 	}
+	b.StopTimer()
 }
 
 func BenchmarkWorkspaceBarrierTwoWorkspaceIsolation(b *testing.B) {
@@ -1093,17 +1123,22 @@ func BenchmarkWorkspaceBarrierTwoWorkspaceIsolation(b *testing.B) {
 		return second, nil
 	}, newEmbeddingPool(func() (textEmbedder, error) { return new(serviceTestEmbedder), nil }), nil)
 	defer service.Close()
-	b.ResetTimer()
-	for range b.N {
-		own, err := service.Search(context.Background(), searchRequest{Root: first.root, Query: "FirstWorkspaceOnly"})
+	searchBoth := func() {
+		own, err := service.Search(context.Background(), searchRequest{Root: first.root, Query: "FirstWorkspaceOnly", Mode: "text"})
 		if err != nil || len(own.Hits) == 0 {
 			b.Fatalf("own=%+v err=%v", own, err)
 		}
-		other, err := service.Search(context.Background(), searchRequest{Root: second.root, Query: "FirstWorkspaceOnly"})
+		other, err := service.Search(context.Background(), searchRequest{Root: second.root, Query: "FirstWorkspaceOnly", Mode: "text"})
 		if err != nil || len(other.Hits) != 0 {
 			b.Fatalf("other=%+v err=%v", other, err)
 		}
 	}
+	searchBoth()
+	b.ResetTimer()
+	for range b.N {
+		searchBoth()
+	}
+	b.StopTimer()
 }
 
 func newDaemonBenchmarkWorkspace(b *testing.B, body string) (*workspaceState, *codestore.Store) {

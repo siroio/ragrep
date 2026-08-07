@@ -22,13 +22,14 @@ import (
 
 const (
 	daemonAddress                = "127.0.0.1:7377"
-	daemonEndpoint               = "http://" + daemonAddress
 	daemonStartTimeout           = 3 * time.Second
 	daemonShutdownTimeout        = 2 * time.Second
 	workspaceRestoreCloseTimeout = 2 * time.Second
 	daemonStopTimeout            = daemonShutdownTimeout + workspaceRestoreCloseTimeout + time.Second
 	workspaceIdleTimeout         = 30 * time.Minute
 )
+
+var daemonBindAddress = daemonAddress
 
 var ErrWorkspaceNotFound = errors.New("workspace not found")
 
@@ -114,6 +115,22 @@ func clientFromDiscovery() (daemonClient, daemonDiscovery, error) {
 
 func listenDaemon(address string) (net.Listener, error) {
 	return net.Listen("tcp", address)
+}
+
+func validatedDaemonListenAddress() (string, error) {
+	address := daemonBindAddress
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", err
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return "", errors.New("daemon bind address must be numeric loopback")
+	}
+	resolved, err := net.ResolveTCPAddr("tcp", address)
+	if err != nil {
+		return "", err
+	}
+	return resolved.String(), nil
 }
 
 type workspaceOpener func(string) (*workspaceState, error)
@@ -904,7 +921,11 @@ func serveDaemon() error {
 			return errors.New("daemon is already running")
 		}
 	}
-	listener, err := listenDaemon(daemonAddress)
+	address, err := validatedDaemonListenAddress()
+	if err != nil {
+		return err
+	}
+	listener, err := listenDaemon(address)
 	if err != nil {
 		return fmt.Errorf("daemon already running or address unavailable: %w", err)
 	}
@@ -925,7 +946,7 @@ func serveDaemon() error {
 	if err != nil {
 		return err
 	}
-	discovery := daemonDiscovery{Endpoint: daemonEndpoint, Token: token, PID: os.Getpid()}
+	discovery := daemonDiscovery{Endpoint: "http://" + listener.Addr().String(), Token: token, PID: os.Getpid()}
 	if err := writeDaemonDiscovery(discoveryPath, discovery); err != nil {
 		return err
 	}
