@@ -164,6 +164,10 @@ func (h *daemonHandler) pack(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
 		return
 	}
+	if len(req.SelectedKeys) > 3 {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: fmt.Sprintf("selected keys accepts at most 3 keys, got %d", len(req.SelectedKeys))})
+		return
+	}
 	release, ok := h.acquireWorkspace(w, req.Root, req.DB)
 	if !ok {
 		return

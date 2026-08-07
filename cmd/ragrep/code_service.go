@@ -210,7 +210,25 @@ func (s *codeService) Verify(ctx context.Context, req verifyRequest) (codeVerify
 	if _, err := codeServiceBarrier(ctx, ws); err != nil {
 		return codeVerifyOutput{}, err
 	}
-	return runCodeVerify(ws.store, req.Manifest, ws.root)
+	return runCodeVerify(ctx, req.Manifest, func(path string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(ws.root, filepath.FromSlash(path)))
+	}, func(ref coderetrieval.SymbolRef) (coderetrieval.SymbolRef, error) {
+		getSymbol := func(key string) (codeindex.Symbol, error) {
+			return s.Get(ctx, getRequest{Root: req.Root, DB: req.DB, Key: key})
+		}
+		if strings.HasPrefix(ref.Key, "live:") {
+			sym, err := getSymbol(ref.Key)
+			if err == nil {
+				ref.StartLine, ref.EndLine = sym.Range.Start.Line, sym.Range.End.Line
+				return ref, nil
+			}
+			if errors.Is(err, ErrStaleLiveKey) || errors.Is(err, codestore.ErrNotFound) {
+				return coderetrieval.SymbolRef{}, fmt.Errorf("%w: live key %q is stale", coderetrieval.ErrAmbiguousResolution, ref.Key)
+			}
+			return coderetrieval.SymbolRef{}, err
+		}
+		return coderetrieval.ResolveRef(ref, getSymbol, ws.store.FindByQualifiedName)
+	})
 }
 
 func codeServiceBarrier(ctx context.Context, ws *workspaceState) (uint64, error) {

@@ -2034,6 +2034,50 @@ func TestCodeServiceVerifyCrossesBarrierAndDetectsSuppressedChange(t *testing.T)
 	}
 }
 
+func TestCodeServiceVerifyResolvesCurrentLivePack(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	ws.save(t, "service.go", "package service\nfunc LiveCurrent() {}")
+	search, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "LiveCurrent"})
+	if err != nil || len(search.Hits) != 1 || !search.Hits[0].Live {
+		t.Fatalf("search=%+v err=%v", search, err)
+	}
+	pack, err := svc.Pack(context.Background(), packRequest{
+		Root: ws.root, Query: "LiveCurrent", Budget: 100_000, SelectedKeys: []string{search.Hits[0].Key},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	verified, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: pack.Manifest})
+	if err != nil || !verified.Clean || len(verified.Entries) != 1 || !verified.Entries[0].Resolved || verified.Entries[0].Stale {
+		t.Fatalf("verified=%+v err=%v", verified, err)
+	}
+}
+
+func TestCodeServiceVerifyMarksReplacedLiveKeyStaleAndUnresolved(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	ws.save(t, "service.go", "package service\nfunc FirstLive() {}")
+	search, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "FirstLive"})
+	if err != nil || len(search.Hits) != 1 {
+		t.Fatalf("search=%+v err=%v", search, err)
+	}
+	pack, err := svc.Pack(context.Background(), packRequest{
+		Root: ws.root, Query: "FirstLive", Budget: 100_000, SelectedKeys: []string{search.Hits[0].Key},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws.save(t, "service.go", "package service\nfunc SecondLive() {}")
+	if err := ws.refreshPaths([]string{filepath.Join(ws.root, "service.go")}); err != nil {
+		t.Fatal(err)
+	}
+
+	verified, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: pack.Manifest})
+	if err != nil || verified.Clean || len(verified.Entries) != 1 || verified.Entries[0].Resolved || !verified.Entries[0].Stale || verified.Entries[0].Error == "" {
+		t.Fatalf("verified=%+v err=%v", verified, err)
+	}
+}
+
 func TestCodeServiceVerifyWaitsForBarrier(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	unblock := make(chan struct{})
@@ -2048,6 +2092,46 @@ func TestCodeServiceVerifyWaitsForBarrier(t *testing.T) {
 	}})
 	if !errors.Is(err, ErrWorkspaceSyncing) || len(out.Entries) != 0 || out.Clean {
 		t.Fatalf("out=%+v err=%v", out, err)
+	}
+}
+
+func TestRunCodeVerifyCancellationStopsFurtherReadsAndResolution(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	manifest := coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{
+		{Key: "a", Path: "a.go", FileHash: codeindex.FileHash([]byte("a"))},
+		{Key: "b", Path: "b.go", FileHash: codeindex.FileHash([]byte("b"))},
+	}}
+	reads, resolutions := 0, 0
+	out, err := runCodeVerify(ctx, manifest,
+		func(string) ([]byte, error) {
+			reads++
+			cancel()
+			return []byte("a"), nil
+		},
+		func(ref coderetrieval.SymbolRef) (coderetrieval.SymbolRef, error) {
+			resolutions++
+			return ref, nil
+		})
+	if !errors.Is(err, context.Canceled) || reads != 1 || resolutions != 0 || len(out.Entries) != 0 {
+		t.Fatalf("out=%+v err=%v reads=%d resolutions=%d", out, err, reads, resolutions)
+	}
+}
+
+func TestRunCodeVerifySamePathComparesEachManifestHash(t *testing.T) {
+	body := []byte("current")
+	manifest := coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{
+		{Key: "fresh", Path: "same.go", FileHash: codeindex.FileHash(body)},
+		{Key: "stale", Path: "same.go", FileHash: "old-hash"},
+	}}
+	reads := 0
+	out, err := runCodeVerify(context.Background(), manifest,
+		func(string) ([]byte, error) {
+			reads++
+			return body, nil
+		},
+		func(ref coderetrieval.SymbolRef) (coderetrieval.SymbolRef, error) { return ref, nil })
+	if err != nil || reads != 1 || len(out.Entries) != 2 || out.Entries[0].Stale || !out.Entries[1].Stale {
+		t.Fatalf("out=%+v err=%v reads=%d", out, err, reads)
 	}
 }
 
@@ -2075,6 +2159,56 @@ func TestCmdCodeVerifyUsesDaemonAndPreservesExitCode(t *testing.T) {
 	}
 	if _, err := os.Stat(db); !os.IsNotExist(err) {
 		t.Fatalf("CLI must not create code.db, stat err=%v", err)
+	}
+}
+
+func TestCmdCodePackLiveThenVerifyIsClean(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	svc := injectCodeServiceDaemon(t, root, db)
+	if err := os.WriteFile(filepath.Join(root, "service.go"), []byte("package service\nfunc LiveCLI() {}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	search, err := svc.Search(context.Background(), searchRequest{Root: root, DB: db, Query: "LiveCLI"})
+	if err != nil || len(search.Hits) != 1 || !search.Hits[0].Live {
+		t.Fatalf("search=%+v err=%v", search, err)
+	}
+
+	packCode, packJSON, packStderr := captureCodeCommand(t, []string{
+		"code", "pack", "--db", db, "--query", "LiveCLI", "--select", search.Hits[0].Key, "--json",
+	})
+	if packCode != 0 || packStderr != "" {
+		t.Fatalf("pack exit=%d stdout=%q stderr=%q", packCode, packJSON, packStderr)
+	}
+	packPath := filepath.Join(t.TempDir(), "live-pack.json")
+	if err := os.WriteFile(packPath, []byte(packJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	verifyCode, verifyJSON, verifyStderr := captureCodeCommand(t, []string{
+		"code", "verify", "--db", db, "--manifest", packPath, "--json",
+	})
+	if verifyCode != 0 || verifyStderr != "" {
+		t.Fatalf("verify exit=%d stdout=%q stderr=%q", verifyCode, verifyJSON, verifyStderr)
+	}
+	var verified codeVerifyOutput
+	if err := json.Unmarshal([]byte(verifyJSON), &verified); err != nil || !verified.Clean {
+		t.Fatalf("verified=%+v err=%v", verified, err)
+	}
+}
+
+func TestDaemonPackRejectsMoreThanThreeSelectedKeysAsBadRequest(t *testing.T) {
+	server := httptest.NewServer(newDaemonHandler(nil, "test-token"))
+	defer server.Close()
+	client := daemonClient{endpoint: server.URL, token: "test-token", client: server.Client()}
+
+	_, err := client.Pack(context.Background(), packRequest{
+		Root: t.TempDir(), DB: filepath.Join(t.TempDir(), "code.db"), Query: "q",
+		SelectedKeys: []string{"a", "b", "c", "d"},
+	})
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) || apiErr.Code != "bad_request" {
+		t.Fatalf("err=%v, want typed bad_request", err)
 	}
 }
 

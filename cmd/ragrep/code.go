@@ -1003,36 +1003,52 @@ type codeVerifyOutput struct {
 	Clean   bool              `json:"clean"`
 }
 
-// runCodeVerify checks m's staleness against wsRoot's on-disk files (see
-// coderetrieval.CheckStale) and re-resolves every entry against s (see
-// coderetrieval.ResolveRef), producing one codeVerifyEntry per manifest
-// symbol. Only a genuine store error aborts with a non-nil error --
+// runCodeVerify checks m's staleness with readFile and re-resolves every
+// entry with resolveRef, producing one codeVerifyEntry per manifest symbol.
+// It checks ctx before each read and resolution so a disconnected request
+// stops before doing more filesystem or store work. Only an operational
+// error aborts with a non-nil error --
 // ErrAmbiguousResolution is a normal per-entry outcome (see ResolveRef's
 // doc comment on why the caller must halt on it rather than guess), folded
 // into that entry's Error field, not propagated.
-func runCodeVerify(s *codestore.Store, m coderetrieval.Manifest, wsRoot string) (codeVerifyOutput, error) {
-	staleReport := coderetrieval.CheckStale(m, func(path string) ([]byte, error) {
-		return os.ReadFile(filepath.Join(wsRoot, filepath.FromSlash(path)))
-	})
-	staleByKey := make(map[string]bool, len(staleReport.Entries))
-	for _, e := range staleReport.Entries {
-		staleByKey[e.Key] = e.Stale
+func runCodeVerify(ctx context.Context, m coderetrieval.Manifest, readFile func(string) ([]byte, error), resolveRef func(coderetrieval.SymbolRef) (coderetrieval.SymbolRef, error)) (codeVerifyOutput, error) {
+	type fileState struct {
+		hash       string
+		unreadable bool
 	}
-
+	files := make(map[string]fileState)
 	out := codeVerifyOutput{Clean: true}
 	for _, ref := range m.Symbols {
-		entry := codeVerifyEntry{Key: ref.Key, Path: ref.Path, Stale: staleByKey[ref.Key]}
+		if err := ctx.Err(); err != nil {
+			return codeVerifyOutput{}, err
+		}
+		file, ok := files[ref.Path]
+		if !ok {
+			content, err := readFile(ref.Path)
+			file.unreadable = err != nil
+			if err == nil {
+				file.hash = codeindex.FileHash(content)
+			}
+			files[ref.Path] = file
+		}
+		if err := ctx.Err(); err != nil {
+			return codeVerifyOutput{}, err
+		}
+		entry := codeVerifyEntry{Key: ref.Key, Path: ref.Path, Stale: file.unreadable || file.hash != ref.FileHash}
 		if entry.Stale {
 			out.Clean = false
 		}
 
-		resolved, err := coderetrieval.ResolveRef(ref, s.GetSymbol, s.FindByQualifiedName)
+		resolved, err := resolveRef(ref)
 		switch {
 		case err == nil:
 			entry.Resolved = true
 			entry.ResolvedKey = resolved.Key
 		case errors.Is(err, coderetrieval.ErrAmbiguousResolution):
 			entry.Error = err.Error()
+			if strings.HasPrefix(ref.Key, "live:") {
+				entry.Stale = true
+			}
 			out.Clean = false
 		default:
 			return codeVerifyOutput{}, err
