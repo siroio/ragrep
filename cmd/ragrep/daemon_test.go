@@ -1294,6 +1294,65 @@ func TestCleanupDaemonRemovesDiscoveryAfterResourcesClose(t *testing.T) {
 	}
 }
 
+func TestServeDaemonCancelsConfirmationBeforeClosingService(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "cache")
+	configDir := filepath.Join(t.TempDir(), "config")
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	t.Setenv("APPDATA", configDir)
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	originalAddress := daemonBindAddress
+	daemonBindAddress = "127.0.0.1:0"
+	t.Cleanup(func() { daemonBindAddress = originalAddress })
+
+	root := t.TempDir()
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-daemon-cleanup-initialize", blockingInitializeServerSrc)
+	writeRagrepConfig(t, root, `{"servers":{"go":"`+filepath.ToSlash(exe)+`"}}`)
+	writeWorkspaceFile(t, root, "service.go", "package service\nfunc CleanupBlockedInitialize() {}\n")
+	served := make(chan error, 1)
+	go func() { served <- serveDaemon() }()
+	discovery, err := waitForDaemon(2 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := daemonClient{endpoint: discovery.Endpoint, token: discovery.Token}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err = client.Search(ctx, searchRequest{Root: root, Query: "CleanupBlockedInitialize"})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForTestPath(t, filepath.Join(root, "initialize.started"))
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	err = client.Stop(ctx)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prompt := false
+	var serveErr error
+	select {
+	case serveErr = <-served:
+		prompt = true
+	case <-time.After(300 * time.Millisecond):
+		serveErr = <-served
+	}
+	if serveErr != nil {
+		t.Fatal(serveErr)
+	}
+	if !prompt {
+		t.Fatal("daemon cleanup closed service before canceling workspace confirmations")
+	}
+	discoveryPath, err := daemonDiscoveryPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(discoveryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery remains after cleanup: %v", err)
+	}
+}
+
 func TestCleanupDaemonPreservesNewerDiscovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.json")
 	old := daemonDiscovery{Endpoint: "http://127.0.0.1:7377", Token: "old", PID: 1}

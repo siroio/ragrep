@@ -1085,7 +1085,7 @@ func serveDaemon() error {
 	service := newCodeServiceForDB(registry.ResolveCode, nil, nil)
 	cleanupPath := ""
 	cleanupDiscovery := daemonDiscovery{}
-	defer func() { cleanupDaemon(cleanupPath, cleanupDiscovery, listener, service, registry) }()
+	defer func() { cleanupDaemon(cleanupPath, cleanupDiscovery, listener, registry, service) }()
 	token, err := newDaemonToken()
 	if err != nil {
 		return err
