@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -124,6 +125,11 @@ func (s *codeService) searchSnapshot(ctx context.Context, ws *workspaceState, re
 	if k <= 0 || k > 5 {
 		k = 5
 	}
+	query, err := canonicalSearchQuery(ws, req.Query)
+	if err != nil {
+		return searchResponse{}, err
+	}
+	req.Query = query
 	live, err := ws.store.SearchLiveText(req.Query, 50)
 	if err != nil {
 		return searchResponse{}, err
@@ -188,6 +194,39 @@ func (s *codeService) searchSnapshot(ctx context.Context, ws *workspaceState, re
 		Degraded:   degraded,
 		UsedVector: usedVector,
 	}, nil
+}
+
+func canonicalSearchQuery(ws *workspaceState, query string) (string, error) {
+	path := filepath.FromSlash(query)
+	looksLikePath := filepath.IsAbs(path) || strings.HasPrefix(query, "./") || strings.HasPrefix(query, `.\`) || strings.ContainsAny(query, `/\`)
+	if !looksLikePath && filepath.Ext(path) != "" {
+		_, err := os.Stat(filepath.Join(ws.root, path))
+		looksLikePath = err == nil
+	}
+	if !looksLikePath {
+		return query, nil
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(ws.root, path)
+	}
+	rel, err := filepath.Rel(ws.root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return query, nil
+	}
+	rel = filepath.ToSlash(rel)
+	if runtime.GOOS != "windows" {
+		return rel, nil
+	}
+	states, err := ws.store.ListWorkspaceFileStates()
+	if err != nil {
+		return "", err
+	}
+	for _, state := range states {
+		if strings.EqualFold(state.Path, rel) {
+			return state.Path, nil
+		}
+	}
+	return rel, nil
 }
 
 func (s *codeService) Pack(ctx context.Context, req packRequest) (codePackOutput, error) {

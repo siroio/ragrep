@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -240,6 +241,66 @@ func TestCodeServiceSearchWindowsLivePathReturnsPinnedLiveHit(t *testing.T) {
 
 	resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: filepath.Join("dir", "file.go")})
 	if err != nil || len(resp.Hits) != 1 || !resp.Hits[0].Live || resp.Hits[0].Path != "dir/file.go" || !resp.Hits[0].ExactMatch || embedder.calls.Load() != 0 || resp.UsedVector {
+		t.Fatalf("resp=%+v embed calls=%d err=%v", resp, embedder.calls.Load(), err)
+	}
+}
+
+func TestCodeServiceSearchCanonicalizesWorkspacePathQueries(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	durableBody := "func DurablePathHandler() {}"
+	putServiceSymbol(t, ws.store, serviceSymbol("dir/durable.go", "DurablePathHandler", durableBody), ws.save(t, "dir/durable.go", durableBody))
+	ws.save(t, "dir/live.go", "package service\nfunc LivePathHandler() {}")
+
+	tests := []struct {
+		name, query, wantPath string
+		wantLive              bool
+	}{
+		{name: "dot-relative durable", query: "." + string(filepath.Separator) + filepath.Join("dir", "durable.go"), wantPath: "dir/durable.go"},
+		{name: "absolute durable", query: filepath.Join(ws.root, "dir", "durable.go"), wantPath: "dir/durable.go"},
+		{name: "dot-relative live", query: "." + string(filepath.Separator) + filepath.Join("dir", "live.go"), wantPath: "dir/live.go", wantLive: true},
+		{name: "absolute live", query: filepath.Join(ws.root, "dir", "live.go"), wantPath: "dir/live.go", wantLive: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			before := embedder.calls.Load()
+			resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: test.query, Mode: "auto"})
+			if err != nil || len(resp.Hits) == 0 || resp.Hits[0].Path != test.wantPath || resp.Hits[0].Live != test.wantLive || !resp.Hits[0].ExactMatch || resp.UsedVector || embedder.calls.Load() != before {
+				t.Fatalf("query=%q resp=%+v embed calls=%d err=%v", test.query, resp, embedder.calls.Load(), err)
+			}
+		})
+	}
+}
+
+func TestCodeServiceSearchCanonicalizesWindowsPathCase(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows paths are case-insensitive")
+	}
+	svc, ws, embedder := newTestCodeService(t)
+	body := "func CasePathHandler() {}"
+	putServiceSymbol(t, ws.store, serviceSymbol("Dir/File.go", "CasePathHandler", body), ws.save(t, "Dir/File.go", body))
+	ws.save(t, "Live/Current.go", "package service\nfunc LiveCasePathHandler() {}")
+
+	for _, test := range []struct {
+		query, wantPath string
+		wantLive        bool
+	}{
+		{query: filepath.Join(ws.root, "dir", "file.go"), wantPath: "Dir/File.go"},
+		{query: filepath.Join(ws.root, "live", "current.go"), wantPath: "Live/Current.go", wantLive: true},
+	} {
+		resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: test.query, Mode: "auto"})
+		if err != nil || len(resp.Hits) == 0 || resp.Hits[0].Path != test.wantPath || resp.Hits[0].Live != test.wantLive || !resp.Hits[0].ExactMatch || resp.UsedVector || embedder.calls.Load() != 0 {
+			t.Fatalf("query=%q resp=%+v embed calls=%d err=%v", test.query, resp, embedder.calls.Load(), err)
+		}
+	}
+}
+
+func TestCodeServiceSearchDoesNotCanonicalizeOutsideWorkspacePath(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	outside := filepath.Join(filepath.Dir(ws.root), "outside.go")
+	embedder.err = errors.New("outside query reached embedding")
+
+	resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: outside, Mode: "auto"})
+	if err != nil || resp.Degraded != "vector_unavailable" || resp.UsedVector || embedder.calls.Load() != 1 {
 		t.Fatalf("resp=%+v embed calls=%d err=%v", resp, embedder.calls.Load(), err)
 	}
 }
