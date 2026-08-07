@@ -634,6 +634,62 @@ func TestWorkspaceRegistryCloseWaitsForAsyncRestore(t *testing.T) {
 	}
 }
 
+func TestWorkspaceRegistryCloseDeadlineRemovesDiscoveryAndClosesLateRestore(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	data, err := json.Marshal(workspaceRegistryFile{Roots: []string{root}})
+	if err != nil || os.WriteFile(file, data, 0o600) != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	produced := make(chan *workspaceState)
+	r, err := newWorkspaceRegistry(file, time.Minute, func(root string) (*workspaceState, error) {
+		close(entered)
+		<-unblock
+		state := &workspaceState{root: root, shutdownDone: make(chan struct{})}
+		produced <- state
+		return state, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.restoreTimeout = 20 * time.Millisecond
+	r.RestoreExplicitAsync()
+	<-entered
+	discoveryPath := filepath.Join(t.TempDir(), "daemon.json")
+	if err := os.WriteFile(discoveryPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cleaned := make(chan struct{})
+	go func() {
+		cleanupDaemon(discoveryPath, r)
+		close(cleaned)
+	}()
+	select {
+	case <-cleaned:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("registry Close exceeded its restore deadline")
+	}
+	if _, err := os.Stat(discoveryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery still exists after cleanup: %v", err)
+	}
+	close(unblock)
+	state := <-produced
+	select {
+	case <-state.shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("late restored workspace was not closed")
+	}
+	r.mu.Lock()
+	entry := r.entries[root]
+	closed := r.closed
+	r.mu.Unlock()
+	if !closed || entry != nil {
+		t.Fatalf("closed=%v late entry=%v", closed, entry)
+	}
+}
+
 func TestWorkspaceRegistryAddFailureRollsBackNewEntry(t *testing.T) {
 	root := testWorkspaceRoot(t)
 	parentFile := filepath.Join(t.TempDir(), "not-a-directory")
@@ -696,13 +752,14 @@ func TestWorkspaceRegistryAddFailureRestoresAutomaticTimer(t *testing.T) {
 	}
 }
 
-func TestDaemonStopWaitsUntilAuthenticatedStatusFails(t *testing.T) {
+func TestDaemonStopWaitsForDiscoveryAfterAuthenticatedStatusFails(t *testing.T) {
 	cache := t.TempDir()
 	t.Setenv("LOCALAPPDATA", cache)
 	t.Setenv("XDG_CACHE_HOME", cache)
 	var alive atomic.Bool
 	alive.Store(true)
 	var statusCalls atomic.Int32
+	var discoveryPath string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer secret" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -712,6 +769,7 @@ func TestDaemonStopWaitsUntilAuthenticatedStatusFails(t *testing.T) {
 		case "/v1/stop":
 			writeJSON(w, http.StatusOK, map[string]bool{"stopping": true})
 			time.AfterFunc(60*time.Millisecond, func() { alive.Store(false) })
+			time.AfterFunc(130*time.Millisecond, func() { _ = os.Remove(discoveryPath) })
 		case "/v1/status":
 			statusCalls.Add(1)
 			if !alive.Load() {
@@ -723,6 +781,7 @@ func TestDaemonStopWaitsUntilAuthenticatedStatusFails(t *testing.T) {
 	}))
 	defer ts.Close()
 	path, err := daemonDiscoveryPath()
+	discoveryPath = path
 	if err != nil || writeDaemonDiscovery(path, daemonDiscovery{Endpoint: ts.URL, Token: "secret", PID: 42}) != nil {
 		t.Fatal(err)
 	}
@@ -730,8 +789,31 @@ func TestDaemonStopWaitsUntilAuthenticatedStatusFails(t *testing.T) {
 	if code := daemonStop(); code != 0 {
 		t.Fatalf("exit=%d", code)
 	}
-	if elapsed := time.Since(started); elapsed < 50*time.Millisecond || statusCalls.Load() == 0 {
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond || statusCalls.Load() == 0 {
 		t.Fatalf("elapsed=%v status calls=%d", elapsed, statusCalls.Load())
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery still exists: %v", err)
+	}
+}
+
+func TestWaitForDaemonStopTimesOutWhileDiscoveryRemains(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeAPIError(w, http.StatusServiceUnavailable, &apiError{Code: "stopped", Message: "stopped"})
+	}))
+	defer ts.Close()
+	path := filepath.Join(t.TempDir(), "daemon.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	err := waitForDaemonStop(ctx, daemonClient{endpoint: ts.URL}, path)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("discovery disappeared: %v", err)
 	}
 }
 

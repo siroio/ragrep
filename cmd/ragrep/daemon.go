@@ -125,13 +125,14 @@ type workspaceRegistryEntry struct {
 }
 
 type workspaceRegistry struct {
-	mu      sync.Mutex
-	file    string
-	idle    time.Duration
-	open    workspaceOpener
-	entries map[string]*workspaceRegistryEntry
-	closed  bool
-	restore sync.WaitGroup
+	mu             sync.Mutex
+	file           string
+	idle           time.Duration
+	open           workspaceOpener
+	entries        map[string]*workspaceRegistryEntry
+	closed         bool
+	restore        sync.WaitGroup
+	restoreTimeout time.Duration
 }
 
 type workspaceRegistryFile struct {
@@ -145,7 +146,13 @@ func newWorkspaceRegistry(file string, idle time.Duration, opener workspaceOpene
 	if opener == nil {
 		opener = openDaemonWorkspace
 	}
-	r := &workspaceRegistry{file: file, idle: idle, open: opener, entries: make(map[string]*workspaceRegistryEntry)}
+	r := &workspaceRegistry{
+		file:           file,
+		idle:           idle,
+		open:           opener,
+		entries:        make(map[string]*workspaceRegistryEntry),
+		restoreTimeout: daemonStartTimeout,
+	}
 	data, err := os.ReadFile(file)
 	if errors.Is(err, os.ErrNotExist) {
 		return r, nil
@@ -512,7 +519,7 @@ func (r *workspaceRegistry) Close() error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		r.restore.Wait()
+		r.waitForRestore()
 		return nil
 	}
 	r.closed = true
@@ -526,8 +533,26 @@ func (r *workspaceRegistry) Close() error {
 		}
 		errs = append(errs, closeWorkspaceEntry(entry))
 	}
-	r.restore.Wait()
+	r.waitForRestore()
 	return errors.Join(errs...)
+}
+
+func (r *workspaceRegistry) waitForRestore() {
+	done := make(chan struct{})
+	go func() {
+		r.restore.Wait()
+		close(done)
+	}()
+	timeout := r.restoreTimeout
+	if timeout <= 0 {
+		timeout = daemonStartTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 func closeWorkspaceEntry(entry *workspaceRegistryEntry) error {
@@ -668,15 +693,13 @@ func waitForDaemonStop(ctx context.Context, client daemonClient, discoveryPath s
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if _, err := os.Stat(discoveryPath); errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if _, err := client.Status(ctx); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		if _, err := os.Stat(discoveryPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
 			}
-			return nil
+			return err
 		}
+		_, _ = client.Status(ctx)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
