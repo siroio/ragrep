@@ -548,6 +548,40 @@ func TestConfirmPathDeletionRemovesDurableSymbolsAndTombstone(t *testing.T) {
 	}
 }
 
+func TestConfirmPathDoesNotPromoteSameHashTombstone(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
+	body := "package service\n\nfunc PromotedHandler() {\n\t// deleted while preparing\n}"
+	hash := ws.save(t, "service.go", body)
+	if err := ws.store.PutLiveFile("service.go", hash, body, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	confirmed := make(chan error, 1)
+	go func() {
+		confirmed <- svc.ConfirmPath(context.Background(), ws.root, "service.go", hash)
+	}()
+	waitForTestPath(t, started)
+	if err := ws.store.PutLiveDeletion("service.go", hash, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("continue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-confirmed; err != nil {
+		t.Fatal(err)
+	}
+
+	states, err := ws.store.ListFileStates()
+	if err != nil || len(states) != 1 || !states[0].Deleted || states[0].Hash != hash {
+		t.Fatalf("live states=%+v err=%v, want same-hash tombstone", states, err)
+	}
+	durable, err := ws.store.SearchSymbolsText("PromotedHandler", 5)
+	if err != nil || len(durable) != 0 {
+		t.Fatalf("durable=%+v err=%v, want no resurrection", durable, err)
+	}
+}
+
 func TestConfirmPathMutationWaitsForActiveSnapshot(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)

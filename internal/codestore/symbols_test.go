@@ -1210,6 +1210,21 @@ func TestRemoveLiveFileIfHashOnlyRemovesCurrentContent(t *testing.T) {
 	}
 }
 
+func TestRemoveLiveFileIfHashKeepsMatchingTombstone(t *testing.T) {
+	s := openTestStore(t, 3)
+	if err := s.PutLiveDeletion("service.go", "hash-current", 7); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := s.RemoveLiveFileIfHash("service.go", "hash-current")
+	if err != nil || removed {
+		t.Fatalf("RemoveLiveFileIfHash(tombstone) = %v, %v", removed, err)
+	}
+	states, err := s.ListFileStates()
+	if err != nil || len(states) != 1 || !states[0].Deleted || states[0].Hash != "hash-current" {
+		t.Fatalf("states=%v err=%v, want matching tombstone", states, err)
+	}
+}
+
 func TestRemoveLiveFileIfHashPropagatesStoreError(t *testing.T) {
 	s := openTestStore(t, 3)
 	if _, err := s.db.Exec(`DROP TABLE live_files`); err != nil {

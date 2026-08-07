@@ -394,13 +394,11 @@ func (s *Store) RemoveLiveFileIfHash(filePath, expectedHash string) (bool, error
 	if err != nil {
 		return false, err
 	}
-	if hash != expectedHash {
+	if hash != expectedHash || deleted {
 		return false, nil
 	}
-	if !deleted {
-		if _, err := tx.Exec(`INSERT INTO live_fts(live_fts, rowid, path, body) VALUES('delete', ?, ?, ?)`, rowID, storedPath, body); err != nil {
-			return false, err
-		}
+	if _, err := tx.Exec(`INSERT INTO live_fts(live_fts, rowid, path, body) VALUES('delete', ?, ?, ?)`, rowID, storedPath, body); err != nil {
+		return false, err
 	}
 	if _, err := tx.Exec(`DELETE FROM live_files WHERE rowid=?`, rowID); err != nil {
 		return false, err

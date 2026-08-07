@@ -325,8 +325,13 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 		if err := ctx.Err(); err != nil {
 			return indexResult{}, err
 		}
-		ws.updateMu.Lock()
+		if err := ws.updateMu.LockContext(ctx); err != nil {
+			return indexResult{}, err
+		}
 		defer ws.updateMu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return indexResult{}, err
+		}
 		result.Pruned, err = pruneCodeSymbolPathsContext(ctx, ws.store, req.Roots, nil)
 		return result, err
 	}
@@ -378,8 +383,13 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 	}
 
 	revision := gitRevision(ws.root)
-	ws.updateMu.Lock()
+	if err := ws.updateMu.LockContext(ctx); err != nil {
+		return indexResult{}, err
+	}
 	defer ws.updateMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return indexResult{}, err
+	}
 	runID, err := ws.store.RecordIndexRun("index:"+strings.Join(req.Roots, ","), revision, req.Language, serverName, serverVersion, codeModelID, time.Now())
 	if err != nil {
 		return indexResult{}, err
@@ -387,6 +397,13 @@ func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult,
 	for _, file := range prepared {
 		if err := ctx.Err(); err != nil {
 			return indexResult{}, err
+		}
+		live, err := ws.store.GetLiveFileByPath(file.path, file.hash)
+		if err == nil && live.Deleted {
+			continue
+		}
+		if err != nil && !errors.Is(err, codestore.ErrStaleLiveKey) {
+			return indexResult{}, fmt.Errorf("%s: %w", file.path, err)
 		}
 		changed, err := ws.store.UpsertSymbols(file.path, file.hash, file.symbols, runID, func(text string) ([]float32, error) {
 			return s.embeddings.Embed(ctx, text)
@@ -541,8 +558,13 @@ func (s *codeService) confirmPathAtDB(ctx context.Context, root, db, path, expec
 		return err
 	}
 	if file.Deleted {
-		ws.updateMu.Lock()
+		if err := ws.updateMu.LockContext(ctx); err != nil {
+			return err
+		}
 		defer ws.updateMu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		_, err = ws.store.DeleteSymbolsForPathIfLiveHash(file.Path, expectedHash)
 		return err
 	}
@@ -567,12 +589,21 @@ func (s *codeService) confirmPathAtDB(ctx context.Context, root, db, path, expec
 	if err != nil {
 		return err
 	}
-	ws.updateMu.Lock()
+	if err := ws.updateMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer ws.updateMu.Unlock()
-	if _, err := ws.store.GetLiveFileByPath(file.Path, expectedHash); errors.Is(err, codestore.ErrStaleLiveKey) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	current, err := ws.store.GetLiveFileByPath(file.Path, expectedHash)
+	if errors.Is(err, codestore.ErrStaleLiveKey) {
 		return nil
 	} else if err != nil {
 		return err
+	}
+	if current.Deleted {
+		return nil
 	}
 	if _, err := ws.store.UpsertSymbols(rel, file.Hash, symbols, 0, func(text string) ([]float32, error) {
 		return s.embeddings.Embed(ctx, text)

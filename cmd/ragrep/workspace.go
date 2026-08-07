@@ -39,7 +39,7 @@ type workspaceState struct {
 	closed               bool
 	shutdownDone         chan struct{}
 	shutdownErr          error
-	updateMu             sync.Mutex
+	updateMu             contextMutex
 	refreshWG            sync.WaitGroup
 	watcherWG            sync.WaitGroup
 	confirmationMu       sync.Mutex
@@ -48,6 +48,39 @@ type workspaceState struct {
 }
 
 type workspaceConfirmation struct{ path, hash string }
+
+type contextMutex struct {
+	once  sync.Once
+	token chan struct{}
+}
+
+func (m *contextMutex) init() {
+	m.token = make(chan struct{}, 1)
+	m.token <- struct{}{}
+}
+
+func (m *contextMutex) Lock() {
+	_ = m.LockContext(context.Background())
+}
+
+func (m *contextMutex) LockContext(ctx context.Context) error {
+	m.once.Do(m.init)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.token:
+	}
+	if err := ctx.Err(); err != nil {
+		m.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (m *contextMutex) Unlock() {
+	m.once.Do(m.init)
+	m.token <- struct{}{}
+}
 
 type workspaceRefresh struct {
 	done             chan struct{}
@@ -137,7 +170,13 @@ func (w *workspaceState) Snapshot(ctx context.Context) (uint64, func(), error) {
 	if _, err := w.Barrier(ctx); err != nil {
 		return 0, nil, err
 	}
-	w.updateMu.Lock()
+	if err := w.updateMu.LockContext(ctx); err != nil {
+		return 0, nil, ErrWorkspaceSyncing
+	}
+	if err := ctx.Err(); err != nil {
+		w.updateMu.Unlock()
+		return 0, nil, ErrWorkspaceSyncing
+	}
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()

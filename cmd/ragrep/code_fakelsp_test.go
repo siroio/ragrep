@@ -383,6 +383,96 @@ func TestCodeServiceIndexRemovesMatchingLiveOverlayUnderUpdateLock(t *testing.T)
 	}
 }
 
+func TestCodeServiceIndexCanceledWhileWaitingForUpdateLockDoesNotMutate(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"injected-test-server"}}`)
+	body := "package service\n\nfunc PromotedHandler() {\n\t// indexed\n}"
+	ws.save(t, "service.go", body)
+
+	ws.updateMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			ws.updateMu.Unlock()
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	indexed := make(chan error, 1)
+	go func() {
+		_, err := svc.Index(ctx, indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+		indexed <- err
+	}()
+	waitForTestPath(t, started)
+	if err := os.WriteFile(release, []byte("continue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-indexed:
+		t.Fatalf("Index finished before update lock was released: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+
+	select {
+	case err := <-indexed:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Index error=%v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		ws.updateMu.Unlock()
+		locked = false
+		err := <-indexed
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Index error after forced unlock=%v, want context.Canceled", err)
+		}
+		t.Fatal("Index ignored cancellation while waiting for update lock")
+	}
+	if _, err := ws.store.LatestIndexRun(); !errors.Is(err, codestore.ErrNotFound) {
+		t.Fatalf("LatestIndexRun error=%v, want ErrNotFound", err)
+	}
+	paths, err := ws.store.ListPaths()
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("paths=%v err=%v, want no upsert or delete", paths, err)
+	}
+}
+
+func TestCodeServiceIndexDoesNotPromoteSameHashTombstone(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"injected-test-server"}}`)
+	body := "package service\n\nfunc PromotedHandler() {\n\t// deleted while preparing\n}"
+	hash := ws.save(t, "service.go", body)
+	if err := ws.store.PutLiveFile("service.go", hash, body, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	indexed := make(chan error, 1)
+	go func() {
+		_, err := svc.Index(context.Background(), indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}})
+		indexed <- err
+	}()
+	waitForTestPath(t, started)
+	if err := ws.store.PutLiveDeletion("service.go", hash, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("continue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-indexed; err != nil {
+		t.Fatal(err)
+	}
+
+	states, err := ws.store.ListFileStates()
+	if err != nil || len(states) != 1 || !states[0].Deleted || states[0].Hash != hash {
+		t.Fatalf("live states=%+v err=%v, want same-hash tombstone", states, err)
+	}
+	durable, err := ws.store.SearchSymbolsText("PromotedHandler", 5)
+	if err != nil || len(durable) != 0 {
+		t.Fatalf("durable=%+v err=%v, want no resurrection", durable, err)
+	}
+}
+
 func TestCodeServiceIndexKeepsNewerLiveOverlay(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
 	started, release := useBlockingDocumentSymbolServer(t, svc, ws.root)

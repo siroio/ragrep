@@ -231,6 +231,45 @@ func TestWorkspaceBarrierTimeoutDoesNotCancelRefresh(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSnapshotStopsWaitingForUpdateLockWhenContextExpires(t *testing.T) {
+	w := newTestWorkspace(t, "func CurrentName() {}")
+	done := make(chan struct{})
+	close(done)
+	w.mu.Lock()
+	w.refresh = &workspaceRefresh{done: done, generation: w.generation}
+	w.mu.Unlock()
+
+	w.updateMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			w.updateMu.Unlock()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, unlock, err := w.Snapshot(ctx)
+		if unlock != nil {
+			unlock()
+		}
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrWorkspaceSyncing) {
+			t.Fatalf("Snapshot error=%v, want ErrWorkspaceSyncing", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		w.updateMu.Unlock()
+		locked = false
+		err := <-result
+		t.Fatalf("Snapshot ignored context while waiting for update lock: %v", err)
+	}
+}
+
 func TestWorkspaceFullRefreshRequestDuringRefreshSurvivesUntilNextBarrier(t *testing.T) {
 	w := newTestWorkspace(t, "func BeforeRefreshRequest() {}")
 	started := make(chan struct{})
