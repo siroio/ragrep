@@ -35,9 +35,10 @@ type LiveFile struct {
 
 // FileState is the live overlay state used to reconcile files after save.
 type FileState struct {
-	Path    string
-	Hash    string
-	Deleted bool
+	Path       string
+	Hash       string
+	Generation uint64
+	Deleted    bool
 }
 
 // EmbedFunc mirrors internal/store's EmbedFunc (same shape, separate type
@@ -397,7 +398,7 @@ func (s *Store) RemoveLiveFileIfHash(filePath, expectedHash string) (bool, error
 
 // ListFileStates returns the live overlay state for every dirty path.
 func (s *Store) ListFileStates() ([]FileState, error) {
-	rows, err := s.db.Query(`SELECT path, hash, deleted FROM live_files ORDER BY path`)
+	rows, err := s.db.Query(`SELECT path, hash, generation, deleted FROM live_files ORDER BY path`)
 	if err != nil {
 		return nil, err
 	}
@@ -406,7 +407,7 @@ func (s *Store) ListFileStates() ([]FileState, error) {
 	var states []FileState
 	for rows.Next() {
 		var state FileState
-		if err := rows.Scan(&state.Path, &state.Hash, &state.Deleted); err != nil {
+		if err := rows.Scan(&state.Path, &state.Hash, &state.Generation, &state.Deleted); err != nil {
 			return nil, err
 		}
 		states = append(states, state)

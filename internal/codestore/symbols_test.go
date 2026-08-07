@@ -1088,7 +1088,7 @@ func TestLiveDeletionSuppressesStoredSymbols(t *testing.T) {
 		t.Fatalf("live=%v err=%v", live, err)
 	}
 	states, err := s.ListFileStates()
-	if err != nil || !reflect.DeepEqual(states, []FileState{{Path: "service.go", Hash: "hash-old", Deleted: true}}) {
+	if err != nil || !reflect.DeepEqual(states, []FileState{{Path: "service.go", Hash: "hash-old", Generation: 8, Deleted: true}}) {
 		t.Fatalf("states=%v err=%v", states, err)
 	}
 }

@@ -32,12 +32,18 @@ type workspaceState struct {
 
 	ext                 string
 	enumerate           func(string, string) ([]string, error)
-	refreshRunning      bool
-	refreshWaiters      int
+	refresh             *workspaceRefresh
 	fullRefreshRequired bool
 	closed              bool
 	refreshMu           sync.Mutex
+	refreshWG           sync.WaitGroup
 	watcherWG           sync.WaitGroup
+}
+
+type workspaceRefresh struct {
+	done       chan struct{}
+	generation uint64
+	err        error
 }
 
 type workspaceFile struct {
@@ -69,65 +75,68 @@ func newWorkspaceState(root string, store *codestore.Store, roots []string, lang
 		}
 		relRoots = append(relRoots, rel)
 	}
+	states, err := store.ListFileStates()
+	if err != nil {
+		return nil, err
+	}
+	var generation uint64
+	for _, state := range states {
+		if state.Generation > generation {
+			generation = state.Generation
+		}
+	}
 	return &workspaceState{
-		root:      absRoot,
-		language:  language,
-		roots:     relRoots,
-		store:     store,
-		ext:       ext,
-		enumerate: discoverCodeFiles,
+		root:       absRoot,
+		language:   language,
+		roots:      relRoots,
+		store:      store,
+		ext:        ext,
+		enumerate:  discoverCodeFiles,
+		generation: generation,
 	}, nil
 }
 
 func (w *workspaceState) Barrier(ctx context.Context) (uint64, error) {
 	w.mu.Lock()
-	if w.refreshDone == nil {
-		w.refreshDone = make(chan struct{})
-		w.refreshRunning = true
-		done := w.refreshDone
-		go w.runFullRefresh(done)
+	if w.closed {
+		w.mu.Unlock()
+		return 0, ErrWorkspaceSyncing
 	}
-	done := w.refreshDone
-	w.refreshWaiters++
+	if w.refresh == nil {
+		w.refresh = &workspaceRefresh{done: make(chan struct{})}
+		w.refreshDone = w.refresh.done
+		w.refreshWG.Add(1)
+		go w.runFullRefresh(w.refresh)
+	}
+	refresh := w.refresh
 	w.mu.Unlock()
 
 	select {
-	case <-done:
-		w.mu.Lock()
-		generation, err := w.generation, w.refreshErr
-		w.releaseRefreshWaiterLocked()
-		w.mu.Unlock()
-		return generation, err
+	case <-refresh.done:
+		return refresh.generation, refresh.err
 	case <-ctx.Done():
-		w.mu.Lock()
-		w.releaseRefreshWaiterLocked()
-		w.mu.Unlock()
 		return 0, ErrWorkspaceSyncing
 	}
 }
 
-func (w *workspaceState) releaseRefreshWaiterLocked() {
-	w.refreshWaiters--
-	if w.refreshWaiters == 0 && !w.refreshRunning {
-		w.refreshDone = nil
-	}
-}
-
-func (w *workspaceState) runFullRefresh(done chan struct{}) {
+func (w *workspaceState) runFullRefresh(refresh *workspaceRefresh) {
+	defer w.refreshWG.Done()
 	w.refreshMu.Lock()
 	err := w.refreshAll()
 	w.refreshMu.Unlock()
 
 	w.mu.Lock()
+	refresh.generation = w.generation
+	refresh.err = err
 	w.refreshErr = err
 	if err == nil {
 		w.fullRefreshRequired = false
 	}
-	w.refreshRunning = false
-	close(done)
-	if w.refreshWaiters == 0 {
+	if w.refresh == refresh {
+		w.refresh = nil
 		w.refreshDone = nil
 	}
+	close(refresh.done)
 	w.mu.Unlock()
 }
 
@@ -223,17 +232,18 @@ func (w *workspaceState) StartWatcher() error {
 	if err != nil {
 		return err
 	}
-	if err := w.addWatchRoots(watcher); err != nil {
+	watched, err := w.addWatchRoots(watcher)
+	if err != nil {
 		watcher.Close()
 		return err
 	}
 	w.watcher = watcher
 	w.watcherWG.Add(1)
-	go w.watch(watcher)
+	go w.watch(watcher, watched)
 	return nil
 }
 
-func (w *workspaceState) addWatchRoots(watcher *fsnotify.Watcher) error {
+func (w *workspaceState) addWatchRoots(watcher *fsnotify.Watcher) (map[string]bool, error) {
 	added := make(map[string]bool)
 	for _, root := range w.roots {
 		absRoot := filepath.Join(w.root, filepath.FromSlash(root))
@@ -255,13 +265,13 @@ func (w *workspaceState) addWatchRoots(watcher *fsnotify.Watcher) error {
 			return watcher.Add(path)
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return added, nil
 }
 
-func (w *workspaceState) watch(watcher *fsnotify.Watcher) {
+func (w *workspaceState) watch(watcher *fsnotify.Watcher, watched map[string]bool) {
 	defer w.watcherWG.Done()
 	pending := make(map[string]time.Time)
 	timer := time.NewTimer(time.Hour)
@@ -300,12 +310,21 @@ func (w *workspaceState) watch(watcher *fsnotify.Watcher) {
 			}
 			if event.Has(fsnotify.Create) {
 				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					if err := w.addWatchRoots(watcher); err != nil {
+					added, err := w.addWatchRoots(watcher)
+					if err != nil {
 						w.requireFullRefresh()
+					}
+					for path := range added {
+						watched[path] = true
 					}
 					w.requireFullRefresh()
 					continue
 				}
+			}
+			if (event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)) && watched[event.Name] {
+				delete(watched, event.Name)
+				w.requireFullRefresh()
+				continue
 			}
 			if filepath.Ext(event.Name) == w.ext {
 				pending[event.Name] = time.Now().Add(50 * time.Millisecond)
@@ -326,8 +345,11 @@ func (w *workspaceState) watch(watcher *fsnotify.Watcher) {
 			}
 			if len(paths) != 0 {
 				w.refreshMu.Lock()
-				_ = w.refreshPaths(paths)
+				err := w.refreshPaths(paths)
 				w.refreshMu.Unlock()
+				if err != nil {
+					w.requireFullRefresh()
+				}
 			}
 			reset()
 		}
@@ -406,10 +428,11 @@ func (w *workspaceState) Close() error {
 	watcher := w.watcher
 	w.watcher = nil
 	w.mu.Unlock()
-	if watcher == nil {
-		return nil
+	var err error
+	if watcher != nil {
+		err = watcher.Close()
 	}
-	err := watcher.Close()
+	w.refreshWG.Wait()
 	w.watcherWG.Wait()
 	return err
 }

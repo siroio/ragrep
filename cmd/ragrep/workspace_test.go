@@ -196,3 +196,138 @@ func TestWorkspaceWatcherRefreshesSavedPath(t *testing.T) {
 	}
 	t.Fatal("watcher did not refresh saved path")
 }
+
+func TestWorkspaceBarrierDoesNotJoinCompletedRefresh(t *testing.T) {
+	w := newTestWorkspace(t, "func OldFlightName() {}")
+	done := make(chan struct{})
+	close(done)
+	w.mu.Lock()
+	w.refreshDone = done
+	w.mu.Unlock()
+
+	writeWorkspaceFile(t, w.root, "service.go", "func NewFlightName() {}")
+	if got := barrierGeneration(t, w.workspaceState); got != w.gen+1 {
+		t.Fatalf("generation=%d, want %d", got, w.gen+1)
+	}
+	hits, err := w.store.SearchLiveText("NewFlightName", 5)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("hits=%v err=%v", hits, err)
+	}
+}
+
+func TestWorkspaceWatcherRequiresFullRefreshForRemovedDirectory(t *testing.T) {
+	w := newTestWorkspace(t, "func RootName() {}")
+	writeWorkspaceFile(t, w.root, "pkg/nested.go", "func NestedName() {}")
+	barrierGeneration(t, w.workspaceState)
+	if err := w.StartWatcher(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(w.root, "pkg")); err != nil {
+		t.Fatal(err)
+	}
+	waitForFullRefreshRequired(t, w.workspaceState)
+}
+
+func TestWorkspaceWatcherRequiresFullRefreshForRenamedDirectory(t *testing.T) {
+	w := newTestWorkspace(t, "func RootName() {}")
+	writeWorkspaceFile(t, w.root, "pkg/nested.go", "func NestedName() {}")
+	barrierGeneration(t, w.workspaceState)
+	if err := w.StartWatcher(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(w.root, "pkg"), filepath.Join(t.TempDir(), "moved")); err != nil {
+		t.Fatal(err)
+	}
+	waitForFullRefreshRequired(t, w.workspaceState)
+}
+
+func TestWorkspaceWatcherRefreshErrorRequiresFullRefresh(t *testing.T) {
+	w := newTestWorkspace(t, "func BeforeError() {}")
+	if err := w.StartWatcher(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeWorkspaceFile(t, w.root, "service.go", "func AfterError() {}")
+	waitForFullRefreshRequired(t, w.workspaceState)
+}
+
+func TestWorkspaceCloseWaitsForInFlightRefresh(t *testing.T) {
+	w := newTestWorkspace(t, "func BeforeClose() {}")
+	unblock := make(chan struct{})
+	original := w.enumerate
+	w.enumerate = func(root, ext string) ([]string, error) {
+		<-unblock
+		return original(root, ext)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := w.Barrier(ctx); !errors.Is(err, ErrWorkspaceSyncing) {
+		t.Fatalf("Barrier timeout err=%v, want ErrWorkspaceSyncing", err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before refresh completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(unblock)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after refresh completed")
+	}
+}
+
+func TestWorkspaceGenerationContinuesFromPopulatedStore(t *testing.T) {
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWorkspaceFile(t, root, "service.go", "func OldGeneration() {}")
+	db := filepath.Join(t.TempDir(), "code.db")
+	store, err := codestore.Open(db, "test-model", codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutLiveFile("service.go", "old-hash", "func OldGeneration() {}", 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = codestore.Open(db, "test-model", codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	w, err := newWorkspaceState(root, store, []string{"."}, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Close() })
+	writeWorkspaceFile(t, root, "service.go", "func NewGeneration() {}")
+	if got := barrierGeneration(t, w); got != 8 {
+		t.Fatalf("generation=%d, want 8", got)
+	}
+}
+
+func waitForFullRefreshRequired(t *testing.T, w *workspaceState) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		required := w.fullRefreshRequired
+		w.mu.Unlock()
+		if required {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("full refresh was not required")
+}
