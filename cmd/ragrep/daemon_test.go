@@ -1121,9 +1121,9 @@ func TestWarmCandidateSearchP95(t *testing.T) {
 		check   func(searchResponse) bool
 	}{
 		{"exact", searchRequest{Root: workspace.root, Query: "ExactSearchCandidate", Mode: "auto"}, func(result searchResponse) bool {
-			return len(result.Hits) > 0 && result.Fresh && !result.UsedVector
+			return len(result.Hits) > 0 && result.Hits[0].Key == exactSymbol.Key && result.Hits[0].ExactMatch && !result.Hits[0].Live && result.Fresh && !result.UsedVector
 		}},
-		{"ambiguous", searchRequest{Root: workspace.root, Query: "request validation", Mode: "hybrid"}, func(result searchResponse) bool {
+		{"ambiguous", searchRequest{Root: workspace.root, Query: "request validation", Mode: "auto"}, func(result searchResponse) bool {
 			return len(result.Hits) > 0 && result.Hits[0].Key == symbol.Key && result.Hits[0].VecRank > 0 && result.UsedVector && result.Fresh
 		}},
 	}
