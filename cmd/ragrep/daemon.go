@@ -1062,29 +1062,30 @@ func cleanupDaemon(discoveryPath string, owned daemonDiscovery, resources ...io.
 func finishDaemonDiscoveryClaim(claim, discoveryPath string, owned daemonDiscovery) {
 	current, err := readDaemonDiscovery(claim)
 	if err == nil && current == owned {
-		_ = os.Remove(claim)
+		removeDaemonDiscoveryClaim(claim)
 		return
 	}
 	if err := os.Link(claim, discoveryPath); err == nil || errors.Is(err, os.ErrExist) {
-		_ = os.Remove(claim)
+		removeDaemonDiscoveryClaim(claim)
 	}
 }
 
 func claimDaemonDiscovery(path string) (string, error) {
-	claimFile, err := os.CreateTemp(filepath.Dir(path), ".daemon-cleanup-*.tmp")
+	claimDir, err := os.MkdirTemp(filepath.Dir(path), ".daemon-cleanup-*")
 	if err != nil {
 		return "", err
 	}
-	claim := claimFile.Name()
-	if err := claimFile.Close(); err != nil {
-		_ = os.Remove(claim)
-		return "", err
-	}
+	claim := filepath.Join(claimDir, "daemon.json")
 	if err := os.Rename(path, claim); err != nil {
-		_ = os.Remove(claim)
+		_ = os.Remove(claimDir)
 		return "", err
 	}
 	return claim, nil
+}
+
+func removeDaemonDiscoveryClaim(claim string) {
+	_ = os.Remove(claim)
+	_ = os.Remove(filepath.Dir(claim))
 }
 
 func newDaemonHTTPServer(handler http.Handler) *http.Server {

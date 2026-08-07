@@ -101,3 +101,23 @@ func TestWorkspaceRegistryReusesWindowsDatabaseAliases(t *testing.T) {
 		}
 	})
 }
+
+func TestClaimDaemonDiscoveryUsesUnoccupiedTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.json")
+	discovery := daemonDiscovery{Endpoint: "http://127.0.0.1:7377", Token: "secret", PID: 1}
+	if err := writeDaemonDiscovery(path, discovery); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claimDaemonDiscovery(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimDir := filepath.Dir(claim)
+	if claimDir == filepath.Dir(path) {
+		t.Fatalf("claim target %q shares discovery directory; Windows rename replacement remains possible", claim)
+	}
+	finishDaemonDiscoveryClaim(claim, path, discovery)
+	if _, err := os.Stat(claimDir); !os.IsNotExist(err) {
+		t.Fatalf("claim directory remains after cleanup: %v", err)
+	}
+}
