@@ -613,31 +613,43 @@ func cmdDaemon(args []string) int {
 }
 
 func daemonStart() int {
-	if client, _, err := clientFromDiscovery(); err == nil {
+	_, discovery, err := loadDaemonClient()
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Println(discovery.PID)
+	return 0
+}
+
+func loadCodeDaemonClient() (codeDaemonClient, error) {
+	client, _, err := loadDaemonClient()
+	return client, err
+}
+
+func loadDaemonClient() (daemonClient, daemonDiscovery, error) {
+	if client, discovery, err := clientFromDiscovery(); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-		status, statusErr := client.Status(ctx)
+		_, statusErr := client.Status(ctx)
 		cancel()
 		if statusErr == nil {
-			fmt.Println(status.PID)
-			return 0
+			return client, discovery, nil
 		}
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return fail(err)
+		return daemonClient{}, daemonDiscovery{}, err
 	}
 	process, err := launchDaemonProcess(executable)
 	if err != nil {
-		return fail(err)
+		return daemonClient{}, daemonDiscovery{}, err
 	}
 	discovery, err := waitForDaemon(daemonStartTimeout)
 	if err != nil {
 		_ = process.Kill()
-		return fail(err)
+		return daemonClient{}, daemonDiscovery{}, err
 	}
 	_ = process.Release()
-	fmt.Println(discovery.PID)
-	return 0
+	return daemonClient{endpoint: discovery.Endpoint, token: discovery.Token}, discovery, nil
 }
 
 func launchDaemonProcess(executable string) (*os.Process, error) {

@@ -261,6 +261,13 @@ type daemonClient struct {
 	client   *http.Client
 }
 
+type codeDaemonClient interface {
+	Search(context.Context, searchRequest) (searchResponse, error)
+	Get(context.Context, getRequest) (codeindex.Symbol, error)
+}
+
+var codeDaemonClientFactory = loadCodeDaemonClient
+
 func (c daemonClient) Status(ctx context.Context) (daemonStatus, error) {
 	var status daemonStatus
 	err := c.do(ctx, http.MethodGet, "/v1/status", nil, &status)

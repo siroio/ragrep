@@ -30,7 +30,8 @@ const codeUsage = `ragrep code - code symbol indexing/search (uses code.db, neve
 
 Usage:
   ragrep code index --language go <path>...        index symbols via the configured language server
-  ragrep code search [--json] [-k N] <query>        search indexed symbols (no body in the output)
+  ragrep code search [--json] [--mode auto|text|hybrid] [-k N] <query>
+                                                     search indexed symbols (no body in the output)
   ragrep code get --symbol <key> [--body] [--json]  fetch one symbol's metadata (and body with --body)
   ragrep code expand --symbol <key> --relation definition|references|callers|callees|tests [--json]
                                                      live-query the language server for one symbol's
@@ -504,7 +505,8 @@ func formatCodeSearchHits(w io.Writer, hits []codestore.SymbolHit, asJSON bool) 
 func cmdCodeSearch(args []string) int {
 	fs := newFlagSet("code search")
 	db := codeDBFlag(fs)
-	k := fs.Int("k", 10, "max results")
+	mode := fs.String("mode", "auto", "search mode: auto, text, or hybrid")
+	k := fs.Int("k", 5, "max results")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if code, handled := parseArgsUsage(fs, args, codeUsage); handled {
 		return code
@@ -514,39 +516,51 @@ func cmdCodeSearch(args []string) int {
 	}
 	query := fs.Arg(0)
 
-	s, err := openCodeStoreAt(*db)
+	root, err := workspaceRoot(*db)
 	if err != nil {
 		return fail(err)
 	}
-	defer s.Close()
-
-	dir, err := embed.CacheDir()
+	client, err := codeDaemonClientFactory()
 	if err != nil {
 		return fail(err)
 	}
-	e, err := embed.New(dir)
+	resp, err := client.Search(context.Background(), searchRequest{Root: root, Query: query, Mode: *mode, K: *k})
 	if err != nil {
-		return fail(err)
+		return codeDaemonError(err)
 	}
-	defer e.Close()
-
-	qv, err := e.Embed(query)
-	if err != nil {
-		return fail(err)
-	}
-
-	hits, err := s.SearchSymbolsHybrid(query, qv, *k)
-	if err != nil {
-		return fail(err)
-	}
-	if len(hits) == 0 {
+	if len(resp.Hits) == 0 {
 		fmt.Fprintln(os.Stderr, "no hits")
 		return 2
 	}
-	if err := formatCodeSearchHits(os.Stdout, hits, *asJSON); err != nil {
+	if *asJSON {
+		err = json.NewEncoder(os.Stdout).Encode(struct {
+			Hits       []codestore.SymbolHit `json:"hits"`
+			Fresh      bool                  `json:"fresh"`
+			Generation uint64                `json:"generation"`
+			Degraded   string                `json:"degraded"`
+		}{resp.Hits, resp.Fresh, resp.Generation, resp.Degraded})
+	} else {
+		err = formatCodeSearchHits(os.Stdout, resp.Hits, false)
+	}
+	if err != nil {
 		return fail(err)
 	}
 	return 0
+}
+
+func codeDaemonError(err error) int {
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case "not_found":
+			fmt.Fprintln(os.Stderr, apiErr.Message)
+			return 2
+		case "workspace_syncing":
+			fmt.Fprintln(os.Stderr, "workspace syncing; retry")
+			return 1
+		}
+	}
+	return fail(err)
 }
 
 // codeSymbolOutput is `code get`'s output shape: metadata always, Body only
@@ -607,19 +621,17 @@ func cmdCodeGet(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep code get --symbol <stable-key> [--body] [--json]"))
 	}
 
-	s, err := openCodeStoreAt(*db)
+	root, err := workspaceRoot(*db)
 	if err != nil {
 		return fail(err)
 	}
-	defer s.Close()
-
-	sym, err := s.GetSymbol(*symbolKey)
-	if err == codestore.ErrNotFound {
-		fmt.Fprintln(os.Stderr, "not found")
-		return 2
-	}
+	client, err := codeDaemonClientFactory()
 	if err != nil {
 		return fail(err)
+	}
+	sym, err := client.Get(context.Background(), getRequest{Root: root, Key: *symbolKey, Body: *body})
+	if err != nil {
+		return codeDaemonError(err)
 	}
 
 	if err := formatCodeSymbol(os.Stdout, sym, *body, *asJSON); err != nil {

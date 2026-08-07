@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -491,28 +493,181 @@ func TestCmdCodeGetUsageErrors(t *testing.T) {
 	}
 }
 
-func TestCmdCodeGetNotFound(t *testing.T) {
-	db := filepath.Join(t.TempDir(), "code.db")
-	s, err := codestore.Open(db, codeModelID, codeEmbedDim)
+type fakeCodeDaemonClient struct {
+	search func(context.Context, searchRequest) (searchResponse, error)
+	get    func(context.Context, getRequest) (codeindex.Symbol, error)
+}
+
+func (f fakeCodeDaemonClient) Search(ctx context.Context, req searchRequest) (searchResponse, error) {
+	return f.search(ctx, req)
+}
+
+func (f fakeCodeDaemonClient) Get(ctx context.Context, req getRequest) (codeindex.Symbol, error) {
+	return f.get(ctx, req)
+}
+
+func injectCodeDaemonClient(t *testing.T, client codeDaemonClient) *int {
+	t.Helper()
+	old := codeDaemonClientFactory
+	calls := 0
+	codeDaemonClientFactory = func() (codeDaemonClient, error) {
+		calls++
+		return client, nil
+	}
+	t.Cleanup(func() { codeDaemonClientFactory = old })
+	return &calls
+}
+
+func captureCodeCommand(t *testing.T, args []string) (int, string, string) {
+	t.Helper()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Close()
-
-	r, w, _ := os.Pipe()
-	old := os.Stderr
-	os.Stderr = w
-	code := run([]string{"code", "get", "--db", db, "--symbol", "does-not-exist"})
-	w.Close()
-	os.Stderr = old
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-
-	if code != 2 {
-		t.Fatalf("get missing symbol: exit=%d, want 2", code)
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), "not found") {
-		t.Fatalf("stderr=%q, want not-found message", buf.String())
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = stdoutW, stderrW
+	code := run(args)
+	stdoutW.Close()
+	stderrW.Close()
+	os.Stdout, os.Stderr = oldStdout, oldStderr
+	var stdout, stderr bytes.Buffer
+	_, _ = stdout.ReadFrom(stdoutR)
+	_, _ = stderr.ReadFrom(stderrR)
+	return code, stdout.String(), stderr.String()
+}
+
+func TestCmdCodeSearchDaemonText(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	hit := codestore.SymbolHit{
+		Key: "key-1", Kind: "function", QualifiedName: "pkg.Foo", Signature: "func Foo()",
+		Path: "pkg/foo.go", StartLine: 4, EndLine: 8, Score: 0.25, FTSRank: 1, VecRank: 2, ExactMatch: true,
+	}
+	client := fakeCodeDaemonClient{search: func(_ context.Context, req searchRequest) (searchResponse, error) {
+		if req.Root != filepath.Clean(root) || req.Query != "Foo" || req.Mode != "text" || req.K != 3 {
+			t.Fatalf("request=%+v", req)
+		}
+		return searchResponse{Hits: []codestore.SymbolHit{hit}, Fresh: true, Generation: 9, Degraded: "vector_unavailable"}, nil
+	}}
+	calls := injectCodeDaemonClient(t, client)
+
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "search", "--mode", "text", "-k", "3", "--db", db, "Foo"})
+	if code != 0 || stderr != "" || *calls != 1 {
+		t.Fatalf("exit=%d factory calls=%d stdout=%q stderr=%q", code, *calls, stdout, stderr)
+	}
+	want := "key-1\tfunction\tpkg.Foo\tfunc Foo()\tpkg/foo.go:4-8\tscore=0.2500 (fts=1 vec=2 exact=true)\n"
+	if stdout != want {
+		t.Fatalf("stdout=%q, want byte-for-byte %q", stdout, want)
+	}
+}
+
+func TestCmdCodeSearchDaemonJSONDefaultsToAutoFive(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	hit := codestore.SymbolHit{Key: "key-1", Path: "pkg/foo.go"}
+	client := fakeCodeDaemonClient{search: func(_ context.Context, req searchRequest) (searchResponse, error) {
+		if req.Root != filepath.Clean(root) || req.Query != "Foo" || req.Mode != "auto" || req.K != 5 {
+			t.Fatalf("request=%+v", req)
+		}
+		return searchResponse{Hits: []codestore.SymbolHit{hit}, Fresh: true, Generation: 9, Degraded: "vector_unavailable"}, nil
+	}}
+	injectCodeDaemonClient(t, client)
+
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "search", "--json", "--db", db, "Foo"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("invalid JSON: %v (%q)", err, stdout)
+	}
+	if len(got) != 4 || got["hits"] == nil || string(got["fresh"]) != "true" || string(got["generation"]) != "9" || string(got["degraded"]) != `"vector_unavailable"` {
+		t.Fatalf("JSON object=%s", stdout)
+	}
+	var hits []codestore.SymbolHit
+	if err := json.Unmarshal(got["hits"], &hits); err != nil || !reflect.DeepEqual(hits, []codestore.SymbolHit{hit}) {
+		t.Fatalf("hits=%+v err=%v", hits, err)
+	}
+}
+
+func TestCmdCodeSearchDaemonNoHitsAndSyncing(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	tests := []struct {
+		name   string
+		result searchResponse
+		err    error
+		code   int
+		stderr string
+	}{
+		{name: "no hits", result: searchResponse{Fresh: true}, code: 2, stderr: "no hits\n"},
+		{name: "syncing", err: &apiError{Code: "workspace_syncing", Message: "workspace syncing", Retryable: true}, code: 1, stderr: "workspace syncing; retry\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fakeCodeDaemonClient{search: func(context.Context, searchRequest) (searchResponse, error) {
+				return tt.result, tt.err
+			}}
+			injectCodeDaemonClient(t, client)
+			code, stdout, stderr := captureCodeCommand(t, []string{"code", "search", "--db", db, "Foo"})
+			if code != tt.code || stdout != "" || stderr != tt.stderr {
+				t.Fatalf("exit=%d stdout=%q stderr=%q, want exit=%d stderr=%q", code, stdout, stderr, tt.code, tt.stderr)
+			}
+		})
+	}
+}
+
+func TestCmdCodeGetDaemon(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	sym := testSymbol()
+	client := fakeCodeDaemonClient{get: func(_ context.Context, req getRequest) (codeindex.Symbol, error) {
+		if req.Root != filepath.Clean(root) || req.Key != sym.Key || !req.Body {
+			t.Fatalf("request=%+v", req)
+		}
+		return sym, nil
+	}}
+	calls := injectCodeDaemonClient(t, client)
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "get", "--body", "--db", db, "--symbol", sym.Key})
+	if code != 0 || stderr != "" || *calls != 1 {
+		t.Fatalf("exit=%d factory calls=%d stdout=%q stderr=%q", code, *calls, stdout, stderr)
+	}
+	var want bytes.Buffer
+	if err := formatCodeSymbol(&want, sym, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if stdout != want.String() {
+		t.Fatalf("stdout=%q, want byte-for-byte %q", stdout, want.String())
+	}
+}
+
+func TestCmdCodeGetDaemonNotFoundAndOperationalError(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	tests := []struct {
+		name   string
+		err    error
+		code   int
+		stderr string
+	}{
+		{name: "not found", err: &apiError{Code: "not_found", Message: "not found"}, code: 2, stderr: "not found\n"},
+		{name: "operational", err: errors.New("transport failed"), code: 1, stderr: "error: transport failed\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fakeCodeDaemonClient{get: func(context.Context, getRequest) (codeindex.Symbol, error) {
+				return codeindex.Symbol{}, tt.err
+			}}
+			injectCodeDaemonClient(t, client)
+			code, stdout, stderr := captureCodeCommand(t, []string{"code", "get", "--db", db, "--symbol", "missing"})
+			if code != tt.code || stdout != "" || stderr != tt.stderr {
+				t.Fatalf("exit=%d stdout=%q stderr=%q, want exit=%d stderr=%q", code, stdout, stderr, tt.code, tt.stderr)
+			}
+		})
 	}
 }
 
