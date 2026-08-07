@@ -5,12 +5,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -131,6 +134,7 @@ func TestDaemonMapsOperationalErrors(t *testing.T) {
 	}{
 		{ErrWorkspaceSyncing, http.StatusConflict, "workspace_syncing", true},
 		{ErrStaleLiveKey, http.StatusConflict, "stale_live_key", false},
+		{codestore.ErrNotFound, http.StatusNotFound, "not_found", false},
 		{codestore.ErrReindexRequired, http.StatusConflict, "reindex_required", false},
 		{&lsp.ResponseError{Code: lsp.ErrCodeInternalError, Message: "failed"}, http.StatusBadGateway, "lsp_error", true},
 	}
@@ -148,6 +152,34 @@ func TestDaemonMapsOperationalErrors(t *testing.T) {
 				t.Fatalf("status=%d error=%+v", rr.Code, got)
 			}
 		})
+	}
+}
+
+func TestDaemonClientPreservesTypedNotFound(t *testing.T) {
+	h := newDaemonHandler(fakeDaemonCodeService{
+		search: func(context.Context, searchRequest) (searchResponse, error) { return searchResponse{}, nil },
+		get: func(context.Context, getRequest) (codeindex.Symbol, error) {
+			return codeindex.Symbol{}, codestore.ErrNotFound
+		},
+	}, "secret")
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	_, err := (daemonClient{endpoint: ts.URL, token: "secret", client: ts.Client()}).Get(context.Background(), getRequest{})
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" || apiErr.Retryable {
+		t.Fatalf("error=%T %v", err, err)
+	}
+}
+
+func TestDaemonStopRejectsMalformedJSON(t *testing.T) {
+	called := false
+	h := newDaemonServerHandler(nil, "secret", nil, func() { called = true })
+	req := httptest.NewRequest(http.MethodPost, "/v1/stop", strings.NewReader(`{`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || called {
+		t.Fatalf("status=%d called=%v body=%s", rr.Code, called, rr.Body.String())
 	}
 }
 
@@ -321,5 +353,253 @@ func TestWorkspaceRegistryExplicitRootDoesNotAutoEvict(t *testing.T) {
 	state.mu.Unlock()
 	if closed {
 		t.Fatal("explicit workspace was evicted")
+	}
+}
+
+func TestWorkspaceRegistryRecentAccessSurvivesOldIdleCallback(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	r, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), 100*time.Millisecond, testWorkspaceOpener(map[string]*workspaceState{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	state, err := r.Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(70 * time.Millisecond)
+	if _, err := r.Resolve(root); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	state.mu.Lock()
+	closed := state.closed
+	state.mu.Unlock()
+	if closed {
+		t.Fatal("old idle callback closed a recently accessed workspace")
+	}
+}
+
+func TestWorkspaceRegistryRejectsOldEvictionEpoch(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	r, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Minute, testWorkspaceOpener(map[string]*workspaceState{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := r.Resolve(root); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	entry := r.entries[root]
+	oldEpoch := entry.epoch
+	r.scheduleEvictionLocked(root, entry)
+	r.mu.Unlock()
+	r.evict(root, entry, oldEpoch)
+	entry.state.mu.Lock()
+	closed := entry.state.closed
+	entry.state.mu.Unlock()
+	if closed {
+		t.Fatal("old eviction epoch closed a recently accessed workspace")
+	}
+}
+
+func TestDaemonRequestLeasesAutomaticWorkspace(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	opened := map[string]*workspaceState{}
+	r, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), 20*time.Millisecond, testWorkspaceOpener(opened))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	state, err := r.Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newDaemonServerHandler(fakeDaemonCodeService{
+		search: func(context.Context, searchRequest) (searchResponse, error) {
+			time.Sleep(50 * time.Millisecond)
+			state.mu.Lock()
+			closed := state.closed
+			state.mu.Unlock()
+			if closed {
+				return searchResponse{}, errors.New("workspace closed during request")
+			}
+			return searchResponse{Fresh: true}, nil
+		},
+	}, "secret", r, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/code/search", strings.NewReader(fmt.Sprintf(`{"root":%q,"query":"Handler"}`, root)))
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWorkspaceRegistryRestoresRootsLazilyAndRemovesMissing(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	missing := filepath.Join(t.TempDir(), "gone")
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	data, err := json.Marshal(workspaceRegistryFile{Roots: []string{root, missing}})
+	if err != nil || os.WriteFile(file, data, 0o600) != nil {
+		t.Fatal(err)
+	}
+	var opens atomic.Int32
+	r, err := newWorkspaceRegistry(file, time.Minute, func(root string) (*workspaceState, error) {
+		opens.Add(1)
+		return &workspaceState{root: root, shutdownDone: make(chan struct{})}, nil
+	})
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	defer r.Close()
+	if opens.Load() != 0 {
+		t.Fatalf("restore opened %d workspaces, want lazy restore", opens.Load())
+	}
+	if got := r.List(); len(got) != 2 {
+		t.Fatalf("roots=%v", got)
+	}
+	removed, err := r.Remove(missing)
+	if err != nil || !removed {
+		t.Fatalf("remove missing=%v err=%v", removed, err)
+	}
+	if _, err := r.Resolve(root); err != nil || opens.Load() != 1 {
+		t.Fatalf("resolve err=%v opens=%d", err, opens.Load())
+	}
+}
+
+func TestWorkspaceRegistryAddFailureRollsBackNewEntry(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	parentFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parentFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opened := map[string]*workspaceState{}
+	r, err := newWorkspaceRegistry(filepath.Join(parentFile, "workspaces.json"), time.Minute, testWorkspaceOpener(opened))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := r.Add(root); err == nil {
+		t.Fatal("Add unexpectedly succeeded")
+	}
+	if got := r.List(); len(got) != 0 {
+		t.Fatalf("roots=%v", got)
+	}
+	state := opened[root]
+	state.mu.Lock()
+	closed := state.closed
+	state.mu.Unlock()
+	if !closed {
+		t.Fatal("failed Add leaked its newly opened workspace")
+	}
+}
+
+func TestWorkspaceRegistryAddFailureRestoresAutomaticTimer(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	opened := map[string]*workspaceState{}
+	r, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), 20*time.Millisecond, testWorkspaceOpener(opened))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	state, err := r.Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parentFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.file = filepath.Join(parentFile, "workspaces.json")
+	if _, err := r.Add(root); err == nil {
+		t.Fatal("Add unexpectedly succeeded")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		state.mu.Lock()
+		closed := state.closed
+		state.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed Add did not restore automatic eviction")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestDaemonStopWaitsUntilAuthenticatedStatusFails(t *testing.T) {
+	cache := t.TempDir()
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	var alive atomic.Bool
+	alive.Store(true)
+	var statusCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/stop":
+			writeJSON(w, http.StatusOK, map[string]bool{"stopping": true})
+			time.AfterFunc(60*time.Millisecond, func() { alive.Store(false) })
+		case "/v1/status":
+			statusCalls.Add(1)
+			if !alive.Load() {
+				writeAPIError(w, http.StatusServiceUnavailable, &apiError{Code: "stopped", Message: "stopped"})
+				return
+			}
+			writeJSON(w, http.StatusOK, daemonStatus{Status: "running", PID: 42})
+		}
+	}))
+	defer ts.Close()
+	path, err := daemonDiscoveryPath()
+	if err != nil || writeDaemonDiscovery(path, daemonDiscovery{Endpoint: ts.URL, Token: "secret", PID: 42}) != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if code := daemonStop(); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if elapsed := time.Since(started); elapsed < 50*time.Millisecond || statusCalls.Load() == 0 {
+		t.Fatalf("elapsed=%v status calls=%d", elapsed, statusCalls.Load())
+	}
+}
+
+func TestDaemonServerForcesCloseAfterShutdownDeadline(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := newDaemonHTTPServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(entered)
+		<-release
+	}))
+	if server.ReadHeaderTimeout <= 0 {
+		t.Fatal("ReadHeaderTimeout is disabled")
+	}
+	go server.Serve(listener)
+	requestDone := make(chan struct{})
+	go func() {
+		_, _ = http.Get("http://" + listener.Addr().String())
+		close(requestDone)
+	}()
+	<-entered
+	started := time.Now()
+	shutdownDaemonServer(server, 20*time.Millisecond)
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("shutdown took %v", elapsed)
+	}
+	close(release)
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("forced Close did not release client")
 	}
 }

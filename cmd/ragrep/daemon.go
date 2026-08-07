@@ -118,6 +118,8 @@ type workspaceRegistryEntry struct {
 	state    *workspaceState
 	explicit bool
 	timer    *time.Timer
+	epoch    uint64
+	leases   int
 }
 
 type workspaceRegistry struct {
@@ -153,17 +155,13 @@ func newWorkspaceRegistry(file string, idle time.Duration, opener workspaceOpene
 		return nil, err
 	}
 	for _, path := range saved.Roots {
-		root, err := canonicalWorkspaceRoot(path)
-		if err != nil {
-			r.Close()
-			return nil, err
+		if path == "" {
+			continue
 		}
-		state, err := opener(root)
-		if err != nil {
-			r.Close()
-			return nil, err
+		root, err := filepath.Abs(path)
+		if err == nil {
+			r.entries[filepath.Clean(root)] = &workspaceRegistryEntry{explicit: true}
 		}
-		r.entries[root] = &workspaceRegistryEntry{state: state, explicit: true}
 	}
 	return r, nil
 }
@@ -205,19 +203,34 @@ func (r *workspaceRegistry) Add(path string) (string, error) {
 		return "", err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return "", errors.New("workspace registry is closed")
 	}
 	entry := r.entries[root]
+	existed := entry != nil
 	if entry == nil {
-		state, err := r.open(root)
-		if err != nil {
-			return "", err
-		}
-		entry = &workspaceRegistryEntry{state: state}
+		entry = &workspaceRegistryEntry{}
 		r.entries[root] = entry
 	}
+	oldState := entry.state
+	if entry.state == nil {
+		state, err := r.open(root)
+		if err != nil {
+			if !existed {
+				delete(r.entries, root)
+			}
+			r.mu.Unlock()
+			return "", err
+		}
+		entry.state = state
+	}
+	if entry.explicit {
+		r.mu.Unlock()
+		return root, nil
+	}
+	oldTimer := entry.timer != nil
+	entry.epoch++
 	if entry.timer != nil {
 		entry.timer.Stop()
 		entry.timer = nil
@@ -225,18 +238,35 @@ func (r *workspaceRegistry) Add(path string) (string, error) {
 	entry.explicit = true
 	if err := r.persistLocked(); err != nil {
 		entry.explicit = false
+		var closeEntry *workspaceRegistryEntry
+		if !existed {
+			delete(r.entries, root)
+			closeEntry = entry
+		} else {
+			if oldState == nil {
+				closeEntry = &workspaceRegistryEntry{state: entry.state}
+				entry.state = nil
+			}
+			if oldTimer {
+				r.scheduleEvictionLocked(root, entry)
+			}
+		}
+		r.mu.Unlock()
+		_ = closeWorkspaceEntry(closeEntry)
 		return "", err
 	}
+	r.mu.Unlock()
 	return root, nil
 }
 
 func (r *workspaceRegistry) Remove(path string) (bool, error) {
 	root, err := canonicalWorkspaceRoot(path)
 	if err != nil {
-		if errors.Is(err, ErrWorkspaceNotFound) {
-			return false, nil
+		root, err = filepath.Abs(path)
+		if err != nil {
+			return false, err
 		}
-		return false, err
+		root = filepath.Clean(root)
 	}
 	r.mu.Lock()
 	entry := r.entries[root]
@@ -276,25 +306,87 @@ func (r *workspaceRegistry) Resolve(path string) (*workspaceState, error) {
 	}
 	entry := r.entries[root]
 	if entry == nil {
-		state, err := r.open(root)
-		if err != nil {
-			return nil, err
-		}
-		entry = &workspaceRegistryEntry{state: state}
+		entry = &workspaceRegistryEntry{}
 		r.entries[root] = entry
 	}
-	if !entry.explicit {
-		if entry.timer != nil {
-			entry.timer.Stop()
+	if entry.state == nil {
+		state, err := r.open(root)
+		if err != nil {
+			if !entry.explicit {
+				delete(r.entries, root)
+			}
+			return nil, err
 		}
-		entry.timer = time.AfterFunc(r.idle, func() { r.evict(root, entry) })
+		entry.state = state
 	}
+	r.scheduleEvictionLocked(root, entry)
 	return entry.state, nil
 }
 
-func (r *workspaceRegistry) evict(root string, entry *workspaceRegistryEntry) {
+func (r *workspaceRegistry) Acquire(path string) (func(), error) {
+	root, err := canonicalWorkspaceRoot(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrWorkspaceNotFound
+		}
+		return nil, err
+	}
 	r.mu.Lock()
-	if r.entries[root] != entry || entry.explicit || r.closed {
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errors.New("workspace registry is closed")
+	}
+	entry := r.entries[root]
+	if entry == nil {
+		entry = &workspaceRegistryEntry{}
+		r.entries[root] = entry
+	}
+	if entry.state == nil {
+		state, err := r.open(root)
+		if err != nil {
+			if !entry.explicit {
+				delete(r.entries, root)
+			}
+			r.mu.Unlock()
+			return nil, err
+		}
+		entry.state = state
+	}
+	entry.leases++
+	entry.epoch++
+	if entry.timer != nil {
+		entry.timer.Stop()
+		entry.timer = nil
+	}
+	r.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if r.entries[root] == entry && entry.leases > 0 {
+				entry.leases--
+				r.scheduleEvictionLocked(root, entry)
+			}
+			r.mu.Unlock()
+		})
+	}, nil
+}
+
+func (r *workspaceRegistry) scheduleEvictionLocked(root string, entry *workspaceRegistryEntry) {
+	if entry.explicit || entry.leases > 0 {
+		return
+	}
+	if entry.timer != nil {
+		entry.timer.Stop()
+	}
+	entry.epoch++
+	epoch := entry.epoch
+	entry.timer = time.AfterFunc(r.idle, func() { r.evict(root, entry, epoch) })
+}
+
+func (r *workspaceRegistry) evict(root string, entry *workspaceRegistryEntry, epoch uint64) {
+	r.mu.Lock()
+	if r.entries[root] != entry || entry.explicit || entry.leases > 0 || entry.epoch != epoch || r.closed {
 		r.mu.Unlock()
 		return
 	}
@@ -308,10 +400,32 @@ func (r *workspaceRegistry) persistLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(r.file), 0o700); err != nil {
+	dir := filepath.Dir(r.file)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(r.file, data, 0o600)
+	temp, err := os.CreateTemp(dir, "workspaces-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, r.file)
 }
 
 func (r *workspaceRegistry) explicitRootsLocked() []string {
@@ -464,12 +578,40 @@ func daemonStop() int {
 	if err != nil {
 		return fail(err)
 	}
+	discoveryPath, err := daemonDiscoveryPath()
+	if err != nil {
+		return fail(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), daemonStartTimeout)
 	defer cancel()
 	if err := client.Stop(ctx); err != nil {
 		return fail(err)
 	}
+	if err := waitForDaemonStop(ctx, client, discoveryPath); err != nil {
+		return fail(err)
+	}
 	return 0
+}
+
+func waitForDaemonStop(ctx context.Context, client daemonClient, discoveryPath string) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(discoveryPath); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if _, err := client.Status(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func daemonStatusCommand() int {
@@ -526,21 +668,33 @@ func serveDaemon() error {
 	}
 	defer os.Remove(discoveryPath)
 	stop := make(chan struct{}, 1)
-	server := &http.Server{Handler: newDaemonServerHandler(service, token, registry, func() {
+	server := newDaemonHTTPServer(newDaemonServerHandler(service, token, registry, func() {
 		select {
 		case stop <- struct{}{}:
 		default:
 		}
-	})}
+	}))
 	go func() {
 		<-stop
-		_ = server.Shutdown(context.Background())
+		shutdownDaemonServer(server, daemonStartTimeout)
 	}()
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
+}
+
+func newDaemonHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+}
+
+func shutdownDaemonServer(server *http.Server, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+	}
 }
 
 func cmdWorkspace(args []string) int {
@@ -555,10 +709,14 @@ func cmdWorkspace(args []string) int {
 	defer cancel()
 	switch args[0] {
 	case "add":
-		if len(args) != 2 {
+		if len(args) > 2 {
 			return fail(errors.New("usage: ragrep workspace add [path]"))
 		}
-		root, err := client.WorkspaceAdd(ctx, args[1])
+		path := "."
+		if len(args) == 2 {
+			path = args[1]
+		}
+		root, err := client.WorkspaceAdd(ctx, path)
 		if err != nil {
 			return fail(err)
 		}

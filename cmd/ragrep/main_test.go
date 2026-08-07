@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -82,6 +84,34 @@ func TestRunWorkspaceCleanNegativeExitsTwo(t *testing.T) {
 	}
 	if code := run([]string{"workspace", "list"}); code != 2 {
 		t.Fatalf("workspace list empty exit=%d, want 2", code)
+	}
+}
+
+func TestRunWorkspaceAddDefaultsToCurrentDirectory(t *testing.T) {
+	cache := t.TempDir()
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	requested := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Path string `json:"path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
+		requested <- req.Path
+		json.NewEncoder(w).Encode(map[string]string{"root": "root"})
+	}))
+	defer ts.Close()
+	path, err := daemonDiscoveryPath()
+	if err != nil || writeDaemonDiscovery(path, daemonDiscovery{Endpoint: ts.URL, Token: "secret", PID: os.Getpid()}) != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"workspace", "add"}); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if got := <-requested; got != "." {
+		t.Fatalf("path=%q, want .", got)
 	}
 }
 

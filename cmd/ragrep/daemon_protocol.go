@@ -83,6 +83,10 @@ func (h *daemonHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
 		writeJSON(w, http.StatusOK, daemonStatus{Status: "running", PID: os.Getpid()})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/stop":
+		if err := decodeJSON(r, &struct{}{}); err != nil {
+			writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]bool{"stopping": true})
 		if h.stop != nil {
 			h.stop()
@@ -104,6 +108,11 @@ func (h *daemonHandler) get(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
 		return
 	}
+	release, ok := h.acquireWorkspace(w, req.Root)
+	if !ok {
+		return
+	}
+	defer release()
 	getter, ok := h.service.(daemonCodeGetter)
 	if !ok {
 		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
@@ -128,6 +137,11 @@ func (h *daemonHandler) search(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
 		return
 	}
+	release, ok := h.acquireWorkspace(w, req.Root)
+	if !ok {
+		return
+	}
+	defer release()
 	resp, err := h.service.Search(r.Context(), searchRequest{Root: req.Root, Query: req.Query, Mode: req.Mode, K: req.K})
 	if err != nil {
 		status, apiErr := classifyAPIError(err)
@@ -138,6 +152,19 @@ func (h *daemonHandler) search(w http.ResponseWriter, r *http.Request) {
 		Hits: resp.Hits, Fresh: resp.Fresh, Generation: resp.Generation,
 		Degraded: resp.Degraded, UsedVector: resp.UsedVector,
 	})
+}
+
+func (h *daemonHandler) acquireWorkspace(w http.ResponseWriter, root string) (func(), bool) {
+	if h.registry == nil {
+		return func() {}, true
+	}
+	release, err := h.registry.Acquire(root)
+	if err != nil {
+		status, apiErr := classifyAPIError(err)
+		writeAPIError(w, status, apiErr)
+		return nil, false
+	}
+	return release, true
 }
 
 func (h *daemonHandler) workspaces(w http.ResponseWriter, r *http.Request) {
@@ -209,6 +236,8 @@ func classifyAPIError(err error) (int, *apiError) {
 		return http.StatusConflict, &apiError{Code: "workspace_syncing", Message: err.Error(), Retryable: true}
 	case errors.Is(err, ErrStaleLiveKey):
 		return http.StatusConflict, &apiError{Code: "stale_live_key", Message: err.Error()}
+	case errors.Is(err, codestore.ErrNotFound):
+		return http.StatusNotFound, &apiError{Code: "not_found", Message: err.Error()}
 	case errors.Is(err, codestore.ErrReindexRequired):
 		return http.StatusConflict, &apiError{Code: "reindex_required", Message: err.Error()}
 	}
