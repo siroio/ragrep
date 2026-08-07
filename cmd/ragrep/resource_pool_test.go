@@ -79,6 +79,23 @@ func TestLSPPoolReusesOverlappingLease(t *testing.T) {
 	}
 }
 
+func TestLSPPoolAcquireWithMetadataPreservesServerIdentity(t *testing.T) {
+	client := new(lsp.Client)
+	p := newLSPPool(time.Hour, func(context.Context, string, string) (*pooledLanguageServer, error) {
+		return &pooledLanguageServer{client: client, serverName: "fake-lsp", serverVersion: "v1.2.3"}, nil
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	got, name, version, release, err := p.AcquireWithMetadata(context.Background(), t.TempDir(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if got != client || name != "fake-lsp" || version != "v1.2.3" {
+		t.Fatalf("client=%p name=%q version=%q", got, name, version)
+	}
+}
+
 func TestLSPPoolDoesNotShareAcrossRoots(t *testing.T) {
 	var constructed atomic.Int32
 	p := newLSPPool(time.Hour, func(context.Context, string, string) (*pooledLanguageServer, error) {

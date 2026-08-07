@@ -50,12 +50,32 @@ type daemonGetRequest struct {
 	Body bool   `json:"body"`
 }
 
+type daemonIndexRequest struct {
+	Root     string   `json:"root"`
+	Language string   `json:"language"`
+	Roots    []string `json:"roots"`
+}
+
+type daemonExpandRequest struct {
+	Root     string `json:"root"`
+	Key      string `json:"key"`
+	Relation string `json:"relation"`
+}
+
 type daemonCodeSearcher interface {
 	Search(context.Context, searchRequest) (searchResponse, error)
 }
 
 type daemonCodeGetter interface {
 	Get(context.Context, getRequest) (codeindex.Symbol, error)
+}
+
+type daemonCodeIndexer interface {
+	Index(context.Context, indexRequest) (indexResult, error)
+}
+
+type daemonCodeExpander interface {
+	Expand(context.Context, expandRequest) ([]codeExpandTarget, error)
 }
 
 type daemonHandler struct {
@@ -95,11 +115,65 @@ func (h *daemonHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.search(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/get":
 		h.get(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/index":
+		h.index(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/expand":
+		h.expand(w, r)
 	case r.URL.Path == "/v1/workspaces":
 		h.workspaces(w, r)
 	default:
 		writeAPIError(w, http.StatusNotFound, &apiError{Code: "not_found", Message: "not found"})
 	}
+}
+
+func (h *daemonHandler) index(w http.ResponseWriter, r *http.Request) {
+	var req daemonIndexRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
+		return
+	}
+	release, ok := h.acquireWorkspace(w, req.Root)
+	if !ok {
+		return
+	}
+	defer release()
+	indexer, ok := h.service.(daemonCodeIndexer)
+	if !ok {
+		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
+		return
+	}
+	result, err := indexer.Index(r.Context(), indexRequest{Root: req.Root, Language: req.Language, Roots: req.Roots})
+	if err != nil {
+		status, apiErr := classifyAPIError(err)
+		writeAPIError(w, status, apiErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *daemonHandler) expand(w http.ResponseWriter, r *http.Request) {
+	var req daemonExpandRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
+		return
+	}
+	release, ok := h.acquireWorkspace(w, req.Root)
+	if !ok {
+		return
+	}
+	defer release()
+	expander, ok := h.service.(daemonCodeExpander)
+	if !ok {
+		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "code service unavailable"})
+		return
+	}
+	targets, err := expander.Expand(r.Context(), expandRequest{Root: req.Root, Key: req.Key, Relation: req.Relation})
+	if err != nil {
+		status, apiErr := classifyAPIError(err)
+		writeAPIError(w, status, apiErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, targets)
 }
 
 func (h *daemonHandler) get(w http.ResponseWriter, r *http.Request) {
@@ -241,6 +315,10 @@ func classifyAPIError(err error) (int, *apiError) {
 	case errors.Is(err, codestore.ErrReindexRequired):
 		return http.StatusConflict, &apiError{Code: "reindex_required", Message: err.Error()}
 	}
+	var unsupported *codeExpandUnsupportedError
+	if errors.As(err, &unsupported) {
+		return http.StatusNotImplemented, &apiError{Code: "not_supported", Message: err.Error()}
+	}
 	var lspErr *lsp.ResponseError
 	if errors.As(err, &lspErr) || strings.HasPrefix(err.Error(), "lsp:") {
 		return http.StatusBadGateway, &apiError{Code: "lsp_error", Message: err.Error(), Retryable: true}
@@ -264,6 +342,8 @@ type daemonClient struct {
 type codeDaemonClient interface {
 	Search(context.Context, searchRequest) (searchResponse, error)
 	Get(context.Context, getRequest) (codeindex.Symbol, error)
+	Index(context.Context, indexRequest) (indexResult, error)
+	Expand(context.Context, expandRequest) ([]codeExpandTarget, error)
 }
 
 var codeDaemonClientFactory = loadCodeDaemonClient
@@ -290,6 +370,18 @@ func (c daemonClient) Get(ctx context.Context, req getRequest) (codeindex.Symbol
 	var symbol codeindex.Symbol
 	err := c.do(ctx, http.MethodPost, "/v1/code/get", daemonGetRequest{Root: req.Root, Key: req.Key, Body: req.Body}, &symbol)
 	return symbol, err
+}
+
+func (c daemonClient) Index(ctx context.Context, req indexRequest) (indexResult, error) {
+	var result indexResult
+	err := c.do(ctx, http.MethodPost, "/v1/code/index", daemonIndexRequest{Root: req.Root, Language: req.Language, Roots: req.Roots}, &result)
+	return result, err
+}
+
+func (c daemonClient) Expand(ctx context.Context, req expandRequest) ([]codeExpandTarget, error) {
+	var targets []codeExpandTarget
+	err := c.do(ctx, http.MethodPost, "/v1/code/expand", daemonExpandRequest{Root: req.Root, Key: req.Key, Relation: req.Relation}, &targets)
+	return targets, err
 }
 
 func (c daemonClient) Stop(ctx context.Context) error {

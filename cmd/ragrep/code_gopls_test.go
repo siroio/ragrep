@@ -74,6 +74,7 @@ func TestGoplsIntegration(t *testing.T) {
 	}
 
 	db := filepath.Join(ragrepDir, "code.db")
+	injectCodeServiceDaemon(t, root, db)
 
 	var indexCode int
 	indexOut := captureStdout(t, func() {
@@ -97,10 +98,13 @@ func TestGoplsIntegration(t *testing.T) {
 	if searchCode != 0 {
 		t.Fatalf("code search: exit=%d, output=%q", searchCode, searchOut)
 	}
-	var hits []codestore.SymbolHit
-	if err := json.Unmarshal([]byte(searchOut), &hits); err != nil {
+	var searchResult struct {
+		Hits []codestore.SymbolHit `json:"hits"`
+	}
+	if err := json.Unmarshal([]byte(searchOut), &searchResult); err != nil {
 		t.Fatalf("code search --json output not valid JSON: %v (%q)", err, searchOut)
 	}
+	hits := searchResult.Hits
 	if len(hits) == 0 {
 		t.Fatalf("code search for %q returned no hits", "Greet")
 	}

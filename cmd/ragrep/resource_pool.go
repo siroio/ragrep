@@ -72,8 +72,9 @@ func (p *embeddingPool) Close() error {
 }
 
 type pooledLanguageServer struct {
-	client *lsp.Client
-	close  func() error
+	client                    *lsp.Client
+	serverName, serverVersion string
+	close                     func() error
 }
 
 type lspPoolEntry struct {
@@ -112,11 +113,12 @@ func newLSPPool(idle time.Duration, constructor func(context.Context, string, st
 			if err != nil {
 				return nil, err
 			}
-			client, _, err := startLanguageServer(command, root)
+			client, initResult, err := startLanguageServer(command, root)
 			if err != nil {
 				return nil, err
 			}
-			return &pooledLanguageServer{client: client, close: client.Close}, nil
+			name, version := serverIdentity(initResult)
+			return &pooledLanguageServer{client: client, serverName: name, serverVersion: version, close: client.Close}, nil
 		}
 	}
 	return &lspPool{
@@ -127,24 +129,29 @@ func newLSPPool(idle time.Duration, constructor func(context.Context, string, st
 }
 
 func (p *lspPool) Acquire(ctx context.Context, root, language string) (*lsp.Client, func(), error) {
+	client, _, _, release, err := p.AcquireWithMetadata(ctx, root, language)
+	return client, release, err
+}
+
+func (p *lspPool) AcquireWithMetadata(ctx context.Context, root, language string) (*lsp.Client, string, string, func(), error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, "", "", nil, err
 	}
 	root, err := filepath.Abs(root)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", "", nil, err
 	}
 	key := lspPoolKey{root: root, language: language}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return nil, nil, errors.New("LSP pool is closed")
+		return nil, "", "", nil, errors.New("LSP pool is closed")
 	}
 	entry := p.entries[key]
 	if entry == nil {
 		server, err := p.constructor(ctx, root, language)
 		if err != nil {
-			return nil, nil, err
+			return nil, "", "", nil, err
 		}
 		entry = &lspPoolEntry{server: server}
 		p.entries[key] = entry
@@ -157,7 +164,7 @@ func (p *lspPool) Acquire(ctx context.Context, root, language string) (*lsp.Clie
 	release := func() {
 		once.Do(func() { p.release(key, entry) })
 	}
-	return entry.server.client, release, nil
+	return entry.server.client, entry.server.serverName, entry.server.serverVersion, release, nil
 }
 
 func (p *lspPool) release(key lspPoolKey, entry *lspPoolEntry) {

@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/siroio/ragrep/internal/codeindex"
 )
 
 // fakeLSPServerSrc is a standalone (no internal/lsp, no internal/lsp/testdata
@@ -119,6 +124,7 @@ func TestCmdCodeIndexCapabilityGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	db := filepath.Join(ragrepDir, "code.db")
+	injectCodeServiceDaemon(t, root, filepath.Join(t.TempDir(), "code.db"))
 
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -143,5 +149,104 @@ func TestCmdCodeIndexCapabilityGate(t *testing.T) {
 	// nothing should have been indexed -- not even an empty code.db file.
 	if _, err := os.Stat(db); !os.IsNotExist(err) {
 		t.Fatalf("code.db must not be created when the capability gate fails, stat err=%v", err)
+	}
+}
+
+func TestCodeServiceIndexPreservesIndexingSemantics(t *testing.T) {
+	svc, ws, embedder := newTestCodeService(t)
+	src := strings.Replace(fakeLSPServerDocumentSymbolSrc,
+		`{"capabilities":{"documentSymbolProvider":true}}`,
+		`{"capabilities":{"documentSymbolProvider":true},"serverInfo":{"name":"fake-index","version":"v1"}}`, 1)
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-service-index", src)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"`+filepath.ToSlash(exe)+`"}}`)
+
+	body := "package p\n\nfunc Foo() {\n\n}\n"
+	ws.save(t, "a.go", body)
+	ws.save(t, "b.go", body)
+	req := indexRequest{Root: ws.root, Language: "go", Roots: []string{"."}}
+
+	first, err := svc.Index(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first.Indexed, []string{"a.go", "b.go"}) || first.Scanned != 2 || len(first.Pruned) != 0 {
+		t.Fatalf("first result=%+v", first)
+	}
+	if embedder.calls.Load() != 2 {
+		t.Fatalf("first embed calls=%d, want 2", embedder.calls.Load())
+	}
+	run, err := ws.store.LatestIndexRun()
+	if err != nil || run.Scope != "index:." || run.ServerName != "fake-index" || run.ServerVersion != "v1" {
+		t.Fatalf("latest run=%+v err=%v", run, err)
+	}
+
+	second, err := svc.Index(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Indexed) != 0 || second.Scanned != 2 || len(second.Pruned) != 0 || embedder.calls.Load() != 2 {
+		t.Fatalf("unchanged result=%+v embed calls=%d", second, embedder.calls.Load())
+	}
+
+	if err := os.Remove(filepath.Join(ws.root, "b.go")); err != nil {
+		t.Fatal(err)
+	}
+	third, err := svc.Index(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(third.Pruned, []string{"b.go"}) || third.Scanned != 1 {
+		t.Fatalf("delete result=%+v", third)
+	}
+	paths, err := ws.store.ListPaths()
+	if err != nil || !reflect.DeepEqual(paths, []string{"a.go"}) {
+		t.Fatalf("paths=%v err=%v", paths, err)
+	}
+}
+
+func TestCodeServiceExpandPreservesRelationSemantics(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	body := "package main\n\nfunc Callee() {}\n\nfunc Caller() {\n\tCallee()\n\tCallee()\n}\n"
+	ws.save(t, "main.go", body)
+	target := serviceSymbol("main.go", "Callee", "func Callee() {}")
+	target.Key = "target-key"
+	target.Range = codeindex.Range{Start: codeindex.Position{Line: 2}, End: codeindex.Position{Line: 2, Character: 16}}
+	caller := serviceSymbol("main.go", "Caller", "func Caller() {\n\tCallee()\n\tCallee()\n}")
+	caller.Key = "caller-key"
+	caller.Range = codeindex.Range{Start: codeindex.Position{Line: 4}, End: codeindex.Position{Line: 7, Character: 1}}
+	if _, err := ws.store.UpsertSymbols("main.go", codeindex.FileHash([]byte(body)), []codeindex.Symbol{target, caller}, 0, fakeCodeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	indexRun, err := ws.store.RecordIndexRun("index:.", "index-rev", "go", "fake-index", "v0", codeModelID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	locations := "[" + strings.Join([]string{
+		lspLocationJSON(filepath.Join(ws.root, "main.go"), 5),
+		lspLocationJSON(filepath.Join(ws.root, "main.go"), 6),
+		lspLocationJSON(filepath.Join(ws.root, "missing.go"), 0),
+	}, ",") + "]"
+	src := strings.Replace(fakeLSPServerReferencesSrcTemplate,
+		`{"capabilities":{"referencesProvider":true}}`,
+		`{"capabilities":{"referencesProvider":true},"serverInfo":{"name":"fake-expand","version":"v2"}}`, 1)
+	src = strings.ReplaceAll(src, "LOCATIONS_JSON_PLACEHOLDER", locations)
+	exe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-service-expand", src)
+	writeRagrepConfig(t, ws.root, `{"servers":{"go":"`+filepath.ToSlash(exe)+`"}}`)
+
+	targets, err := svc.Expand(context.Background(), expandRequest{Root: ws.root, Key: target.Key, Relation: "references"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 3 || !targets[0].Resolved || targets[0].Key != caller.Key || !targets[1].Resolved || targets[2].Resolved || targets[2].Path != "missing.go" {
+		t.Fatalf("targets=%+v", targets)
+	}
+	relations, err := ws.store.RelationsFrom(target.Key)
+	if err != nil || len(relations) != 1 || relations[0].ToKey != caller.Key || relations[0].Source != "fake-expand" {
+		t.Fatalf("relations=%+v err=%v", relations, err)
+	}
+	after, err := ws.store.LatestIndexRun()
+	if err != nil || after.ID != indexRun {
+		t.Fatalf("latest index run=%+v err=%v, want id %d", after, err, indexRun)
 	}
 }

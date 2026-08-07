@@ -15,7 +15,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 	"unicode/utf16"
 
 	"github.com/siroio/ragrep/internal/codeindex"
@@ -302,147 +301,36 @@ func cmdCodeIndex(args []string) int {
 	if *language == "" || fs.NArg() == 0 {
 		return fail(fmt.Errorf("usage: ragrep code index --language <lang> <path>..."))
 	}
-	ext, ok := codeLangExt[*language]
-	if !ok {
+	if _, ok := codeLangExt[*language]; !ok {
 		return fail(fmt.Errorf("unsupported --language %q (supported: go)", *language))
 	}
-
 	wsRoot, err := workspaceRoot(*db)
 	if err != nil {
 		return fail(err)
 	}
-
-	// Validate every root arg is inside the workspace UP FRONT, mirroring
-	// cmdIndex's doc-index rationale: fail before resolving the server or
-	// touching the (slow) embedding model, not partway through a walk.
-	roots := fs.Args()
-	relRoots := make([]string, len(roots))
-	for i, r := range roots {
+	relRoots := make([]string, fs.NArg())
+	for i, r := range fs.Args() {
 		rel, err := normPath(r, wsRoot)
 		if err != nil {
 			return fail(err)
 		}
 		relRoots[i] = rel
 	}
-
-	cfg, err := config.Load(wsRoot)
+	client, err := codeDaemonClientFactory()
 	if err != nil {
 		return fail(err)
 	}
-	serverCmd, err := cfg.ServerCommand(*language)
+	result, err := client.Index(context.Background(), indexRequest{Root: wsRoot, Language: *language, Roots: relRoots})
 	if err != nil {
-		return fail(err)
+		return codeDaemonError(err)
 	}
-
-	var files []string
-	for _, r := range roots {
-		found, err := discoverCodeFiles(r, ext)
-		if err != nil {
-			return fail(err)
-		}
-		files = append(files, found...)
+	for _, path := range result.Indexed {
+		fmt.Println("indexed", path)
 	}
-
-	if len(files) == 0 {
-		// Still prune: every file that used to be under one of these roots
-		// may have been deleted, including the last one -- that must not
-		// require the server or embedding model either (see
-		// TestCmdCodeIndexZeroFilesSkipsServerAndModel).
-		s, err := openCodeStoreAt(*db)
-		if err != nil {
-			return fail(err)
-		}
-		defer s.Close()
-		pruned, err := pruneCodeSymbols(s, relRoots, nil)
-		if err != nil {
-			return fail(err)
-		}
-		fmt.Printf("done: 0 indexed (0 files scanned, %d pruned)\n", pruned)
-		return 0
+	for _, path := range result.Pruned {
+		fmt.Println("pruned", path)
 	}
-
-	// Start the server and gate on its advertised capabilities BEFORE paying
-	// for the codestore/embedding-model setup below: a server that can't do
-	// textDocument/documentSymbol (or isn't the executable we expect) should
-	// fail fast, the same "cheap/critical checks before expensive ones"
-	// rationale as the workspace-root validation above.
-	client, initResult, err := startLanguageServer(serverCmd, wsRoot)
-	if err != nil {
-		return fail(err)
-	}
-	defer client.Close()
-	if !client.Supports(lsp.FeatureDocumentSymbol) {
-		return fail(fmt.Errorf("language server %q does not support textDocument/documentSymbol (required relation: document symbols for indexing)", serverCmd))
-	}
-
-	s, err := openCodeStoreAt(*db)
-	if err != nil {
-		return fail(err)
-	}
-	defer s.Close()
-
-	// Record the run BEFORE indexing any file, not after: UpsertSymbols
-	// needs a real runID to stamp into symbols.index_run_id as it goes, so
-	// the row's own id must exist first.
-	serverName, serverVersion := serverIdentity(initResult)
-	// Scoped "index:..." so LatestIndexRun can tell this run apart from a
-	// `code expand` call's own "expand:..."-scoped run (see LatestIndexRun's
-	// doc comment) -- expand never (re)indexes any symbol, so it must never
-	// win a manifest's identity just by recording a later id.
-	runID, err := s.RecordIndexRun("index:"+strings.Join(relRoots, ","), gitRevision(wsRoot), *language, serverName, serverVersion, codeModelID, time.Now())
-	if err != nil {
-		return fail(err)
-	}
-
-	dir, err := embed.CacheDir()
-	if err != nil {
-		return fail(err)
-	}
-	e, err := embed.New(dir)
-	if err != nil {
-		return fail(err)
-	}
-	defer e.Close()
-
-	indexed := 0
-	seen := make(map[string]bool, len(files))
-	ctx := context.Background()
-	for _, f := range files {
-		rel, err := normPath(f, wsRoot)
-		if err != nil {
-			return fail(err)
-		}
-		seen[rel] = true
-		content, err := os.ReadFile(f)
-		if err != nil {
-			return fail(err)
-		}
-		docSyms, err := client.DocumentSymbol(ctx, lsp.DocumentSymbolParams{
-			TextDocument: lsp.TextDocumentIdentifier{URI: fileURI(f)},
-		})
-		if err != nil {
-			return fail(fmt.Errorf("%s: %w", rel, err))
-		}
-		symbols, err := codeindex.Extract(*language, rel, content, docSyms)
-		if err != nil {
-			return fail(err)
-		}
-		changed, err := s.UpsertSymbols(rel, codeindex.FileHash(content), symbols, runID, e.Embed)
-		if err != nil {
-			return fail(fmt.Errorf("%s: %w", rel, err))
-		}
-		if changed {
-			fmt.Println("indexed", rel)
-			indexed++
-		}
-	}
-
-	pruned, err := pruneCodeSymbols(s, relRoots, seen)
-	if err != nil {
-		return fail(err)
-	}
-
-	fmt.Printf("done: %d indexed (%d files scanned, %d pruned)\n", indexed, len(files), pruned)
+	fmt.Printf("done: %d indexed (%d files scanned, %d pruned)\n", len(result.Indexed), result.Scanned, len(result.Pruned))
 	return 0
 }
 
@@ -454,11 +342,19 @@ func cmdCodeIndex(args []string) int {
 // the number of distinct paths pruned; each is also printed, mirroring the
 // doc index's own --prune output.
 func pruneCodeSymbols(s *codestore.Store, relRoots []string, seen map[string]bool) (int, error) {
+	paths, err := pruneCodeSymbolPaths(s, relRoots, seen)
+	for _, path := range paths {
+		fmt.Println("pruned", path)
+	}
+	return len(paths), err
+}
+
+func pruneCodeSymbolPaths(s *codestore.Store, relRoots []string, seen map[string]bool) ([]string, error) {
 	allPaths, err := s.ListPaths()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	pruned := 0
+	var pruned []string
 	for _, p := range allPaths {
 		if seen[p] || !pathUnderAnyRoot(p, relRoots) {
 			continue
@@ -466,8 +362,7 @@ func pruneCodeSymbols(s *codestore.Store, relRoots []string, seen map[string]boo
 		if err := s.DeleteSymbolsForPath(p); err != nil {
 			return pruned, err
 		}
-		fmt.Println("pruned", p)
-		pruned++
+		pruned = append(pruned, p)
 	}
 	return pruned, nil
 }
@@ -563,6 +458,9 @@ func codeDaemonError(err error) int {
 		case "not_found":
 			fmt.Fprintln(os.Stderr, apiErr.Message)
 			return 2
+		case "not_supported":
+			fmt.Fprintln(os.Stderr, apiErr.Message)
+			return 1
 		case "workspace_syncing":
 			fmt.Fprintln(os.Stderr, "workspace syncing; retry")
 			return 1
@@ -887,7 +785,7 @@ func cmdCodeExpand(args []string) int {
 	if code, handled := parseArgsUsage(fs, args, codeUsage); handled {
 		return code
 	}
-	feature, validRelation := codeExpandFeature[*relation]
+	_, validRelation := codeExpandFeature[*relation]
 	if fs.NArg() != 0 || *symbolKey == "" || !validRelation {
 		return fail(fmt.Errorf("usage: ragrep code expand --symbol <stable-key> --relation definition|references|callers|callees|tests [--json]"))
 	}
@@ -896,155 +794,17 @@ func cmdCodeExpand(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-
-	s, err := openCodeStoreAt(*db)
+	client, err := codeDaemonClientFactory()
 	if err != nil {
 		return fail(err)
 	}
-	defer s.Close()
-
-	sym, err := s.GetSymbol(*symbolKey)
-	if err == codestore.ErrNotFound {
-		fmt.Fprintln(os.Stderr, "not found")
-		return 2
-	}
+	targets, err := client.Expand(context.Background(), expandRequest{Root: wsRoot, Key: *symbolKey, Relation: *relation})
 	if err != nil {
-		return fail(err)
+		return codeDaemonError(err)
 	}
-
-	cfg, err := config.Load(wsRoot)
-	if err != nil {
-		return fail(err)
-	}
-	serverCmd, err := cfg.ServerCommand(sym.Language)
-	if err != nil {
-		return fail(err)
-	}
-
-	client, initResult, err := startLanguageServer(serverCmd, wsRoot)
-	if err != nil {
-		return fail(err)
-	}
-	defer client.Close()
-
-	// Distinct from "no results": the server itself can't do this, so no
-	// query was even attempted.
-	if !client.Supports(feature) {
-		fmt.Fprintf(os.Stderr, "not supported by server %s\n", serverCmd)
-		return 1
-	}
-
-	serverName, serverVersion := serverIdentity(initResult)
-	resolve, resolveErr := resolverFor(s)
-	absPath := filepath.Join(wsRoot, filepath.FromSlash(sym.Path))
-	content, _ := os.ReadFile(absPath) // best-effort; declarationPosition falls back to sym.Range.Start if this fails or the name can't be found
-	pos := lsp.TextDocumentPositionParams{
-		TextDocument: lsp.TextDocumentIdentifier{URI: fileURI(absPath)},
-		Position:     declarationPosition(content, sym),
-	}
-
-	ctx := context.Background()
-	var relations []codeindex.Relation
-	switch *relation {
-	case "definition":
-		locs, err := client.Definition(ctx, lsp.DefinitionParams(pos))
-		if err != nil {
-			return fail(err)
-		}
-		relations = codeindex.DefinitionRelations(sym.Key, locsFromLSP(wsRoot, locs), serverName, resolve)
-
-	case "references", "tests":
-		locs, err := client.References(ctx, lsp.ReferenceParams{
-			TextDocumentPositionParams: pos,
-			Context:                    lsp.ReferenceContext{IncludeDeclaration: false},
-		})
-		if err != nil {
-			return fail(err)
-		}
-		relations = codeindex.ReferenceRelations(sym.Key, locsFromLSP(wsRoot, locs), serverName, resolve)
-
-	case "callers", "callees":
-		items, err := client.PrepareCallHierarchy(ctx, lsp.CallHierarchyPrepareParams(pos))
-		if err != nil {
-			return fail(err)
-		}
-		if len(items) > 0 {
-			// prepareCallHierarchy can return multiple candidate items when a
-			// position is ambiguous; deliberately taking just the first
-			// (items[0]) rather than querying every candidate keeps this to
-			// one call each of Incoming/OutgoingCalls. In practice this
-			// position always names exactly one indexed symbol's own
-			// declaration (see declarationPosition), so ambiguity isn't
-			// expected to bite -- revisit if a language server ever returns
-			// more than one candidate here for a real symbol.
-			//
-			// 1 hop only: query the prepared item's calls exactly once, no
-			// further traversal from the results.
-			item := items[0]
-			if *relation == "callers" {
-				calls, err := client.IncomingCalls(ctx, lsp.CallHierarchyIncomingCallsParams{Item: item})
-				if err != nil {
-					return fail(err)
-				}
-				froms := make([]lsp.CallHierarchyItem, len(calls))
-				for i, c := range calls {
-					froms[i] = c.From
-				}
-				relations = codeindex.CallerRelations(sym.Key, locsFromCallHierarchyItems(wsRoot, froms), serverName, resolve)
-			} else {
-				calls, err := client.OutgoingCalls(ctx, lsp.CallHierarchyOutgoingCallsParams{Item: item})
-				if err != nil {
-					return fail(err)
-				}
-				tos := make([]lsp.CallHierarchyItem, len(calls))
-				for i, c := range calls {
-					tos[i] = c.To
-				}
-				relations = codeindex.CalleeRelations(sym.Key, locsFromCallHierarchyItems(wsRoot, tos), serverName, resolve)
-			}
-		}
-	}
-
-	if *resolveErr != nil {
-		return fail(*resolveErr)
-	}
-
-	// Scoped "expand:<relation>:<key>", never "index:...", so it's excluded
-	// from LatestIndexRun -- see that method's doc comment and the sibling
-	// "index:" scope cmdCodeIndex records.
-	runID, err := s.RecordIndexRun(fmt.Sprintf("expand:%s:%s", *relation, sym.Key), gitRevision(wsRoot), sym.Language, serverName, serverVersion, codeModelID, time.Now())
-	if err != nil {
-		return fail(err)
-	}
-	// Only resolved, deduped relations are persisted -- an unresolved
-	// location (ToKey=="") has no symbol_edges columns to hold it, and an
-	// LSP query naturally returns one location per reference/call site, so a
-	// symbol referenced or called twice from the same enclosing symbol would
-	// otherwise collide on symbol_edges' UNIQUE(from_key, to_key, kind,
-	// source) constraint. See codeindex.DedupResolvedRelations.
-	toPersist := codeindex.DedupResolvedRelations(relations)
-	if err := s.ReplaceRelations(runID, sym.Key, codeExpandReplaceGroup[*relation], toPersist); err != nil {
-		return fail(err)
-	}
-
-	// The requested relation only, even though references/tests share one
-	// underlying LSP call and ReplaceRelations just saved both kinds.
-	wantKind := *relation
-	filtered := relations[:0:0]
-	for _, r := range relations {
-		if r.Kind == wantKind {
-			filtered = append(filtered, r)
-		}
-	}
-
-	if len(filtered) == 0 {
+	if len(targets) == 0 {
 		fmt.Fprintln(os.Stderr, "no results")
 		return 2
-	}
-
-	targets, err := expandTargets(s, filtered)
-	if err != nil {
-		return fail(err)
 	}
 	if err := formatCodeExpandTargets(os.Stdout, targets, *asJSON); err != nil {
 		return fail(err)

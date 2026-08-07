@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -146,6 +147,7 @@ func TestCmdCodeIndexUnregisteredServer(t *testing.T) {
 	// No .ragrep/config.json at all -- config.Load falls back to defaults,
 	// meaning no servers are registered for any language.
 	db := filepath.Join(root, ".ragrep", "code.db")
+	injectCodeServiceDaemon(t, root, db)
 
 	r, w, _ := os.Pipe()
 	old := os.Stderr
@@ -179,6 +181,7 @@ func TestCmdCodeIndexZeroFilesSkipsServerAndModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	db := filepath.Join(root, ".ragrep", "code.db")
+	injectCodeServiceDaemon(t, root, db)
 
 	r, w, _ := os.Pipe()
 	old := os.Stdout
@@ -496,6 +499,8 @@ func TestCmdCodeGetUsageErrors(t *testing.T) {
 type fakeCodeDaemonClient struct {
 	search func(context.Context, searchRequest) (searchResponse, error)
 	get    func(context.Context, getRequest) (codeindex.Symbol, error)
+	index  func(context.Context, indexRequest) (indexResult, error)
+	expand func(context.Context, expandRequest) ([]codeExpandTarget, error)
 }
 
 func (f fakeCodeDaemonClient) Search(ctx context.Context, req searchRequest) (searchResponse, error) {
@@ -504,6 +509,14 @@ func (f fakeCodeDaemonClient) Search(ctx context.Context, req searchRequest) (se
 
 func (f fakeCodeDaemonClient) Get(ctx context.Context, req getRequest) (codeindex.Symbol, error) {
 	return f.get(ctx, req)
+}
+
+func (f fakeCodeDaemonClient) Index(ctx context.Context, req indexRequest) (indexResult, error) {
+	return f.index(ctx, req)
+}
+
+func (f fakeCodeDaemonClient) Expand(ctx context.Context, req expandRequest) ([]codeExpandTarget, error) {
+	return f.expand(ctx, req)
 }
 
 func injectCodeDaemonClient(t *testing.T, client codeDaemonClient) *int {
@@ -516,6 +529,34 @@ func injectCodeDaemonClient(t *testing.T, client codeDaemonClient) *int {
 	}
 	t.Cleanup(func() { codeDaemonClientFactory = old })
 	return &calls
+}
+
+func injectCodeServiceDaemon(t *testing.T, root, db string) *codeService {
+	t.Helper()
+	store, err := openCodeStoreAt(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := newWorkspaceState(root, store, []string{"."}, "go")
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	svc := newCodeService(func(got string) (*workspaceState, error) {
+		if got != filepath.Clean(root) {
+			return nil, fmt.Errorf("unknown workspace %q", got)
+		}
+		return state, nil
+	}, newEmbeddingPool(func() (textEmbedder, error) { return new(serviceTestEmbedder), nil }), nil)
+	server := httptest.NewServer(newDaemonHandler(svc, "test-token"))
+	injectCodeDaemonClient(t, daemonClient{endpoint: server.URL, token: "test-token", client: server.Client()})
+	t.Cleanup(func() {
+		server.Close()
+		_ = svc.Close()
+		_ = state.Close()
+		_ = store.Close()
+	})
+	return svc
 }
 
 func captureCodeCommand(t *testing.T, args []string) (int, string, string) {
@@ -717,6 +758,52 @@ func TestCmdCodeGetDaemonNotFoundAndOperationalError(t *testing.T) {
 	}
 }
 
+func TestCmdCodeIndexDaemonFormatsStructuredResult(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	client := fakeCodeDaemonClient{index: func(_ context.Context, req indexRequest) (indexResult, error) {
+		if req.Root != filepath.Clean(root) || req.Language != "go" || !reflect.DeepEqual(req.Roots, []string{"."}) {
+			t.Fatalf("request=%+v", req)
+		}
+		return indexResult{Indexed: []string{"a.go"}, Scanned: 2, Pruned: []string{"old.go"}}, nil
+	}}
+	calls := injectCodeDaemonClient(t, client)
+
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "index", "--db", db, "--language", "go", root})
+	want := "indexed a.go\npruned old.go\ndone: 1 indexed (2 files scanned, 1 pruned)\n"
+	if code != 0 || stdout != want || stderr != "" || *calls != 1 {
+		t.Fatalf("exit=%d factory calls=%d stdout=%q stderr=%q", code, *calls, stdout, stderr)
+	}
+	if _, err := os.Stat(db); !os.IsNotExist(err) {
+		t.Fatalf("CLI must not create code.db, stat err=%v", err)
+	}
+}
+
+func TestCmdCodeExpandDaemonKeepsFormattingLocal(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	targets := []codeExpandTarget{
+		{Relation: "references", Resolved: true, Key: "caller", Kind: "function", QualifiedName: "Caller", Signature: "func Caller()", Path: "main.go", StartLine: 4, EndLine: 7},
+		{Relation: "references", Path: "missing.go", Line: 2},
+	}
+	client := fakeCodeDaemonClient{expand: func(_ context.Context, req expandRequest) ([]codeExpandTarget, error) {
+		if req.Root != filepath.Clean(root) || req.Key != "target" || req.Relation != "references" {
+			t.Fatalf("request=%+v", req)
+		}
+		return targets, nil
+	}}
+	calls := injectCodeDaemonClient(t, client)
+
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "expand", "--db", db, "--symbol", "target", "--relation", "references"})
+	want := "references\tcaller\tfunction\tCaller\tfunc Caller()\tmain.go:4-7\nreferences\tunresolved\tmissing.go:2\n"
+	if code != 0 || stdout != want || stderr != "" || *calls != 1 {
+		t.Fatalf("exit=%d factory calls=%d stdout=%q stderr=%q", code, *calls, stdout, stderr)
+	}
+	if _, err := os.Stat(db); !os.IsNotExist(err) {
+		t.Fatalf("CLI must not create code.db, stat err=%v", err)
+	}
+}
+
 // --- document `index` command's default code-extension exclusion ---
 
 func TestCmdIndexExcludesCodeExtensionsByDefault(t *testing.T) {
@@ -787,6 +874,8 @@ func TestCmdCodeExpandNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Close()
+	root := filepath.Dir(db)
+	injectCodeServiceDaemon(t, root, db)
 
 	r, w, _ := os.Pipe()
 	old := os.Stderr
@@ -852,6 +941,7 @@ func TestCmdCodeExpandUnregisteredServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	db, key := expandTestSymbol(t, root)
+	injectCodeServiceDaemon(t, root, db)
 	// No .ragrep/config.json -- config.Load falls back to defaults, so no
 	// server is registered for "go".
 
@@ -969,6 +1059,7 @@ func TestCmdCodeExpandCapabilityGate(t *testing.T) {
 	db, key := expandTestSymbol(t, root)
 	exePath := buildFakeLSPServer(t, root)
 	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(exePath)+`"}}`)
+	injectCodeServiceDaemon(t, root, db)
 
 	r, w, _ := os.Pipe()
 	old := os.Stderr
@@ -999,6 +1090,7 @@ func TestCmdCodeExpandNoResults(t *testing.T) {
 	db, key := expandTestSymbol(t, root)
 	exePath := buildFakeLSPServerFromSrc(t, root, "fakelsp-allcaps-empty", fakeLSPServerAllCapsEmptySrc)
 	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(exePath)+`"}}`)
+	injectCodeServiceDaemon(t, root, db)
 
 	r, w, _ := os.Pipe()
 	old := os.Stderr
@@ -1148,6 +1240,7 @@ func TestCmdCodeExpandDedupsRelationsAndSkipsUnresolved(t *testing.T) {
 	src := strings.ReplaceAll(fakeLSPServerReferencesSrcTemplate, "LOCATIONS_JSON_PLACEHOLDER", locationsJSON)
 	exePath := buildFakeLSPServerFromSrc(t, root, "fakelsp-dup-refs", src)
 	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(exePath)+`"}}`)
+	injectCodeServiceDaemon(t, root, db)
 
 	r, w, _ := os.Pipe()
 	old := os.Stdout
@@ -1277,6 +1370,7 @@ func TestCmdCodeIndexPrunesDeletedFiles(t *testing.T) {
 	exePath := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-docsym", fakeLSPServerDocumentSymbolSrc)
 	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(exePath)+`"}}`)
 	db := filepath.Join(root, ".ragrep", "code.db")
+	injectCodeServiceDaemon(t, root, db)
 
 	runIndex := func() (code int, out string) {
 		r, w, _ := os.Pipe()
@@ -1355,6 +1449,7 @@ func TestLatestIndexRunSurvivesSubsequentExpand(t *testing.T) {
 	docSymExe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-docsym-scope", fakeLSPServerDocumentSymbolSrc)
 	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(docSymExe)+`"}}`)
 	db := filepath.Join(root, ".ragrep", "code.db")
+	svc := injectCodeServiceDaemon(t, root, db)
 
 	if code := run([]string{"code", "index", "--db", db, "--language", "go", root}); code != 0 {
 		t.Fatalf("code index: exit=%d", code)
@@ -1387,6 +1482,8 @@ func TestLatestIndexRunSurvivesSubsequentExpand(t *testing.T) {
 	// disturb LatestIndexRun).
 	emptyExe := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-allcaps-empty-scope", fakeLSPServerAllCapsEmptySrc)
 	writeRagrepConfig(t, root, `{"servers": {"go": "`+filepath.ToSlash(emptyExe)+`"}}`)
+	_ = svc.lsps.Close()
+	svc.lsps = newLSPPool(time.Hour, nil)
 	run([]string{"code", "expand", "--db", db, "--symbol", key, "--relation", "references"}) // exit code irrelevant here
 
 	s2, err := codestore.Open(db, codeModelID, codeEmbedDim)

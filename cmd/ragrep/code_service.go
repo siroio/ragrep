@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/siroio/ragrep/internal/codeindex"
 	"github.com/siroio/ragrep/internal/codestore"
+	"github.com/siroio/ragrep/internal/config"
 	"github.com/siroio/ragrep/internal/lsp"
 )
 
@@ -33,6 +35,27 @@ type searchResponse struct {
 type getRequest struct {
 	Root, Key string
 	Body      bool
+}
+
+type indexRequest struct {
+	Root, Language string
+	Roots          []string
+}
+
+type indexResult struct {
+	Indexed []string `json:"indexed"`
+	Scanned int      `json:"scanned"`
+	Pruned  []string `json:"pruned"`
+}
+
+type expandRequest struct {
+	Root, Key, Relation string
+}
+
+type codeExpandUnsupportedError struct{ Server string }
+
+func (e *codeExpandUnsupportedError) Error() string {
+	return "not supported by server " + e.Server
 }
 
 type workspaceResolver func(root string) (*workspaceState, error)
@@ -158,6 +181,191 @@ func (s *codeService) Get(_ context.Context, req getRequest) (codeindex.Symbol, 
 		sym.Body = ""
 	}
 	return sym, nil
+}
+
+func (s *codeService) Index(ctx context.Context, req indexRequest) (indexResult, error) {
+	ws, err := s.workspace(req.Root)
+	if err != nil {
+		return indexResult{}, err
+	}
+	ext, ok := codeLangExt[req.Language]
+	if !ok {
+		return indexResult{}, fmt.Errorf("unsupported language %q", req.Language)
+	}
+	cfg, err := config.Load(ws.root)
+	if err != nil {
+		return indexResult{}, err
+	}
+	serverCmd, err := cfg.ServerCommand(req.Language)
+	if err != nil {
+		return indexResult{}, err
+	}
+
+	var files []string
+	for _, root := range req.Roots {
+		found, err := discoverCodeFiles(filepath.Join(ws.root, filepath.FromSlash(root)), ext)
+		if err != nil {
+			return indexResult{}, err
+		}
+		files = append(files, found...)
+	}
+	result := indexResult{Scanned: len(files)}
+	if len(files) == 0 {
+		result.Pruned, err = pruneCodeSymbolPaths(ws.store, req.Roots, nil)
+		return result, err
+	}
+
+	client, serverName, serverVersion, release, err := s.lsps.AcquireWithMetadata(ctx, ws.root, req.Language)
+	if err != nil {
+		return indexResult{}, err
+	}
+	defer release()
+	if !client.Supports(lsp.FeatureDocumentSymbol) {
+		return indexResult{}, fmt.Errorf("language server %q does not support textDocument/documentSymbol (required relation: document symbols for indexing)", serverCmd)
+	}
+	runID, err := ws.store.RecordIndexRun("index:"+strings.Join(req.Roots, ","), gitRevision(ws.root), req.Language, serverName, serverVersion, codeModelID, time.Now())
+	if err != nil {
+		return indexResult{}, err
+	}
+
+	seen := make(map[string]bool, len(files))
+	for _, path := range files {
+		rel, err := normPath(path, ws.root)
+		if err != nil {
+			return indexResult{}, err
+		}
+		seen[rel] = true
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return indexResult{}, err
+		}
+		docSyms, err := client.DocumentSymbol(ctx, lsp.DocumentSymbolParams{
+			TextDocument: lsp.TextDocumentIdentifier{URI: fileURI(path)},
+		})
+		if err != nil {
+			return indexResult{}, fmt.Errorf("%s: %w", rel, err)
+		}
+		symbols, err := codeindex.Extract(req.Language, rel, content, docSyms)
+		if err != nil {
+			return indexResult{}, err
+		}
+		changed, err := ws.store.UpsertSymbols(rel, codeindex.FileHash(content), symbols, runID, func(text string) ([]float32, error) {
+			return s.embeddings.Embed(ctx, text)
+		})
+		if err != nil {
+			return indexResult{}, fmt.Errorf("%s: %w", rel, err)
+		}
+		if changed {
+			result.Indexed = append(result.Indexed, rel)
+		}
+	}
+	result.Pruned, err = pruneCodeSymbolPaths(ws.store, req.Roots, seen)
+	return result, err
+}
+
+func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpandTarget, error) {
+	feature, ok := codeExpandFeature[req.Relation]
+	if !ok {
+		return nil, fmt.Errorf("unsupported relation %q", req.Relation)
+	}
+	ws, err := s.workspace(req.Root)
+	if err != nil {
+		return nil, err
+	}
+	sym, err := ws.store.GetSymbol(req.Key)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.Load(ws.root)
+	if err != nil {
+		return nil, err
+	}
+	serverCmd, err := cfg.ServerCommand(sym.Language)
+	if err != nil {
+		return nil, err
+	}
+	client, serverName, serverVersion, release, err := s.lsps.AcquireWithMetadata(ctx, ws.root, sym.Language)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if !client.Supports(feature) {
+		return nil, &codeExpandUnsupportedError{Server: serverCmd}
+	}
+
+	resolve, resolveErr := resolverFor(ws.store)
+	absPath := filepath.Join(ws.root, filepath.FromSlash(sym.Path))
+	content, _ := os.ReadFile(absPath)
+	pos := lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: fileURI(absPath)},
+		Position:     declarationPosition(content, sym),
+	}
+
+	var relations []codeindex.Relation
+	switch req.Relation {
+	case "definition":
+		locs, err := client.Definition(ctx, lsp.DefinitionParams(pos))
+		if err != nil {
+			return nil, err
+		}
+		relations = codeindex.DefinitionRelations(sym.Key, locsFromLSP(ws.root, locs), serverName, resolve)
+	case "references", "tests":
+		locs, err := client.References(ctx, lsp.ReferenceParams{
+			TextDocumentPositionParams: pos,
+			Context:                    lsp.ReferenceContext{IncludeDeclaration: false},
+		})
+		if err != nil {
+			return nil, err
+		}
+		relations = codeindex.ReferenceRelations(sym.Key, locsFromLSP(ws.root, locs), serverName, resolve)
+	case "callers", "callees":
+		items, err := client.PrepareCallHierarchy(ctx, lsp.CallHierarchyPrepareParams(pos))
+		if err != nil {
+			return nil, err
+		}
+		if len(items) != 0 {
+			item := items[0]
+			if req.Relation == "callers" {
+				calls, err := client.IncomingCalls(ctx, lsp.CallHierarchyIncomingCallsParams{Item: item})
+				if err != nil {
+					return nil, err
+				}
+				froms := make([]lsp.CallHierarchyItem, len(calls))
+				for i, call := range calls {
+					froms[i] = call.From
+				}
+				relations = codeindex.CallerRelations(sym.Key, locsFromCallHierarchyItems(ws.root, froms), serverName, resolve)
+			} else {
+				calls, err := client.OutgoingCalls(ctx, lsp.CallHierarchyOutgoingCallsParams{Item: item})
+				if err != nil {
+					return nil, err
+				}
+				tos := make([]lsp.CallHierarchyItem, len(calls))
+				for i, call := range calls {
+					tos[i] = call.To
+				}
+				relations = codeindex.CalleeRelations(sym.Key, locsFromCallHierarchyItems(ws.root, tos), serverName, resolve)
+			}
+		}
+	}
+	if *resolveErr != nil {
+		return nil, *resolveErr
+	}
+
+	runID, err := ws.store.RecordIndexRun(fmt.Sprintf("expand:%s:%s", req.Relation, sym.Key), gitRevision(ws.root), sym.Language, serverName, serverVersion, codeModelID, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if err := ws.store.ReplaceRelations(runID, sym.Key, codeExpandReplaceGroup[req.Relation], codeindex.DedupResolvedRelations(relations)); err != nil {
+		return nil, err
+	}
+	filtered := relations[:0:0]
+	for _, relation := range relations {
+		if relation.Kind == req.Relation {
+			filtered = append(filtered, relation)
+		}
+	}
+	return expandTargets(ws.store, filtered)
 }
 
 func (s *codeService) ConfirmPath(ctx context.Context, root, path, expectedHash string) error {
