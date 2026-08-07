@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -120,6 +121,7 @@ type workspaceRegistryEntry struct {
 	timer    *time.Timer
 	epoch    uint64
 	leases   int
+	removing bool
 }
 
 type workspaceRegistry struct {
@@ -129,6 +131,7 @@ type workspaceRegistry struct {
 	open    workspaceOpener
 	entries map[string]*workspaceRegistryEntry
 	closed  bool
+	restore sync.WaitGroup
 }
 
 type workspaceRegistryFile struct {
@@ -214,6 +217,7 @@ func (r *workspaceRegistry) Add(path string) (string, error) {
 		r.entries[root] = entry
 	}
 	oldState := entry.state
+	oldRemoving := entry.removing
 	if entry.state == nil {
 		state, err := r.open(root)
 		if err != nil {
@@ -236,8 +240,10 @@ func (r *workspaceRegistry) Add(path string) (string, error) {
 		entry.timer = nil
 	}
 	entry.explicit = true
+	entry.removing = false
 	if err := r.persistLocked(); err != nil {
 		entry.explicit = false
+		entry.removing = oldRemoving
 		var closeEntry *workspaceRegistryEntry
 		if !existed {
 			delete(r.entries, root)
@@ -274,14 +280,27 @@ func (r *workspaceRegistry) Remove(path string) (bool, error) {
 		r.mu.Unlock()
 		return false, nil
 	}
-	delete(r.entries, root)
+	entry.explicit = false
+	entry.removing = true
+	entry.epoch++
+	if entry.timer != nil {
+		entry.timer.Stop()
+		entry.timer = nil
+	}
 	if err := r.persistLocked(); err != nil {
-		r.entries[root] = entry
+		entry.explicit = true
+		entry.removing = false
 		r.mu.Unlock()
 		return false, err
 	}
+	closeNow := entry.leases == 0
+	if closeNow {
+		delete(r.entries, root)
+	}
 	r.mu.Unlock()
-	closeWorkspaceEntry(entry)
+	if closeNow {
+		closeWorkspaceEntry(entry)
+	}
 	return true, nil
 }
 
@@ -289,6 +308,39 @@ func (r *workspaceRegistry) List() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.explicitRootsLocked()
+}
+
+func (r *workspaceRegistry) RestoreExplicitAsync() {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	roots := r.explicitRootsLocked()
+	r.restore.Add(len(roots))
+	r.mu.Unlock()
+	for _, root := range roots {
+		go func() {
+			defer r.restore.Done()
+			r.restoreExplicit(root)
+		}()
+	}
+}
+
+func (r *workspaceRegistry) restoreExplicit(root string) {
+	state, err := r.open(root)
+	if err != nil {
+		return
+	}
+	r.mu.Lock()
+	entry := r.entries[root]
+	if r.closed || entry == nil || !entry.explicit || entry.state != nil {
+		r.mu.Unlock()
+		_ = closeWorkspaceEntry(&workspaceRegistryEntry{state: state})
+		return
+	}
+	entry.state = state
+	r.mu.Unlock()
 }
 
 func (r *workspaceRegistry) Resolve(path string) (*workspaceState, error) {
@@ -308,6 +360,12 @@ func (r *workspaceRegistry) Resolve(path string) (*workspaceState, error) {
 	if entry == nil {
 		entry = &workspaceRegistryEntry{}
 		r.entries[root] = entry
+	}
+	if entry.removing {
+		if entry.leases > 0 && entry.state != nil {
+			return entry.state, nil
+		}
+		return nil, ErrWorkspaceNotFound
 	}
 	if entry.state == nil {
 		state, err := r.open(root)
@@ -341,6 +399,10 @@ func (r *workspaceRegistry) Acquire(path string) (func(), error) {
 		entry = &workspaceRegistryEntry{}
 		r.entries[root] = entry
 	}
+	if entry.removing {
+		r.mu.Unlock()
+		return nil, ErrWorkspaceNotFound
+	}
 	if entry.state == nil {
 		state, err := r.open(root)
 		if err != nil {
@@ -362,18 +424,25 @@ func (r *workspaceRegistry) Acquire(path string) (func(), error) {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			var closeEntry *workspaceRegistryEntry
 			r.mu.Lock()
 			if r.entries[root] == entry && entry.leases > 0 {
 				entry.leases--
-				r.scheduleEvictionLocked(root, entry)
+				if entry.leases == 0 && entry.removing {
+					delete(r.entries, root)
+					closeEntry = entry
+				} else {
+					r.scheduleEvictionLocked(root, entry)
+				}
 			}
 			r.mu.Unlock()
+			_ = closeWorkspaceEntry(closeEntry)
 		})
 	}, nil
 }
 
 func (r *workspaceRegistry) scheduleEvictionLocked(root string, entry *workspaceRegistryEntry) {
-	if entry.explicit || entry.leases > 0 {
+	if entry.explicit || entry.leases > 0 || entry.removing {
 		return
 	}
 	if entry.timer != nil {
@@ -386,7 +455,7 @@ func (r *workspaceRegistry) scheduleEvictionLocked(root string, entry *workspace
 
 func (r *workspaceRegistry) evict(root string, entry *workspaceRegistryEntry, epoch uint64) {
 	r.mu.Lock()
-	if r.entries[root] != entry || entry.explicit || entry.leases > 0 || entry.epoch != epoch || r.closed {
+	if r.entries[root] != entry || entry.explicit || entry.leases > 0 || entry.removing || entry.epoch != epoch || r.closed {
 		r.mu.Unlock()
 		return
 	}
@@ -443,6 +512,7 @@ func (r *workspaceRegistry) Close() error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
+		r.restore.Wait()
 		return nil
 	}
 	r.closed = true
@@ -456,6 +526,7 @@ func (r *workspaceRegistry) Close() error {
 		}
 		errs = append(errs, closeWorkspaceEntry(entry))
 	}
+	r.restore.Wait()
 	return errors.Join(errs...)
 }
 
@@ -646,18 +717,19 @@ func serveDaemon() error {
 	if err != nil {
 		return fmt.Errorf("daemon already running or address unavailable: %w", err)
 	}
-	defer listener.Close()
 	registryPath, err := workspaceRegistryPath()
 	if err != nil {
+		listener.Close()
 		return err
 	}
 	registry, err := newWorkspaceRegistry(registryPath, workspaceIdleTimeout, nil)
 	if err != nil {
+		listener.Close()
 		return err
 	}
-	defer registry.Close()
 	service := newCodeService(registry.Resolve, nil, nil)
-	defer service.Close()
+	cleanupPath := ""
+	defer func() { cleanupDaemon(cleanupPath, listener, service, registry) }()
 	token, err := newDaemonToken()
 	if err != nil {
 		return err
@@ -666,7 +738,8 @@ func serveDaemon() error {
 	if err := writeDaemonDiscovery(discoveryPath, discovery); err != nil {
 		return err
 	}
-	defer os.Remove(discoveryPath)
+	cleanupPath = discoveryPath
+	registry.RestoreExplicitAsync()
 	stop := make(chan struct{}, 1)
 	server := newDaemonHTTPServer(newDaemonServerHandler(service, token, registry, func() {
 		select {
@@ -683,6 +756,15 @@ func serveDaemon() error {
 		return nil
 	}
 	return err
+}
+
+func cleanupDaemon(discoveryPath string, resources ...io.Closer) {
+	for _, resource := range resources {
+		_ = resource.Close()
+	}
+	if discoveryPath != "" {
+		_ = os.Remove(discoveryPath)
+	}
 }
 
 func newDaemonHTTPServer(handler http.Handler) *http.Server {
@@ -724,7 +806,7 @@ func cmdWorkspace(args []string) int {
 		return 0
 	case "remove":
 		if len(args) != 2 {
-			return fail(errors.New("usage: ragrep workspace remove [path]"))
+			return fail(errors.New("usage: ragrep workspace remove <path>"))
 		}
 		if err := client.WorkspaceRemove(ctx, args[1]); err != nil {
 			var apiErr *apiError

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +27,10 @@ type fakeDaemonCodeService struct {
 	search func(context.Context, searchRequest) (searchResponse, error)
 	get    func(context.Context, getRequest) (codeindex.Symbol, error)
 }
+
+type closeFunc func() error
+
+func (f closeFunc) Close() error { return f() }
 
 func (s fakeDaemonCodeService) Search(ctx context.Context, req searchRequest) (searchResponse, error) {
 	return s.search(ctx, req)
@@ -437,6 +442,73 @@ func TestDaemonRequestLeasesAutomaticWorkspace(t *testing.T) {
 	}
 }
 
+func TestWorkspaceRegistryRemoveWaitsForActiveRequestRelease(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	opened := map[string]*workspaceState{}
+	r, err := newWorkspaceRegistry(file, time.Minute, testWorkspaceOpener(opened))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := r.Add(root); err != nil {
+		t.Fatal(err)
+	}
+	state := opened[root]
+	entered := make(chan struct{})
+	finish := make(chan struct{})
+	h := newDaemonServerHandler(fakeDaemonCodeService{
+		search: func(_ context.Context, req searchRequest) (searchResponse, error) {
+			close(entered)
+			<-finish
+			if _, err := r.Resolve(req.Root); err != nil {
+				return searchResponse{}, err
+			}
+			return searchResponse{Fresh: true}, nil
+		},
+	}, "secret", r, nil)
+	requestDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/code/search", strings.NewReader(fmt.Sprintf(`{"root":%q,"query":"Handler"}`, root)))
+		req.Header.Set("Authorization", "Bearer secret")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		requestDone <- rr
+	}()
+	<-entered
+	removed, err := r.Remove(root)
+	if err != nil || !removed {
+		t.Fatalf("removed=%v err=%v", removed, err)
+	}
+	if roots := r.List(); len(roots) != 0 {
+		t.Fatalf("persistent roots=%v", roots)
+	}
+	state.mu.Lock()
+	closed := state.closed
+	state.mu.Unlock()
+	if closed {
+		t.Fatal("Remove closed workspace while request lease was active")
+	}
+	close(finish)
+	rr := <-requestDone
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		state.mu.Lock()
+		closed = state.closed
+		state.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("last Release did not close removed workspace")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestWorkspaceRegistryRestoresRootsLazilyAndRemovesMissing(t *testing.T) {
 	root := testWorkspaceRoot(t)
 	missing := filepath.Join(t.TempDir(), "gone")
@@ -466,6 +538,99 @@ func TestWorkspaceRegistryRestoresRootsLazilyAndRemovesMissing(t *testing.T) {
 	}
 	if _, err := r.Resolve(root); err != nil || opens.Load() != 1 {
 		t.Fatalf("resolve err=%v opens=%d", err, opens.Load())
+	}
+}
+
+func TestWorkspaceRegistryRestoresExplicitRootsAsynchronouslyPerRoot(t *testing.T) {
+	blockedRoot := testWorkspaceRoot(t)
+	workingRoot := testWorkspaceRoot(t)
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	data, err := json.Marshal(workspaceRegistryFile{Roots: []string{blockedRoot, workingRoot}})
+	if err != nil || os.WriteFile(file, data, 0o600) != nil {
+		t.Fatal(err)
+	}
+	unblock := make(chan struct{})
+	workingOpened := make(chan struct{})
+	var openedOnce sync.Once
+	r, err := newWorkspaceRegistry(file, time.Minute, func(root string) (*workspaceState, error) {
+		if root == blockedRoot {
+			<-unblock
+			return nil, errors.New("broken workspace")
+		}
+		openedOnce.Do(func() { close(workingOpened) })
+		return &workspaceState{root: root, shutdownDone: make(chan struct{})}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	returned := make(chan struct{})
+	go func() {
+		r.RestoreExplicitAsync()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("restore blocked daemon readiness")
+	}
+	select {
+	case <-workingOpened:
+	case <-time.After(time.Second):
+		t.Fatal("one blocked root prevented another root from restoring")
+	}
+	close(unblock)
+	deadline := time.Now().Add(time.Second)
+	for {
+		r.mu.Lock()
+		blocked := r.entries[blockedRoot]
+		working := r.entries[workingRoot]
+		isolated := blocked != nil && blocked.state == nil && working != nil && working.state != nil
+		r.mu.Unlock()
+		if isolated {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed root was not isolated from successful restore")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestWorkspaceRegistryCloseWaitsForAsyncRestore(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	data, err := json.Marshal(workspaceRegistryFile{Roots: []string{root}})
+	if err != nil || os.WriteFile(file, data, 0o600) != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	r, err := newWorkspaceRegistry(file, time.Minute, func(string) (*workspaceState, error) {
+		close(entered)
+		<-unblock
+		return nil, errors.New("restore failed")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.RestoreExplicitAsync()
+	<-entered
+	closed := make(chan struct{})
+	go func() {
+		_ = r.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("registry Close returned while restore was still active")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(unblock)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("registry Close did not finish after restore completed")
 	}
 }
 
@@ -601,5 +766,29 @@ func TestDaemonServerForcesCloseAfterShutdownDeadline(t *testing.T) {
 	case <-requestDone:
 	case <-time.After(time.Second):
 		t.Fatal("forced Close did not release client")
+	}
+}
+
+func TestCleanupDaemonRemovesDiscoveryAfterResourcesClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	closer := func(name string) closeFunc {
+		return func() error {
+			if _, err := os.Stat(path); err != nil {
+				t.Errorf("discovery missing during %s cleanup: %v", name, err)
+			}
+			order = append(order, name)
+			return nil
+		}
+	}
+	cleanupDaemon(path, closer("listener"), closer("service"), closer("registry"))
+	if got := strings.Join(order, ","); got != "listener,service,registry" {
+		t.Fatalf("cleanup order=%s", got)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery remains after cleanup: %v", err)
 	}
 }

@@ -115,6 +115,33 @@ func TestRunWorkspaceAddDefaultsToCurrentDirectory(t *testing.T) {
 	}
 }
 
+func TestRunWorkspaceRemoveUsageRequiresPath(t *testing.T) {
+	cache := t.TempDir()
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+	path, err := daemonDiscoveryPath()
+	if err != nil || writeDaemonDiscovery(path, daemonDiscovery{Endpoint: ts.URL, Token: "secret", PID: os.Getpid()}) != nil {
+		t.Fatal(err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = w
+	code := run([]string{"workspace", "remove"})
+	w.Close()
+	os.Stderr = oldStderr
+	var stderr bytes.Buffer
+	_, _ = io.Copy(&stderr, r)
+	r.Close()
+	if code != 1 || !strings.Contains(stderr.String(), "workspace remove <path>") {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
 // getContent's --lines branch: happy path, invalid ranges, out-of-range
 // start, clamping past EOF, and CRLF normalization. No model needed.
 func TestGetContentLines(t *testing.T) {
