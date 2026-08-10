@@ -102,18 +102,25 @@ func (s *documentService) acquire(ctx context.Context, db string) (*store.Store,
 			entry.err = openErr
 			entry.opening = false
 			close(entry.ready)
+			if openErr != nil && s.entries[key] == entry {
+				delete(s.entries, key)
+			}
 			s.mu.Unlock()
 		}
 
+		var waitErr error
 		select {
 		case <-ctx.Done():
-			return nil, nil, ctx.Err()
+			waitErr = ctx.Err()
 		case <-entry.ready:
 		}
 		if waiting {
 			s.mu.Lock()
 			entry.waiters--
 			s.mu.Unlock()
+		}
+		if waitErr != nil {
+			return nil, nil, waitErr
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err

@@ -85,6 +85,185 @@ func TestDocumentStorePoolOpensConcurrentFirstUseOnce(t *testing.T) {
 	}
 }
 
+func TestDocumentStorePoolRetriesAfterConcurrentOpenFailure(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "index.db")
+	seedDocumentDB(t, db, "notes/result.md", "search result")
+	const searches = 4
+	wantErr := errors.New("temporary open failure")
+	var opens atomic.Int32
+	openerStarted := make(chan struct{})
+	releaseOpener := make(chan struct{})
+	svc := newDocumentService(nil, func(path string) (*store.Store, error) {
+		if opens.Add(1) == 1 {
+			close(openerStarted)
+			<-releaseOpener
+			return nil, wantErr
+		}
+		return store.Open(path)
+	})
+	t.Cleanup(func() { _ = svc.Close() })
+	var releaseOnce sync.Once
+	releaseOpen := func() { releaseOnce.Do(func() { close(releaseOpener) }) }
+	t.Cleanup(releaseOpen)
+
+	errs := make(chan error, searches)
+	search := func() {
+		_, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+		errs <- err
+	}
+	go search()
+	<-openerStarted
+	for range searches - 1 {
+		go search()
+	}
+	waitForDocumentWaiters(t, svc, db, searches-1)
+	releaseOpen()
+	for range searches {
+		if err := <-errs; !errors.Is(err, wantErr) {
+			t.Fatalf("first search cohort error=%v, want %v", err, wantErr)
+		}
+	}
+
+	hits, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+	if err != nil || len(hits) != 1 || hits[0].Doc != "notes/result.md" {
+		t.Fatalf("retry hits=%+v err=%v", hits, err)
+	}
+	if got := opens.Load(); got != 2 {
+		t.Fatalf("open calls=%d, want 2", got)
+	}
+}
+
+type blockingDoneContext struct {
+	context.Context
+	called      chan struct{}
+	release     chan struct{}
+	calledOnce  sync.Once
+	releaseOnce sync.Once
+}
+
+func (c *blockingDoneContext) Done() <-chan struct{} {
+	c.calledOnce.Do(func() { close(c.called) })
+	<-c.release
+	return c.Context.Done()
+}
+
+func (c *blockingDoneContext) unblock() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
+
+func TestDocumentStorePoolRetriesAfterFailurePublication(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "index.db")
+	seedDocumentDB(t, db, "notes/result.md", "search result")
+	wantErr := errors.New("temporary open failure")
+	var opens atomic.Int32
+	openerStarted := make(chan struct{})
+	releaseOpener := make(chan struct{})
+	svc := newDocumentService(nil, func(path string) (*store.Store, error) {
+		if opens.Add(1) == 1 {
+			close(openerStarted)
+			<-releaseOpener
+			return nil, wantErr
+		}
+		return store.Open(path)
+	})
+	t.Cleanup(func() { _ = svc.Close() })
+	var releaseOnce sync.Once
+	releaseOpen := func() { releaseOnce.Do(func() { close(releaseOpener) }) }
+	t.Cleanup(releaseOpen)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+		firstDone <- err
+	}()
+	<-openerStarted
+	waiterCtx := &blockingDoneContext{Context: context.Background(), called: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(waiterCtx.unblock)
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := svc.SearchDocuments(waiterCtx, documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+		waiterDone <- err
+	}()
+	<-waiterCtx.called
+	waitForDocumentWaiters(t, svc, db, 1)
+	releaseOpen()
+	if err := <-firstDone; !errors.Is(err, wantErr) {
+		t.Fatalf("first opener error=%v, want %v", err, wantErr)
+	}
+
+	hits, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+	if err != nil || len(hits) != 1 || hits[0].Doc != "notes/result.md" {
+		t.Fatalf("post-publication retry hits=%+v err=%v", hits, err)
+	}
+	waiterCtx.unblock()
+	if err := <-waiterDone; !errors.Is(err, wantErr) {
+		t.Fatalf("original waiter error=%v, want %v", err, wantErr)
+	}
+	if got := opens.Load(); got != 2 {
+		t.Fatalf("open calls=%d, want 2", got)
+	}
+}
+
+func TestDocumentStorePoolCanceledOpenWaiterIsRemoved(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "index.db")
+	seedDocumentDB(t, db, "notes/result.md", "search result")
+	openerStarted := make(chan struct{})
+	releaseOpener := make(chan struct{})
+	svc := newDocumentService(nil, func(path string) (*store.Store, error) {
+		close(openerStarted)
+		<-releaseOpener
+		return store.Open(path)
+	})
+	t.Cleanup(func() { _ = svc.Close() })
+	var releaseOnce sync.Once
+	releaseOpen := func() { releaseOnce.Do(func() { close(releaseOpener) }) }
+	t.Cleanup(releaseOpen)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+		firstDone <- err
+	}()
+	<-openerStarted
+	ctx, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := svc.SearchDocuments(ctx, documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+		waiterDone <- err
+	}()
+	waitForDocumentWaiters(t, svc, db, 1)
+	cancel()
+	if err := <-waiterDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter error=%v, want context.Canceled", err)
+	}
+	waitForDocumentWaiters(t, svc, db, 0)
+	releaseOpen()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForDocumentWaiters(t *testing.T, svc *documentService, db string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		svc.mu.Lock()
+		_, entry := svc.findEntryLocked(db)
+		got := 0
+		if entry != nil {
+			got = entry.waiters
+		}
+		svc.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiters=%d, want %d", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestDocumentStorePoolKeepsDatabasesIsolated(t *testing.T) {
 	dir := t.TempDir()
 	first := filepath.Join(dir, "first.db")
