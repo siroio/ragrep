@@ -43,8 +43,12 @@ type inspectCodeRelationInput struct {
 }
 
 type inspectCodeRelationData struct {
-	Targets []codeExpandTarget `json:"targets"`
+	Targets   []codeExpandTarget `json:"targets"`
+	Total     int                `json:"total"`
+	Truncated bool               `json:"truncated"`
 }
+
+const maxMCPRelationTargets = 20
 
 type codeQueryBackend interface {
 	SearchCode(context.Context, mcpWorkspace, searchCodeInput) (searchCodeData, error)
@@ -143,8 +147,13 @@ func (tools codeContextTools) verifyCodeContext(ctx context.Context, input verif
 	if err := ctx.Err(); err != nil {
 		return mcpToolFailure[verifyCodeContextData](err)
 	}
-	if len(input.Manifest.Symbols) == 0 {
+	if len(input.Manifest.Symbols) == 0 || len(input.Manifest.Symbols) > 3 {
 		return mcpToolFailure[verifyCodeContextData](mcpInvalidArgument())
+	}
+	for _, ref := range input.Manifest.Symbols {
+		if !validCodeManifestPath(ref.Path) {
+			return mcpToolFailure[verifyCodeContextData](mcpInvalidArgument())
+		}
 	}
 	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
 	if err != nil {
@@ -223,10 +232,19 @@ func (tools codeQueryTools) inspectCodeRelation(ctx context.Context, input inspe
 	if err != nil {
 		return mcpToolFailure[inspectCodeRelationData](err)
 	}
-	if data.Targets == nil {
-		data.Targets = []codeExpandTarget{}
+	filtered := make([]codeExpandTarget, 0, len(data.Targets))
+	for _, target := range data.Targets {
+		if validCodeManifestPath(target.Path) {
+			filtered = append(filtered, target)
+		}
 	}
-	return mcpSuccess(fmt.Sprintf("%d relation targets", len(data.Targets)), data)
+	data.Total = len(filtered)
+	data.Truncated = data.Total > maxMCPRelationTargets
+	if data.Truncated {
+		filtered = filtered[:maxMCPRelationTargets]
+	}
+	data.Targets = filtered
+	return mcpSuccess(fmt.Sprintf("%d of %d relation targets", len(data.Targets), data.Total), data)
 }
 
 func validCodeRelation(relation string) bool {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -703,7 +704,14 @@ func utf16Len(s string) int {
 // still informative even though it won't match anything codestore.SymbolAt
 // can resolve. Mirrors fileURI's construction in reverse.
 func pathFromURI(uri, wsRoot string) string {
-	p := strings.TrimPrefix(uri, "file://")
+	parsed, err := url.Parse(uri)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "file") {
+		return uri
+	}
+	p := parsed.Path
+	if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
+		p = "//" + parsed.Host + p
+	}
 	if len(p) >= 3 && p[0] == '/' && p[2] == ':' {
 		p = p[1:] // strip the leading "/" fileURI adds before a Windows drive letter
 	}
@@ -1132,6 +1140,18 @@ func loadManifest(data []byte) (coderetrieval.Manifest, error) {
 		return coderetrieval.Manifest{}, err
 	}
 	return m, nil
+}
+
+func validCodeManifestPath(path string) bool {
+	if path == "" || strings.Contains(path, `\`) {
+		return false
+	}
+	native := filepath.FromSlash(path)
+	if !filepath.IsLocal(native) || filepath.IsAbs(native) || filepath.VolumeName(native) != "" {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(native))
+	return clean == path && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
 }
 
 func cmdCodeVerify(args []string) int {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -313,6 +314,44 @@ func TestInspectCodeRelationProductionBackendPropagatesExactRequest(t *testing.T
 	}
 }
 
+func TestInspectCodeRelationDiscardsUnsafeWorkspaceExternalPaths(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	outside := filepath.ToSlash(filepath.Join(t.TempDir(), "external.go"))
+	backend := fakeCodeQueryBackend{inspect: func(context.Context, mcpWorkspace, inspectCodeRelationInput) (inspectCodeRelationData, error) {
+		return inspectCodeRelationData{Targets: []codeExpandTarget{
+			{Relation: "references", Resolved: true, Key: "safe", Path: "pkg/safe.go"},
+			{Relation: "references", Resolved: false, Path: outside},
+			{Relation: "references", Resolved: false, Path: "../traversal.go"},
+			{Relation: "references", Resolved: false, Path: "pkg/../unclean.go"},
+		}}, nil
+	}}
+	_, out, err := (codeQueryTools{defaultRoot: root, backend: backend}).inspectCodeRelation(context.Background(), inspectCodeRelationInput{Key: "symbol", Relation: "references"})
+	if err != nil || out.Error != nil || out.Data == nil || len(out.Data.Targets) != 1 || out.Data.Targets[0].Path != "pkg/safe.go" {
+		t.Fatalf("filtered relation output=%+v error=%v", out, err)
+	}
+}
+
+func TestInspectCodeRelationBoundsTargetsAndReportsTruncation(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	targets := make([]codeExpandTarget, 25)
+	for i := range targets {
+		targets[i] = codeExpandTarget{Relation: "references", Resolved: i%2 == 0, Key: fmt.Sprintf("key-%d", i), Path: fmt.Sprintf("pkg/file-%02d.go", i), Line: i}
+	}
+	backend := fakeCodeQueryBackend{inspect: func(context.Context, mcpWorkspace, inspectCodeRelationInput) (inspectCodeRelationData, error) {
+		return inspectCodeRelationData{Targets: targets}, nil
+	}}
+	_, out, err := (codeQueryTools{defaultRoot: root, backend: backend}).inspectCodeRelation(context.Background(), inspectCodeRelationInput{Key: "symbol", Relation: "references"})
+	if err != nil || out.Error != nil || out.Data == nil {
+		t.Fatalf("relation output=%+v error=%v", out, err)
+	}
+	if len(out.Data.Targets) != 20 || out.Data.Total != 25 || !out.Data.Truncated {
+		t.Fatalf("bounded relation data=%+v", out.Data)
+	}
+	if !out.Data.Targets[0].Resolved || out.Data.Targets[1].Resolved || out.Data.Targets[19].Path != "pkg/file-19.go" {
+		t.Fatalf("resolved/unresolved order changed: %+v", out.Data.Targets)
+	}
+}
+
 func TestCodeHandlersRegisterReadOnlyClosedWorldTools(t *testing.T) {
 	backend := fakeCodeQueryBackend{
 		search: func(context.Context, mcpWorkspace, searchCodeInput) (searchCodeData, error) {
@@ -487,6 +526,43 @@ func TestVerifyCodeContextRejectsEmptyManifestAndCancellation(t *testing.T) {
 	}
 	if called {
 		t.Fatal("backend called for empty or canceled input")
+	}
+}
+
+func TestVerifyCodeContextValidatesEveryManifestPathBeforeBackend(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	called := false
+	tools := codeContextTools{defaultRoot: root, backend: fakeCodeContextBackend{verify: func(context.Context, mcpWorkspace, verifyCodeContextInput) (verifyCodeContextData, error) {
+		called = true
+		return verifyCodeContextData{}, nil
+	}}}
+	cases := []struct {
+		name  string
+		paths []string
+	}{
+		{"too many symbols", []string{"a.go", "b.go", "c.go", "d.go"}},
+		{"empty later entry", []string{"safe.go", ""}},
+		{"absolute slash", []string{"/outside.go"}},
+		{"volume qualified", []string{"C:outside.go"}},
+		{"traversal", []string{"../outside.go"}},
+		{"unclean traversal", []string{"pkg/../outside.go"}},
+		{"dot prefix", []string{"./safe.go"}},
+		{"backslash", []string{`pkg\safe.go`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := coderetrieval.Manifest{Symbols: make([]coderetrieval.SymbolRef, len(tc.paths))}
+			for i, path := range tc.paths {
+				manifest.Symbols[i] = coderetrieval.SymbolRef{Key: fmt.Sprintf("key-%d", i), Path: path}
+			}
+			result, out, err := tools.verifyCodeContext(context.Background(), verifyCodeContextInput{Manifest: manifest})
+			if err != nil || !result.IsError || out.Error == nil || out.Error.Code != "invalid_argument" {
+				t.Fatalf("paths=%q result=%+v output=%+v error=%v", tc.paths, result, out, err)
+			}
+		})
+	}
+	if called {
+		t.Fatal("backend called before all manifest entries were validated")
 	}
 }
 

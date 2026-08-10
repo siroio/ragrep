@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -1389,6 +1391,19 @@ func lspLocationJSON(path string, line int) string {
 		fileURI(path), line, line)
 }
 
+func TestPathFromURIUnescapesWorkspaceFilePath(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, "dir with space", "file.go")
+	slashed := filepath.ToSlash(abs)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+	uri := (&url.URL{Scheme: "file", Path: slashed}).String()
+	if got := pathFromURI(uri, root); got != "dir with space/file.go" {
+		t.Fatalf("pathFromURI(%q)=%q, want decoded workspace-relative path", uri, got)
+	}
+}
+
 // A symbol referenced twice from the same enclosing symbol (two locations
 // both resolving to the same caller) must not crash `code expand
 // --relation references` with symbol_edges' UNIQUE(from_key, to_key, kind,
@@ -2200,6 +2215,53 @@ func TestCodeServiceVerifyWaitsForBarrier(t *testing.T) {
 	}})
 	if !errors.Is(err, ErrWorkspaceSyncing) || len(out.Entries) != 0 || out.Clean {
 		t.Fatalf("out=%+v err=%v", out, err)
+	}
+}
+
+func makeCodeDirectoryLink(t *testing.T, link, target string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err == nil {
+		return
+	} else if runtime.GOOS != "windows" {
+		t.Skipf("host denied link creation: %v", err)
+	}
+	if output, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput(); err != nil {
+		t.Skipf("host denied junction creation: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+}
+
+func TestCodeServiceVerifyRejectsOutsideRootLink(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	body := "package service\nfunc Safe() {}"
+	sym := serviceSymbol("safe.go", "Safe", "func Safe() {}")
+	putServiceSymbol(t, ws.store, sym, ws.save(t, "safe.go", body))
+
+	outside := t.TempDir()
+	outsideBody := []byte("outside workspace")
+	if err := os.WriteFile(filepath.Join(outside, "outside.go"), outsideBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	makeCodeDirectoryLink(t, filepath.Join(ws.root, "linked"), outside)
+
+	out, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{{
+		Key: sym.Key, QualifiedName: sym.QualifiedName, Path: "linked/outside.go", FileHash: codeindex.FileHash(outsideBody),
+	}}}})
+	if err == nil || len(out.Entries) != 0 {
+		t.Fatalf("outside link verify out=%+v err=%v, want rejection before verification", out, err)
+	}
+}
+
+func TestCodeServiceVerifyRejectsOversizedFile(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	const oversized = 10*1024*1024 + 1
+	if err := os.WriteFile(filepath.Join(ws.root, "huge.go"), make([]byte, oversized), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{{
+		Key: "missing", QualifiedName: "Missing", Path: "huge.go",
+	}}}})
+	if err == nil || len(out.Entries) != 0 {
+		t.Fatalf("oversized verify out=%+v err=%v, want rejection before verification", out, err)
 	}
 }
 

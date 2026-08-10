@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,6 +21,8 @@ import (
 )
 
 var ErrStaleLiveKey = errors.New("stale_live_key")
+
+const maxCodeVerifyFileBytes = 10 * 1024 * 1024
 
 type searchRequest struct {
 	Root, DB, Query, Mode string
@@ -267,6 +270,14 @@ func (s *codeService) Pack(ctx context.Context, req packRequest) (codePackOutput
 }
 
 func (s *codeService) Verify(ctx context.Context, req verifyRequest) (codeVerifyOutput, error) {
+	if len(req.Manifest.Symbols) == 0 || len(req.Manifest.Symbols) > 3 {
+		return codeVerifyOutput{}, fmt.Errorf("verify manifest must contain 1 to 3 symbols")
+	}
+	for _, ref := range req.Manifest.Symbols {
+		if !validCodeManifestPath(ref.Path) {
+			return codeVerifyOutput{}, fmt.Errorf("invalid manifest path %q", ref.Path)
+		}
+	}
 	ws, err := s.workspace(req.Root, req.DB)
 	if err != nil {
 		return codeVerifyOutput{}, err
@@ -277,8 +288,13 @@ func (s *codeService) Verify(ctx context.Context, req verifyRequest) (codeVerify
 		return codeVerifyOutput{}, err
 	}
 	defer unlock()
+	files, err := readCodeManifestFiles(ctx, ws.root, req.Manifest)
+	if err != nil {
+		return codeVerifyOutput{}, err
+	}
 	return runCodeVerify(ctx, req.Manifest, func(path string) ([]byte, error) {
-		return os.ReadFile(filepath.Join(ws.root, filepath.FromSlash(path)))
+		file := files[path]
+		return file.data, file.err
 	}, func(ref coderetrieval.SymbolRef) (coderetrieval.SymbolRef, error) {
 		getSymbol := func(key string) (codeindex.Symbol, error) {
 			if strings.HasPrefix(key, "live:") {
@@ -299,6 +315,58 @@ func (s *codeService) Verify(ctx context.Context, req verifyRequest) (codeVerify
 		}
 		return coderetrieval.ResolveRef(ref, getSymbol, ws.store.FindByQualifiedName)
 	})
+}
+
+type codeManifestFile struct {
+	data []byte
+	err  error
+}
+
+func readCodeManifestFiles(ctx context.Context, workspaceRoot string, manifest coderetrieval.Manifest) (map[string]codeManifestFile, error) {
+	root, err := os.OpenRoot(workspaceRoot)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	files := make(map[string]codeManifestFile)
+	for _, ref := range manifest.Symbols {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, ok := files[ref.Path]; ok {
+			continue
+		}
+		file, err := root.Open(filepath.FromSlash(ref.Path))
+		if errors.Is(err, os.ErrNotExist) {
+			files[ref.Path] = codeManifestFile{err: err}
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("verify file %q: %w", ref.Path, err)
+		}
+		info, statErr := file.Stat()
+		if statErr != nil {
+			file.Close()
+			return nil, fmt.Errorf("verify file %q: %w", ref.Path, statErr)
+		}
+		if !info.Mode().IsRegular() || info.Size() > maxCodeVerifyFileBytes {
+			file.Close()
+			return nil, fmt.Errorf("verify file %q is not a bounded regular file", ref.Path)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(file, maxCodeVerifyFileBytes+1))
+		closeErr := file.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("verify file %q: %w", ref.Path, readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("verify file %q: %w", ref.Path, closeErr)
+		}
+		if len(data) > maxCodeVerifyFileBytes {
+			return nil, fmt.Errorf("verify file %q exceeds size limit", ref.Path)
+		}
+		files[ref.Path] = codeManifestFile{data: data}
+	}
+	return files, nil
 }
 
 func codeServiceSnapshot(ctx context.Context, ws *workspaceState) (uint64, func(), error) {
