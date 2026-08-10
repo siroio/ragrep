@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -12,6 +14,37 @@ func fakeEmbed(text string) ([]float32, error) {
 		v[i%embedDim] += float32(r % 13)
 	}
 	return v, nil
+}
+
+func TestUpsertDocContextRejectsCancellationBeforeCommit(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	embeds := 0
+	_, err := s.upsertDocWithHashContext(ctx, "docs/canceled.md", "first\n\nsecond", 1, HashContent("first\n\nsecond"), func(text string) ([]float32, error) {
+		embeds++
+		return fakeEmbed(text)
+	}, cancel)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("upsert error=%v, want context.Canceled", err)
+	}
+	if embeds != 2 {
+		t.Fatalf("embed calls=%d, want cancellation after final embed", embeds)
+	}
+	if _, err := s.GetDoc("docs/canceled.md"); err != ErrNotFound {
+		t.Fatalf("canceled upsert committed document: %v", err)
+	}
+}
+
+func TestUpsertDocContextRejectsCancellationBeforeZeroParagraphCommit(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := s.upsertDocWithHashContext(ctx, "docs/empty.md", "", 1, HashContent(""), fakeEmbed, cancel)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("zero-paragraph upsert error=%v, want context.Canceled", err)
+	}
+	if _, err := s.GetDoc("docs/empty.md"); err != ErrNotFound {
+		t.Fatalf("canceled zero-paragraph upsert committed document: %v", err)
+	}
 }
 
 func newTestStore(t *testing.T) *Store {

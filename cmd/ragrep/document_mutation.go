@@ -194,27 +194,11 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 			return result, err
 		}
 	}
-	confinedRoot, err := openConfinedDocumentRoot(root)
-	if err != nil {
-		return result, err
-	}
-	defer confinedRoot.root.Close()
-
 	paths := make([]documentWalkRoot, len(request.Paths))
 	normRoots := make([]string, len(request.Paths))
 	for i, requested := range request.Paths {
 		absolute, err := filepath.Abs(requested)
 		if err != nil {
-			return result, err
-		}
-		if err := confinedRoot.validateExisting(absolute); err != nil {
-			if request.Root != "" && errors.Is(err, os.ErrNotExist) {
-				display := requested
-				if len(request.displayPaths) == len(request.Paths) {
-					display = request.displayPaths[i]
-				}
-				return result, mcpDocumentNotFound(filepath.ToSlash(display))
-			}
 			return result, err
 		}
 		normRoots[i], err = normPath(absolute, root)
@@ -226,6 +210,19 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 			display = request.displayPaths[i]
 		}
 		paths[i] = documentWalkRoot{absolute: absolute, display: display}
+	}
+	confinedRoot, err := openConfinedDocumentRoot(root)
+	if err != nil {
+		return result, err
+	}
+	defer confinedRoot.root.Close()
+	for _, path := range paths {
+		if err := confinedRoot.validateExisting(path.absolute); err != nil {
+			if request.Root != "" && errors.Is(err, os.ErrNotExist) {
+				return result, mcpDocumentNotFound(filepath.ToSlash(path.display))
+			}
+			return result, err
+		}
 	}
 
 	s, err := openStoreAt(request.DB)
@@ -309,7 +306,7 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 				if err != nil {
 					return err
 				}
-				changed, err := s.UpsertDocWithHash(rel, text, info.ModTime().Unix(), srcHash, documentEmbedWithContext(ctx, e.Embed))
+				changed, err := s.UpsertDocWithHashContext(ctx, rel, text, info.ModTime().Unix(), srcHash, documentEmbedWithContext(ctx, e.Embed))
 				if err != nil {
 					return fmt.Errorf("%s: %w", rel, err)
 				}
@@ -335,7 +332,7 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 				result.Skipped++
 				return nil
 			}
-			changed, err := s.UpsertDoc(rel, string(data), info.ModTime().Unix(), documentEmbedWithContext(ctx, e.Embed))
+			changed, err := s.UpsertDocContext(ctx, rel, string(data), info.ModTime().Unix(), documentEmbedWithContext(ctx, e.Embed))
 			if err != nil {
 				return fmt.Errorf("%s: %w", rel, err)
 			}
@@ -610,7 +607,7 @@ func indexNewDocument(ctx context.Context, db, key, content string, mtime int64)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err = s.UpsertDoc(key, content, mtime, documentEmbedWithContext(ctx, e.Embed))
+	_, err = s.UpsertDocContext(ctx, key, content, mtime, documentEmbedWithContext(ctx, e.Embed))
 	return err
 }
 

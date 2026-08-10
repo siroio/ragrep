@@ -557,3 +557,35 @@ func TestReindexDocumentsMissingSourceIsNotFound(t *testing.T) {
 		t.Fatalf("missing source failure=%+v, want safe not_found with relative key", failure)
 	}
 }
+
+func TestReindexDocumentsTraversalTakesPrecedenceOverFilesystemState(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "workspace")
+	if err := os.MkdirAll(filepath.Join(root, ".ragrep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "existing.md"), []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(root, ".ragrep", "index.db")
+	for _, path := range []string{"../existing.md", "../missing.md"} {
+		_, err := (productionMCPBackend{}).ReindexDocuments(context.Background(), mcpWorkspace{
+			Root: root, DocumentDB: db,
+		}, reindexDocumentsInput{Paths: []string{path}})
+		if failure := classifyMCPError(err); failure.Code != "path_outside_workspace" {
+			t.Fatalf("path=%q failure=%+v, want path_outside_workspace", path, failure)
+		}
+	}
+	_, err := (productionMCPBackend{}).ReindexDocuments(context.Background(), mcpWorkspace{
+		Root: root, DocumentDB: db,
+	}, reindexDocumentsInput{Paths: []string{"missing.md", "../existing.md"}})
+	if failure := classifyMCPError(err); failure.Code != "path_outside_workspace" {
+		t.Fatalf("later traversal failure=%+v, want lexical validation before any filesystem lookup", failure)
+	}
+	_, err = (productionMCPBackend{}).ReindexDocuments(context.Background(), mcpWorkspace{
+		Root: root, DocumentDB: db,
+	}, reindexDocumentsInput{Paths: []string{"missing.md"}})
+	if failure := classifyMCPError(err); failure.Code != "not_found" {
+		t.Fatalf("safe missing path failure=%+v, want not_found", failure)
+	}
+}
