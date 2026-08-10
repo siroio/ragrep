@@ -2,7 +2,7 @@ import argparse
 from collections import Counter
 from html import unescape
 import json
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import sys
 
@@ -178,13 +178,35 @@ def validate_case_sets(development: list[dict], holdout: list[dict], corpus_root
     _validate_counts("split unanswerable kind counts (holdout)", Counter(case["unanswerable_kind"] for case in holdout if case["unanswerable_kind"] is not None), expected_split_unanswerable_kind_counts[1])
 
 
-def write_retrieval_cases(cases: list[dict], output: Path) -> int:
+def prefixed_doc(logical_doc: str, doc_prefix: str) -> str:
+    for value, label in ((logical_doc, "logical document"), (doc_prefix, "document prefix")):
+        path = PurePosixPath(value)
+        windows_path = PureWindowsPath(value)
+        if (not isinstance(value, str) or "\\" in value or path.is_absolute()
+                or windows_path.is_absolute() or windows_path.drive or ".." in path.parts):
+            raise ValueError(f"invalid {label}: {value}")
+    logical_path = PurePosixPath(logical_doc)
+    prefix_path = PurePosixPath(doc_prefix)
+    return str(prefix_path / logical_path) if doc_prefix else str(logical_path)
+
+
+def write_holdout_questions(cases: list[dict], output: Path) -> int:
+    ids = [case["id"] for case in cases]
+    duplicates = sorted(identifier for identifier, count in Counter(ids).items() if count > 1)
+    if duplicates:
+        raise ValueError(f"duplicate holdout ID: {duplicates[0]}")
+    lines = [json.dumps({"id": case["id"], "query": case["query"]}, ensure_ascii=False, separators=(",", ":")) for case in cases]
+    output.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return len(lines)
+
+
+def write_retrieval_cases(cases: list[dict], output: Path, doc_prefix: str = "") -> int:
     lines = []
     for case in cases:
         if not case["answerable"]:
             continue
         for evidence in case["evidence"]:
-            retrieval = {"query": case["query"], "doc": evidence["doc"]}
+            retrieval = {"query": case["query"], "doc": prefixed_doc(evidence["doc"], doc_prefix)}
             if "para" in evidence:
                 retrieval["para"] = evidence["para"]
             lines.append(json.dumps(retrieval, ensure_ascii=False, separators=(",", ":")))

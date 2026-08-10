@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from validate_cases import main, validate_case_sets, write_retrieval_cases
+from validate_cases import main, prefixed_doc, validate_case_sets, write_holdout_questions, write_retrieval_cases
 
 
 class ValidateCasesTests(unittest.TestCase):
@@ -54,6 +54,72 @@ class ValidateCasesTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(output.read_text(encoding="utf-8")),
                 {"query": "Question?", "doc": "Manual/a.md", "para": 2},
+            )
+
+    def test_writes_holdout_questions_as_compact_jsonl_in_input_order(self):
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "questions.jsonl"
+            case_a = {"id": "holdout-001", "query": "質問A"}
+            case_b = {"id": "holdout-002", "query": "質問B"}
+
+            count = write_holdout_questions([case_a, case_b], output)
+
+            self.assertEqual(count, 2)
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                '{"id":"holdout-001","query":"質問A"}\n'
+                '{"id":"holdout-002","query":"質問B"}\n',
+            )
+
+    def test_rejects_duplicate_holdout_ids_when_writing_questions(self):
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "questions.jsonl"
+
+            with self.assertRaisesRegex(ValueError, "holdout-001"):
+                write_holdout_questions(
+                    [
+                        {"id": "holdout-001", "query": "質問A"},
+                        {"id": "holdout-001", "query": "質問B"},
+                    ],
+                    output,
+                )
+
+    def test_prefixes_logical_document_path(self):
+        self.assertEqual(
+            prefixed_doc(
+                "Manual/static-batching-enable.md",
+                ".superpowers/sdd/2026-08-10-unity-manual-corpus-preparation/unity-corpus-r2",
+            ),
+            ".superpowers/sdd/2026-08-10-unity-manual-corpus-preparation/unity-corpus-r2/Manual/static-batching-enable.md",
+        )
+
+    def test_rejects_ambiguous_or_escaping_retrieval_document_paths(self):
+        for logical_doc, doc_prefix in (
+            ("Manual/a.md", "/absolute"),
+            ("Manual/a.md", "prefix/../escape"),
+            ("Manual/a.md", "prefix\\ambiguous"),
+            ("/absolute.md", "prefix"),
+            ("../escape.md", "prefix"),
+            ("Manual\\ambiguous.md", "prefix"),
+        ):
+            with self.subTest(logical_doc=logical_doc, doc_prefix=doc_prefix):
+                with self.assertRaises(ValueError):
+                    prefixed_doc(logical_doc, doc_prefix)
+
+    def test_exports_prefixed_answerable_retrieval_cases_only(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            answerable, unanswerable = self.make_cases(root)
+            output = root / "retrieval.jsonl"
+
+            count = write_retrieval_cases(
+                [answerable, unanswerable], output, "prepared-corpus"
+            )
+
+            self.assertEqual(count, 1)
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                {"query": "Question?", "doc": "prepared-corpus/Manual/a.md", "para": 2},
             )
 
     def test_rejects_duplicate_ids(self):
