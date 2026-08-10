@@ -209,15 +209,19 @@ def convert_manual(source_root: Path, output_root: Path, unity_version: str, gen
     try:
         for source_file in files:
             relative_source = (source_root.name / source_file.relative_to(source_root)).as_posix()
+            destination = temporary_root / "corpus" / Path(relative_source).with_suffix(".md")
             try:
                 markdown = extract_markdown(source_file.read_text(encoding="utf-8", errors="strict"), relative_source, unity_version)
-                destination = temporary_root / "corpus" / Path(relative_source).with_suffix(".md")
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_text(markdown, encoding="utf-8")
                 converted += 1
                 if not markdown.strip():
                     empty += 1
             except (UnicodeError, OSError, ExtractionError) as error:
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 failures.append({"source": relative_source, "error": str(error)})
 
         failures.sort(key=lambda item: item["source"])

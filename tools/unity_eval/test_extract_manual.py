@@ -141,6 +141,32 @@ class ConvertManualTests(unittest.TestCase):
             disk_manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(disk_manifest, manifest)
 
+    def test_removes_partial_destination_after_page_write_failure(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source = base / "Manual"
+            source.mkdir()
+            (source / "page.html").write_text(
+                '<div id="content-wrap"><div class="section"><h1>Partial</h1></div></div>',
+                encoding="utf-8",
+            )
+            output = base / "snapshot"
+            original_write_text = Path.write_text
+
+            def write_partial_then_fail(path, data, *args, **kwargs):
+                if path.suffix == ".md":
+                    original_write_text(path, "partial", encoding="utf-8")
+                    raise OSError("destination write failed")
+                return original_write_text(path, data, *args, **kwargs)
+
+            with patch.object(Path, "write_text", write_partial_then_fail):
+                manifest = convert_manual(source, output, "6000.3.11f1", datetime.now(timezone.utc))
+
+            self.assertEqual(manifest["converted"], 0)
+            self.assertEqual(manifest["failed"], 1)
+            self.assertEqual(manifest["failures"][0]["error"], "destination write failed")
+            self.assertFalse((output / "corpus" / "Manual" / "page.md").exists())
+
     def test_refuses_existing_output_root(self):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
