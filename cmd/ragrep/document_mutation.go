@@ -133,6 +133,14 @@ type documentWalkRoot struct {
 	display  string
 }
 
+var documentMutationEmbedderFactory = func() (textEmbedder, error) {
+	dir, err := embed.CacheDir()
+	if err != nil {
+		return nil, err
+	}
+	return embed.New(dir)
+}
+
 func runDocumentIndex(ctx context.Context, request documentIndexRequest) (documentIndexResult, error) {
 	var result documentIndexResult
 	if err := ctx.Err(); err != nil {
@@ -177,11 +185,7 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 		return result, err
 	}
 	defer s.Close()
-	dir, err := embed.CacheDir()
-	if err != nil {
-		return result, err
-	}
-	e, err := embed.New(dir)
+	e, err := documentMutationEmbedderFactory()
 	if err != nil {
 		return result, err
 	}
@@ -541,11 +545,7 @@ func indexNewDocument(ctx context.Context, db, key, content string, mtime int64)
 		return err
 	}
 	defer s.Close()
-	dir, err := embed.CacheDir()
-	if err != nil {
-		return err
-	}
-	e, err := embed.New(dir)
+	e, err := documentMutationEmbedderFactory()
 	if err != nil {
 		return err
 	}

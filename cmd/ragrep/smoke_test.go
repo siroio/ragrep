@@ -26,13 +26,6 @@ import (
 )
 
 func TestSmokeMCP(t *testing.T) {
-	cache, err := embed.CacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !embed.ModelCached(cache) {
-		t.Skip("model not cached; run 'ragrep init' to enable the MCP mutation smoke test")
-	}
 	packageDir, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -46,14 +39,28 @@ func TestSmokeMCP(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build MCP smoke binary: %v\n%s", err, output)
 	}
+	mcpExecutable := filepath.Join(t.TempDir(), "ragrep-mcp-test")
+	if runtime.GOOS == "windows" {
+		mcpExecutable += ".exe"
+	}
+	buildMCP := exec.Command("go", "test", "-c", "-o", mcpExecutable, ".")
+	buildMCP.Dir = packageDir
+	if output, err := buildMCP.CombinedOutput(); err != nil {
+		t.Fatalf("build hermetic MCP smoke binary: %v\n%s", err, output)
+	}
 
 	environmentRoot := t.TempDir()
 	environment := isolatedDaemonEnvironment(environmentRoot)
-	if !copyDaemonSmokeEmbedCache(t, filepath.Join(environmentRoot, "cache", "ragrep")) {
-		t.Fatal("host model disappeared before MCP smoke")
+	if embed.ModelCached(filepath.Join(environmentRoot, "cache", "ragrep")) {
+		t.Fatal("isolated MCP smoke unexpectedly has embedding assets")
 	}
-	root := daemonSmokeWorkspace(t, "func MCPFixture() {}\n")
-	fakeLSP := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-mcp-smoke", fakeLSPServerAllCapsEmptySrc)
+	root := daemonSmokeWorkspace(t, "func MCPFixture() {}\nfunc MCPCaller() { MCPFixture() }\n")
+	locations := "[" + strings.Join([]string{
+		lspLocationJSON(filepath.Join(root, "service.go"), 2),
+		lspLocationJSON(filepath.Join(root, "missing.go"), 0),
+	}, ",") + "]"
+	fakeLSPSrc := strings.ReplaceAll(fakeLSPServerReferencesSrcTemplate, "LOCATIONS_JSON_PLACEHOLDER", locations)
+	fakeLSP := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-mcp-smoke", fakeLSPSrc)
 	configData, err := json.Marshal(map[string]any{"servers": map[string]string{"go": fakeLSP}})
 	if err != nil {
 		t.Fatal(err)
@@ -63,10 +70,23 @@ func TestSmokeMCP(t *testing.T) {
 	}
 	codeDB := filepath.Join(root, ".ragrep", "code.db")
 	symbol := testSymbol()
+	symbol.Name = "MCPFixture"
+	symbol.QualifiedName = "MCPFixture"
+	symbol.Signature = "func MCPFixture()"
 	symbol.Path = "service.go"
 	symbol.Body = "func MCPFixture() {}\n"
+	symbol.Range = codeindex.Range{Start: codeindex.Position{Line: 1}, End: codeindex.Position{Line: 1, Character: 20}}
 	symbol.BodyHash = codeindex.FileHash([]byte(symbol.Body))
 	symbol.EmbeddingText = codeindex.RenderEmbeddingText(symbol)
+	caller := symbol
+	caller.Key = "mcp-caller-key"
+	caller.Name = "MCPCaller"
+	caller.QualifiedName = "MCPCaller"
+	caller.Signature = "func MCPCaller()"
+	caller.Body = "func MCPCaller() { MCPFixture() }\n"
+	caller.Range = codeindex.Range{Start: codeindex.Position{Line: 2}, End: codeindex.Position{Line: 2, Character: 34}}
+	caller.BodyHash = codeindex.FileHash([]byte(caller.Body))
+	caller.EmbeddingText = codeindex.RenderEmbeddingText(caller)
 	codeStore, err := codestore.Open(codeDB, codeModelID, codeEmbedDim)
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +95,7 @@ func TestSmokeMCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := codeStore.UpsertSymbols(symbol.Path, codeindex.FileHash(fileContent), []codeindex.Symbol{symbol}, 0, fakeCodeEmbed); err != nil {
+	if _, err := codeStore.UpsertSymbols(symbol.Path, codeindex.FileHash(fileContent), []codeindex.Symbol{symbol, caller}, 0, fakeCodeEmbed); err != nil {
 		codeStore.Close()
 		t.Fatal(err)
 	}
@@ -109,8 +129,9 @@ func TestSmokeMCP(t *testing.T) {
 		t.Fatalf("workspace add: %v: %s", err, stderr)
 	}
 
-	command := exec.Command(executable, "mcp", "serve")
-	command.Dir, command.Env = root, environment
+	command := exec.Command(mcpExecutable, "-test.run=^TestMCPServerHelperProcess$")
+	command.Dir = root
+	command.Env = append(environment, "GO_WANT_MCP_SERVER_HELPER=1")
 	var mcpStderr bytes.Buffer
 	command.Stderr = &mcpStderr
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -130,19 +151,39 @@ func TestSmokeMCP(t *testing.T) {
 			_ = command.Process.Kill()
 		}
 	})
-	callMCPTool(t, ctx, session, "add_document", map[string]any{"path": "notes/mcp.md", "content": "old MCP marker"})
+	addedResult := callMCPTool(t, ctx, session, "add_document", map[string]any{"path": "notes/mcp.md", "content": "old MCP marker"})
+	var added mcpToolOutput[addDocumentData]
+	decodeMCPStructured(t, addedResult, &added)
+	if added.Data == nil || added.Data.Path != "notes/mcp.md" || added.Data.Paragraphs != 1 {
+		t.Fatalf("add result=%+v", added)
+	}
 	search := callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "old MCP marker", "mode": "text"})
 	var searched mcpToolOutput[searchDocumentsData]
 	decodeMCPStructured(t, search, &searched)
-	if searched.Data == nil || len(searched.Data.Hits) != 1 {
+	if searched.Data == nil || len(searched.Data.Hits) != 1 || searched.Data.Hits[0].Path != "notes/mcp.md" || !strings.Contains(searched.Data.Hits[0].Snippet, "old MCP marker") {
 		t.Fatalf("document search=%+v", searched)
 	}
-	callMCPTool(t, ctx, session, "read_document", map[string]any{"path": "notes/mcp.md"})
+	readResult := callMCPTool(t, ctx, session, "read_document", map[string]any{"path": "notes/mcp.md"})
+	var read mcpToolOutput[readDocumentData]
+	decodeMCPStructured(t, readResult, &read)
+	if read.Data == nil || read.Data.Path != "notes/mcp.md" || read.Data.Content != "old MCP marker" {
+		t.Fatalf("read document=%+v", read)
+	}
 	if err := os.WriteFile(filepath.Join(root, "notes", "mcp.md"), []byte("new MCP marker"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	callMCPTool(t, ctx, session, "reindex_documents", map[string]any{"paths": []string{"notes/mcp.md"}})
-	callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "new MCP marker", "mode": "text"})
+	reindexResult := callMCPTool(t, ctx, session, "reindex_documents", map[string]any{"paths": []string{"notes/mcp.md"}})
+	var reindexed mcpToolOutput[reindexDocumentsData]
+	decodeMCPStructured(t, reindexResult, &reindexed)
+	if reindexed.Data == nil || reindexed.Data.Indexed != 1 || reindexed.Data.Skipped != 0 {
+		t.Fatalf("reindex=%+v", reindexed)
+	}
+	newSearchResult := callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "new MCP marker", "mode": "text"})
+	var newSearch mcpToolOutput[searchDocumentsData]
+	decodeMCPStructured(t, newSearchResult, &newSearch)
+	if newSearch.Data == nil || len(newSearch.Data.Hits) != 1 || newSearch.Data.Hits[0].Path != "notes/mcp.md" || !strings.Contains(newSearch.Data.Hits[0].Snippet, "new MCP marker") || strings.Contains(newSearch.Data.Hits[0].Snippet, "old MCP marker") {
+		t.Fatalf("new document search=%+v", newSearch)
+	}
 
 	codeSearch := callMCPTool(t, ctx, session, "search_code", map[string]any{"query": "MCPFixture", "mode": "text"})
 	var codeHits mcpToolOutput[searchCodeData]
@@ -151,15 +192,30 @@ func TestSmokeMCP(t *testing.T) {
 		t.Fatalf("code search=%+v", codeHits)
 	}
 	key := codeHits.Data.Hits[0].Key
-	callMCPTool(t, ctx, session, "read_code_symbol", map[string]any{"key": key})
-	callMCPTool(t, ctx, session, "inspect_code_relation", map[string]any{"key": key, "relation": "tests"})
+	readCodeResult := callMCPTool(t, ctx, session, "read_code_symbol", map[string]any{"key": key})
+	var readCode mcpToolOutput[readCodeSymbolData]
+	decodeMCPStructured(t, readCodeResult, &readCode)
+	if readCode.Data == nil || readCode.Data.Symbol.Key != key || !strings.Contains(readCode.Data.Symbol.Body, "MCPFixture") {
+		t.Fatalf("read code=%+v", readCode)
+	}
+	relationResult := callMCPTool(t, ctx, session, "inspect_code_relation", map[string]any{"key": key, "relation": "references"})
+	var relation mcpToolOutput[inspectCodeRelationData]
+	decodeMCPStructured(t, relationResult, &relation)
+	if relation.Data == nil || len(relation.Data.Targets) != 2 || relation.Data.Targets[0].Relation != "references" || !relation.Data.Targets[0].Resolved || relation.Data.Targets[0].Key != caller.Key || relation.Data.Targets[1].Resolved || relation.Data.Targets[1].Path != "missing.go" {
+		t.Fatalf("relation=%+v", relation)
+	}
 	contextResult := callMCPTool(t, ctx, session, "build_code_context", map[string]any{"query": "MCPFixture", "selected_keys": []string{key}})
 	var built mcpToolOutput[buildCodeContextData]
 	decodeMCPStructured(t, contextResult, &built)
-	if built.Data == nil {
-		t.Fatal("build_code_context returned no data")
+	if built.Data == nil || len(built.Data.Pack.Symbols) != 1 || built.Data.Pack.Symbols[0].Key != key || len(built.Data.Manifest.Symbols) != 1 || built.Data.Manifest.Symbols[0].Key != key {
+		t.Fatalf("build code context=%+v", built)
 	}
-	callMCPTool(t, ctx, session, "verify_code_context", map[string]any{"manifest": built.Data.Manifest})
+	verifyResult := callMCPTool(t, ctx, session, "verify_code_context", map[string]any{"manifest": built.Data.Manifest})
+	var verified mcpToolOutput[verifyCodeContextData]
+	decodeMCPStructured(t, verifyResult, &verified)
+	if verified.Data == nil || !verified.Data.Clean || len(verified.Data.Entries) != 1 || verified.Data.Entries[0].Stale || !verified.Data.Entries[0].Resolved || verified.Data.Entries[0].ResolvedKey != key {
+		t.Fatalf("verify code context=%+v", verified)
+	}
 
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
@@ -172,6 +228,16 @@ func TestSmokeMCP(t *testing.T) {
 	if mcpStderr.Len() != 0 {
 		t.Fatalf("MCP stderr=%q", mcpStderr.String())
 	}
+}
+
+func TestMCPServerHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_MCP_SERVER_HELPER") != "1" {
+		return
+	}
+	documentMutationEmbedderFactory = func() (textEmbedder, error) {
+		return textEmbedderFunc(fakeEmbed), nil
+	}
+	os.Exit(cmdMCP([]string{"serve"}))
 }
 
 func callMCPTool(t *testing.T, ctx context.Context, session *mcp.ClientSession, name string, arguments any) *mcp.CallToolResult {
