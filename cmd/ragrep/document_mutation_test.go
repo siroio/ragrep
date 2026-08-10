@@ -308,6 +308,83 @@ func TestDocumentMutationsSerializeAddAndReindex(t *testing.T) {
 	}
 }
 
+func TestCanceledDocumentMutationNeverTouchesFilesystemAndReturnsGate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func(addDocumentDeps) (context.Context, addDocumentDeps)
+	}{
+		{
+			name: "already canceled with free token",
+			ctx: func(deps addDocumentDeps) (context.Context, addDocumentDeps) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, deps
+			},
+		},
+		{
+			name: "canceled immediately after token acquisition",
+			ctx: func(deps addDocumentDeps) (context.Context, addDocumentDeps) {
+				ctx, cancel := context.WithCancel(context.Background())
+				deps.acquireHooks.afterAcquire = cancel
+				return ctx, deps
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, db := newDocumentMutationWorkspace(t)
+			beforeCreate := false
+			deps := addDocumentDeps{beforeCreate: func() { beforeCreate = true }}
+			ctx, deps := tc.ctx(deps)
+			_, err := runAddDocument(ctx, addDocumentRequest{
+				DB: db, Root: root, Path: "notes/canceled.md", Content: "body",
+			}, deps)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled add error=%v, want context.Canceled", err)
+			}
+			if beforeCreate {
+				t.Fatal("canceled add reached beforeCreate")
+			}
+			if _, err := os.Stat(filepath.Join(root, "notes")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("canceled add left directory state: %v", err)
+			}
+			if _, err := os.Stat(db); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("canceled add touched DB: %v", err)
+			}
+
+			oldFactory := documentMutationEmbedderFactory
+			documentMutationEmbedderFactory = func() (textEmbedder, error) { return textEmbedderFunc(fakeEmbed), nil }
+			t.Cleanup(func() { documentMutationEmbedderFactory = oldFactory })
+			if _, err := runAddDocument(context.Background(), addDocumentRequest{
+				DB: db, Root: root, Path: "notes/next.md", Content: "next",
+			}, addDocumentDeps{}); err != nil {
+				t.Fatalf("next mutation failed after canceled acquire: %v", err)
+			}
+		})
+	}
+}
+
+func TestAcquireDocumentMutationReturnsTokenWhenCancelAndReleaseRace(t *testing.T) {
+	<-documentMutationGate
+	ctx, cancel := context.WithCancel(context.Background())
+	waiting := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- acquireDocumentMutation(ctx, documentMutationAcquireHooks{
+			beforeWait: func() { close(waiting) },
+		})
+	}()
+	<-waiting
+	cancel()
+	unlockDocumentMutation()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("racing acquire error=%v, want context.Canceled", err)
+	}
+	if err := acquireDocumentMutation(context.Background(), documentMutationAcquireHooks{}); err != nil {
+		t.Fatalf("gate token leaked after racing cancellation: %v", err)
+	}
+	unlockDocumentMutation()
+}
+
 func TestRunAddDocumentDoesNotCreateThroughSwappedAncestor(t *testing.T) {
 	root, db := newDocumentMutationWorkspace(t)
 	if err := os.Mkdir(filepath.Join(root, "notes"), 0o755); err != nil {

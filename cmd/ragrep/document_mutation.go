@@ -129,6 +129,7 @@ type addDocumentDeps struct {
 	Count        func(*store.Store, string) (int, error)
 	Close        func(*store.Store) error
 	beforeCreate func()
+	acquireHooks documentMutationAcquireHooks
 }
 
 type documentWalkRoot struct {
@@ -150,13 +151,31 @@ var documentMutationGate = func() chan struct{} {
 	return gate
 }()
 
-func lockDocumentMutation(ctx context.Context) error {
+type documentMutationAcquireHooks struct {
+	beforeWait   func()
+	afterAcquire func()
+}
+
+func acquireDocumentMutation(ctx context.Context, hooks documentMutationAcquireHooks) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if hooks.beforeWait != nil {
+		hooks.beforeWait()
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-documentMutationGate:
-		return nil
 	}
+	if hooks.afterAcquire != nil {
+		hooks.afterAcquire()
+	}
+	if err := ctx.Err(); err != nil {
+		unlockDocumentMutation()
+		return err
+	}
+	return nil
 }
 
 func unlockDocumentMutation() { documentMutationGate <- struct{}{} }
@@ -179,7 +198,7 @@ func documentEmbedWithContext(ctx context.Context, embed store.EmbedFunc) store.
 
 func runDocumentIndex(ctx context.Context, request documentIndexRequest) (documentIndexResult, error) {
 	var result documentIndexResult
-	if err := lockDocumentMutation(ctx); err != nil {
+	if err := acquireDocumentMutation(ctx, documentMutationAcquireHooks{}); err != nil {
 		return result, err
 	}
 	defer unlockDocumentMutation()
@@ -488,7 +507,7 @@ func resolveDocumentWritePathAt(confinedRoot *confinedDocumentRoot, requested st
 
 func runAddDocument(ctx context.Context, request addDocumentRequest, deps addDocumentDeps) (addDocumentResult, error) {
 	var result addDocumentResult
-	if err := lockDocumentMutation(ctx); err != nil {
+	if err := acquireDocumentMutation(ctx, deps.acquireHooks); err != nil {
 		return result, err
 	}
 	defer unlockDocumentMutation()
