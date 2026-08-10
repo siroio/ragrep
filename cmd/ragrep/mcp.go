@@ -165,10 +165,12 @@ func mcpToolFailure[T any](err error) (*mcp.CallToolResult, mcpToolOutput[T], er
 }
 
 func newMCPBaseServer() *mcp.Server {
-	return mcp.NewServer(
+	server := mcp.NewServer(
 		&mcp.Implementation{Name: "ragrep", Version: "0.1.0"},
 		&mcp.ServerOptions{Instructions: mcpServerInstructions},
 	)
+	registerDocumentQueryTools(server, documentQueryTools{defaultRoot: ".", backend: productionMCPBackend{}})
+	return server
 }
 
 func runMCPServer(ctx context.Context, transport mcp.Transport, server *mcp.Server) error {
