@@ -512,6 +512,9 @@ func cmdSearch(args []string) int {
 		return fail(fmt.Errorf("k must be positive"))
 	}
 	query := fs.Arg(0)
+	if strings.TrimSpace(query) == "" {
+		return fail(fmt.Errorf("query must not be empty"))
+	}
 	dbPath, err := filepath.Abs(*db)
 	if err != nil {
 		return fail(err)

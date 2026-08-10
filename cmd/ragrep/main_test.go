@@ -270,12 +270,48 @@ func TestCmdSearchDaemonPreservesJSONNoHitsErrorsAndStaleWarning(t *testing.T) {
 	}
 }
 
+func TestCmdSearchDaemonFreshJSONDoesNotLeakMtime(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.MkdirAll(filepath.Join(root, "notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "notes", "fresh.md")
+	if err := os.WriteFile(path, []byte("fresh content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hit := store.Hit{Doc: "notes/fresh.md", Para: 1, Lines: "2", Score: 0.5, Snippet: "fresh", Mtime: info.ModTime().Unix()}
+	handler := newDaemonHandlerWithDocuments(nil, documentDaemonClientFunc(func(context.Context, documentSearchRequest) ([]store.Hit, error) {
+		return []store.Hit{hit}, nil
+	}), "secret", nil, nil)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	calls := injectDocumentDaemonClient(t, daemonClient{endpoint: server.URL, token: "secret", client: server.Client()}, nil)
+
+	code, stdout, stderr := captureSearch(t, []string{"--db", filepath.Join(".ragrep", "index.db"), "--json", "fresh"})
+	if code != 0 || *calls != 1 || stderr != "" {
+		t.Fatalf("exit=%d calls=%d stderr=%q", code, *calls, stderr)
+	}
+	want, err := json.Marshal([]store.Hit{hit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != string(want)+"\n" || strings.Contains(stdout, "mtime") || strings.Contains(stdout, "stale") {
+		t.Fatalf("stdout=%q, want fresh public JSON %q", stdout, string(want)+"\n")
+	}
+}
+
 func TestCmdSearchDaemonValidatesBeforeFactory(t *testing.T) {
 	client := &testDocumentDaemonClient{}
 	calls := injectDocumentDaemonClient(t, client, nil)
 	for _, args := range [][]string{
 		{"--mode", "invalid", "query"},
 		{"-k", "0", "query"},
+		{"--mode", "text", "   "},
 		{"--mode", "text"},
 		{"--mode", "text", "one", "two"},
 	} {

@@ -48,6 +48,47 @@ type daemonDocumentSearchRequest struct {
 	Tags  []string `json:"tags,omitempty"`
 }
 
+type daemonDocumentHit struct {
+	Doc     string  `json:"doc"`
+	Para    int     `json:"para"`
+	Lines   string  `json:"lines"`
+	Score   float64 `json:"score"`
+	Snippet string  `json:"snippet"`
+	Heading string  `json:"heading,omitempty"`
+	Mtime   int64   `json:"mtime"`
+	Stale   bool    `json:"stale,omitempty"`
+}
+
+func daemonDocumentHitsFromStore(hits []store.Hit) []daemonDocumentHit {
+	if hits == nil {
+		return nil
+	}
+	wire := make([]daemonDocumentHit, len(hits))
+	for i, hit := range hits {
+		wire[i] = daemonDocumentHit{
+			Doc: hit.Doc, Para: hit.Para, Lines: hit.Lines, Score: hit.Score,
+			Snippet: hit.Snippet, Heading: hit.Heading, Mtime: hit.Mtime, Stale: hit.Stale,
+		}
+	}
+	return wire
+}
+
+func (hits daemonDocumentHits) storeHits() []store.Hit {
+	if hits == nil {
+		return nil
+	}
+	storeHits := make([]store.Hit, len(hits))
+	for i, hit := range hits {
+		storeHits[i] = store.Hit{
+			Doc: hit.Doc, Para: hit.Para, Lines: hit.Lines, Score: hit.Score,
+			Snippet: hit.Snippet, Heading: hit.Heading, Mtime: hit.Mtime, Stale: hit.Stale,
+		}
+	}
+	return storeHits
+}
+
+type daemonDocumentHits []daemonDocumentHit
+
 type daemonSearchResponse struct {
 	Hits       any    `json:"hits"`
 	Fresh      bool   `json:"fresh"`
@@ -207,7 +248,7 @@ func (h *daemonHandler) searchDocuments(w http.ResponseWriter, r *http.Request) 
 		writeAPIError(w, status, apiErr)
 		return
 	}
-	writeJSON(w, http.StatusOK, hits)
+	writeJSON(w, http.StatusOK, daemonDocumentHitsFromStore(hits))
 }
 
 func (h *daemonHandler) pack(w http.ResponseWriter, r *http.Request) {
@@ -519,9 +560,9 @@ func (c daemonClient) Search(ctx context.Context, req searchRequest) (searchResp
 }
 
 func (c daemonClient) SearchDocuments(ctx context.Context, req documentSearchRequest) ([]store.Hit, error) {
-	var hits []store.Hit
+	var hits daemonDocumentHits
 	err := c.do(ctx, http.MethodPost, "/v1/search", daemonDocumentSearchRequest{DB: req.DB, Query: req.Query, Mode: req.Mode, K: req.K, Tags: req.Tags}, &hits)
-	return hits, err
+	return hits.storeHits(), err
 }
 
 func (c daemonClient) Get(ctx context.Context, req getRequest) (codeindex.Symbol, error) {

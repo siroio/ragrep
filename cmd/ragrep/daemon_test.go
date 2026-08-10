@@ -99,7 +99,7 @@ func TestDaemonDocumentSearchRejectsUnauthorizedAndInvalidRequests(t *testing.T)
 }
 
 func TestDaemonDocumentSearchPropagatesRequestAndHits(t *testing.T) {
-	want := []store.Hit{{Doc: "notes/result.md", Para: 2, Snippet: "matched", Score: 0.75}}
+	want := []store.Hit{{Doc: "notes/result.md", Para: 2, Lines: "3-4", Snippet: "matched", Heading: "Result", Score: 0.75, Mtime: 172337}}
 	db := filepath.Join(t.TempDir(), "index.db")
 	h := newDaemonHandlerWithDocuments(nil, fakeDaemonDocumentService{search: func(_ context.Context, req documentSearchRequest) ([]store.Hit, error) {
 		if !reflect.DeepEqual(req, documentSearchRequest{DB: db, Query: "find this", Mode: "hybrid", K: 3, Tags: []string{"guide", "api"}}) {
