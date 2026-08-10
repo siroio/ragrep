@@ -1,6 +1,13 @@
+import contextlib
+from datetime import datetime, timezone
+import io
+import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from extract_manual import ExtractionError, extract_markdown
+from extract_manual import ExtractionError, convert_manual, extract_markdown, main
 
 
 class ExtractMarkdownTests(unittest.TestCase):
@@ -95,6 +102,135 @@ class ExtractMarkdownTests(unittest.TestCase):
         html = '<div id="content-wrap"><div class="section"><script>noise</script></div></div>'
         with self.assertRaisesRegex(ExtractionError, "empty #content-wrap .section"):
             extract_markdown(html, "Manual/empty.html", "6000.3.11f1")
+
+
+class ConvertManualTests(unittest.TestCase):
+    def test_converts_tree_and_records_failures(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source = base / "Manual"
+            source.mkdir()
+            valid = '<div id="content-wrap"><div class="section"><h1>{}</h1></div></div>'
+            (source / "a.html").write_text(valid.format("A"), encoding="utf-8")
+            (source / "b.html").write_text(valid.format("B"), encoding="utf-8")
+            (source / "bad.html").write_text("<p>bad</p>", encoding="utf-8")
+            output = base / "snapshot"
+
+            manifest = convert_manual(source, output, "6000.3.11f1", datetime(2026, 8, 10, tzinfo=timezone.utc))
+
+            self.assertEqual(manifest["source_files"], 3)
+            self.assertEqual(manifest["converted"], 2)
+            self.assertEqual(manifest["failed"], 1)
+            self.assertEqual(manifest["empty"], 0)
+            self.assertEqual(manifest["failures"][0]["source"], "Manual/bad.html")
+            self.assertTrue((output / "corpus" / "Manual" / "a.md").is_file())
+            disk_manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(disk_manifest, manifest)
+
+    def test_refuses_existing_output_root(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source = base / "Manual"
+            source.mkdir()
+            output = base / "snapshot"
+            output.mkdir()
+            with self.assertRaises(FileExistsError):
+                convert_manual(source, output, "6000.3.11f1", datetime.now(timezone.utc))
+
+    def test_output_is_deterministic_for_matching_sources(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            html = '<div id="content-wrap"><div class="section"><h1>Stable</h1></div></div>'
+            source_a = base / "source-a" / "Manual"
+            source_b = base / "source-b" / "Manual"
+            source_a.mkdir(parents=True)
+            source_b.mkdir(parents=True)
+            (source_a / "page.html").write_text(html, encoding="utf-8")
+            (source_b / "page.html").write_text(html, encoding="utf-8")
+            generated_at = datetime(2026, 8, 10, tzinfo=timezone.utc)
+
+            manifest_a = convert_manual(source_a, base / "snapshot-a", "6000.3.11f1", generated_at)
+            manifest_b = convert_manual(source_b, base / "snapshot-b", "6000.3.11f1", generated_at)
+
+            markdown_a = (base / "snapshot-a" / "corpus" / "Manual" / "page.md").read_bytes()
+            markdown_b = (base / "snapshot-b" / "corpus" / "Manual" / "page.md").read_bytes()
+            self.assertEqual(markdown_a, markdown_b)
+            manifest_a.pop("source_root")
+            manifest_b.pop("source_root")
+            self.assertEqual(manifest_a, manifest_b)
+
+    def test_cli_prints_conversion_summary(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source = base / "Manual"
+            source.mkdir()
+            (source / "page.html").write_text(
+                '<div id="content-wrap"><div class="section"><h1>CLI</h1></div></div>',
+                encoding="utf-8",
+            )
+            output = base / "snapshot"
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                result = main(["--source", str(source), "--output", str(output), "--unity-version", "6000.3.11f1"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(stdout.getvalue(), f"converted=1 failed=0 empty=0 output={output.resolve()}\n")
+
+    def test_cli_returns_one_for_invalid_arguments(self):
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            result = main([])
+
+        self.assertEqual(result, 1)
+        self.assertIn("error:", stderr.getvalue())
+
+    def test_refuses_output_created_before_publication(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source = base / "Manual"
+            source.mkdir()
+            (source / "page.html").write_text(
+                '<div id="content-wrap"><div class="section"><h1>Race</h1></div></div>',
+                encoding="utf-8",
+            )
+            output = base / "snapshot"
+            original_write_text = Path.write_text
+
+            def create_output_after_manifest(path, data, *args, **kwargs):
+                result = original_write_text(path, data, *args, **kwargs)
+                if path.name == "manifest.json":
+                    output.mkdir()
+                return result
+
+            def rename_must_not_run(path, target):
+                raise AssertionError("publication attempted after output root appeared")
+
+            with patch.object(Path, "write_text", create_output_after_manifest), patch.object(Path, "rename", rename_must_not_run):
+                with self.assertRaises(FileExistsError):
+                    convert_manual(source, output, "6000.3.11f1", datetime.now(timezone.utc))
+
+            self.assertTrue(output.is_dir())
+            self.assertEqual(list(base.glob(".snapshot-*")), [])
+
+    def test_removes_temporary_output_when_publication_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            source = base / "Manual"
+            source.mkdir()
+            (source / "page.html").write_text(
+                '<div id="content-wrap"><div class="section"><h1>Cleanup</h1></div></div>',
+                encoding="utf-8",
+            )
+            output = base / "snapshot"
+
+            with patch.object(Path, "rename", side_effect=OSError("publication failed")):
+                with self.assertRaisesRegex(OSError, "publication failed"):
+                    convert_manual(source, output, "6000.3.11f1", datetime.now(timezone.utc))
+
+            self.assertFalse(output.exists())
+            self.assertEqual(list(base.glob(".snapshot-*")), [])
 
 
 if __name__ == "__main__":

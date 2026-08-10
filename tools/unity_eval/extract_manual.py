@@ -1,6 +1,14 @@
+import argparse
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from html.parser import HTMLParser
+import hashlib
+import json
+from pathlib import Path
 import re
+import shutil
+import sys
+import tempfile
 
 
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
@@ -187,3 +195,73 @@ def extract_markdown(html_text: str, source: str, unity_version: str) -> str:
     if not body:
         raise ExtractionError(f"empty #content-wrap .section: {source}")
     return f"---\nsource: {source}\nunity_version: {unity_version}\n---\n\n{body}\n"
+
+
+def convert_manual(source_root: Path, output_root: Path, unity_version: str, generated_at: datetime) -> dict:
+    if output_root.exists():
+        raise FileExistsError(output_root)
+
+    files = sorted(source_root.glob("*.html"), key=lambda path: path.relative_to(source_root).as_posix())
+    temporary_root = Path(tempfile.mkdtemp(prefix=f".{output_root.name}-", dir=output_root.parent))
+    failures: list[dict[str, str]] = []
+    converted = 0
+    empty = 0
+    try:
+        for source_file in files:
+            relative_source = (source_root.name / source_file.relative_to(source_root)).as_posix()
+            try:
+                markdown = extract_markdown(source_file.read_text(encoding="utf-8", errors="strict"), relative_source, unity_version)
+                destination = temporary_root / "corpus" / Path(relative_source).with_suffix(".md")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(markdown, encoding="utf-8")
+                converted += 1
+                if not markdown.strip():
+                    empty += 1
+            except (UnicodeError, OSError, ExtractionError) as error:
+                failures.append({"source": relative_source, "error": str(error)})
+
+        failures.sort(key=lambda item: item["source"])
+        manifest = {
+            "unity_version": unity_version,
+            "source_root": str(source_root.resolve()),
+            "source_files": len(files),
+            "converted": converted,
+            "failed": len(failures),
+            "empty": empty,
+            "generated_at": generated_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "extractor_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "failures": failures,
+        }
+        (temporary_root / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        if output_root.exists():
+            raise FileExistsError(output_root)
+        temporary_root.rename(output_root)
+        return manifest
+    except BaseException:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--unity-version", required=True)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as error:
+        return 0 if error.code == 0 else 1
+    try:
+        manifest = convert_manual(args.source, args.output, args.unity_version, datetime.now(timezone.utc))
+    except (OSError, UnicodeError, ExtractionError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(f"converted={manifest['converted']} failed={manifest['failed']} empty={manifest['empty']} output={args.output.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
