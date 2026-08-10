@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +40,79 @@ func newTestStore(t *testing.T) *store.Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+func TestRunDocumentSearchTextSkipsEmbedding(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("notes/result.md", "search result", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	hits, err := runDocumentSearch(context.Background(), s, "text", "search", 10, nil, func(context.Context, string) ([]float32, error) {
+		called++
+		return nil, errors.New("text search must not embed")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Doc != "notes/result.md" {
+		t.Fatalf("hits=%+v, want notes/result.md", hits)
+	}
+	if called != 0 {
+		t.Fatalf("embed calls=%d, want 0", called)
+	}
+}
+
+func TestRunDocumentSearchVectorPrefixesQuery(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("notes/result.md", "search result", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	var gotQuery string
+	hits, err := runDocumentSearch(context.Background(), s, "vector", "find this", 10, nil, func(_ context.Context, query string) ([]float32, error) {
+		gotQuery = query
+		return fakeEmbed(query)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Doc != "notes/result.md" {
+		t.Fatalf("hits=%+v, want notes/result.md", hits)
+	}
+	if gotQuery != "task: search result | query: find this" {
+		t.Fatalf("embed query=%q", gotQuery)
+	}
+}
+
+func TestRunDocumentSearchHybridPreservesTags(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("notes/keep.md", "---\ntags: [wanted]\n---\n\nsearch result", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("notes/drop.md", "---\ntags: [other]\n---\n\nsearch result", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := runDocumentSearch(context.Background(), s, "hybrid", "search", 10, []string{"wanted"}, func(_ context.Context, query string) ([]float32, error) {
+		return fakeEmbed(query)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Doc != "notes/keep.md" {
+		t.Fatalf("hits=%+v, want only notes/keep.md", hits)
+	}
+}
+
+func TestRunDocumentSearchRejectsUnknownAndCanceledContext(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := runDocumentSearch(context.Background(), s, "unknown", "q", 1, nil, nil); err == nil {
+		t.Fatal("unknown mode: want error")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := runDocumentSearch(ctx, s, "text", "q", 1, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled context error=%v, want context.Canceled", err)
+	}
 }
 
 // -h/--help must print usage and exit 0, not read as a generic parse error

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -543,6 +544,29 @@ func cmdSearch(args []string) int {
 	return 0
 }
 
+type documentEmbedFunc func(context.Context, string) ([]float32, error)
+
+func runDocumentSearch(ctx context.Context, s *store.Store, mode, query string, k int, tags []string, embed documentEmbedFunc) ([]store.Hit, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch mode {
+	case "text":
+		return s.SearchText(query, k, tags)
+	case "vector", "hybrid":
+		vector, err := embed(ctx, "task: search result | query: "+query)
+		if err != nil {
+			return nil, err
+		}
+		if mode == "vector" {
+			return s.SearchVector(vector, k, tags)
+		}
+		return s.SearchHybrid(query, vector, k, tags)
+	default:
+		return nil, fmt.Errorf("unknown mode %q", mode)
+	}
+}
+
 // runSearch builds hits for query using mode, the same way cmdSearch does --
 // shared with cmdEval so both run the identical text/vector/hybrid calls.
 // vector/hybrid modes construct a fresh embedder per call, same as cmdSearch
@@ -552,7 +576,7 @@ func cmdSearch(args []string) int {
 func runSearch(s *store.Store, mode, query string, k int, tags []string) ([]store.Hit, error) {
 	switch mode {
 	case "text":
-		return s.SearchText(query, k, tags)
+		return runDocumentSearch(context.Background(), s, mode, query, k, tags, nil)
 	case "vector", "hybrid":
 		dir, err := embed.CacheDir()
 		if err != nil {
@@ -563,16 +587,11 @@ func runSearch(s *store.Store, mode, query string, k int, tags []string) ([]stor
 			return nil, err
 		}
 		defer e.Close()
-		qv, err := e.Embed("task: search result | query: " + query)
-		if err != nil {
-			return nil, err
-		}
-		if mode == "vector" {
-			return s.SearchVector(qv, k, tags)
-		}
-		return s.SearchHybrid(query, qv, k, tags)
+		return runDocumentSearch(context.Background(), s, mode, query, k, tags, func(_ context.Context, query string) ([]float32, error) {
+			return e.Embed(query)
+		})
 	default:
-		return nil, fmt.Errorf("unknown mode %q", mode)
+		return runDocumentSearch(context.Background(), s, mode, query, k, tags, nil)
 	}
 }
 
