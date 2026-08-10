@@ -195,3 +195,15 @@ func newRagrepMCPServer(defaultRoot string, backends mcpBackends) (*mcp.Server, 
 func runMCPServer(ctx context.Context, transport mcp.Transport, server *mcp.Server) error {
 	return server.Run(ctx, transport)
 }
+
+func serveMCP(ctx context.Context, defaultRoot string, transport mcp.Transport, backends mcpBackends) error {
+	workspace, err := discoverMCPWorkspace(defaultRoot)
+	if err != nil {
+		return err
+	}
+	server, err := newRagrepMCPServer(workspace.Root, backends)
+	if err != nil {
+		return err
+	}
+	return runMCPServer(ctx, transport, server)
+}

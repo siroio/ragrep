@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,10 +18,185 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/siroio/ragrep/internal/codeindex"
 	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/embed"
 	"github.com/siroio/ragrep/internal/store"
 )
+
+func TestSmokeMCP(t *testing.T) {
+	cache, err := embed.CacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !embed.ModelCached(cache) {
+		t.Skip("model not cached; run 'ragrep init' to enable the MCP mutation smoke test")
+	}
+	packageDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(t.TempDir(), "ragrep-mcp-smoke")
+	if runtime.GOOS == "windows" {
+		executable += ".exe"
+	}
+	build := exec.Command("go", "build", "-ldflags", "-X=main.daemonBindAddress=127.0.0.1:0", "-o", executable, ".")
+	build.Dir = packageDir
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build MCP smoke binary: %v\n%s", err, output)
+	}
+
+	environmentRoot := t.TempDir()
+	environment := isolatedDaemonEnvironment(environmentRoot)
+	if !copyDaemonSmokeEmbedCache(t, filepath.Join(environmentRoot, "cache", "ragrep")) {
+		t.Fatal("host model disappeared before MCP smoke")
+	}
+	root := daemonSmokeWorkspace(t, "func MCPFixture() {}\n")
+	fakeLSP := buildFakeLSPServerFromSrc(t, t.TempDir(), "fakelsp-mcp-smoke", fakeLSPServerAllCapsEmptySrc)
+	configData, err := json.Marshal(map[string]any{"servers": map[string]string{"go": fakeLSP}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".ragrep", "config.json"), configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	codeDB := filepath.Join(root, ".ragrep", "code.db")
+	symbol := testSymbol()
+	symbol.Path = "service.go"
+	symbol.Body = "func MCPFixture() {}\n"
+	symbol.BodyHash = codeindex.FileHash([]byte(symbol.Body))
+	symbol.EmbeddingText = codeindex.RenderEmbeddingText(symbol)
+	codeStore, err := codestore.Open(codeDB, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileContent, err := os.ReadFile(filepath.Join(root, "service.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := codeStore.UpsertSymbols(symbol.Path, codeindex.FileHash(fileContent), []codeindex.Symbol{symbol}, 0, fakeCodeEmbed); err != nil {
+		codeStore.Close()
+		t.Fatal(err)
+	}
+	if err := codeStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	discoveryPath := daemonSmokeDiscoveryPath(environmentRoot, runtime.GOOS)
+	stdout, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "start")
+	if err != nil {
+		t.Fatalf("daemon start: %v: %s", err, stderr)
+	}
+	daemonPID, err := strconv.Atoi(strings.TrimSpace(stdout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	discovery, err := readDaemonDiscovery(discoveryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := strings.TrimPrefix(discovery.Endpoint, "http://")
+	stopped := false
+	t.Cleanup(func() {
+		if stopped {
+			return
+		}
+		_, _, _ = runBuiltRagrep(executable, packageDir, environment, "daemon", "stop")
+		_ = waitForDaemonSmokeCleanup(daemonPID, address, 3*time.Second)
+	})
+	if _, stderr, err := runBuiltRagrep(executable, packageDir, environment, "workspace", "add", root); err != nil {
+		t.Fatalf("workspace add: %v: %s", err, stderr)
+	}
+
+	command := exec.Command(executable, "mcp", "serve")
+	command.Dir, command.Env = root, environment
+	var mcpStderr bytes.Buffer
+	command.Stderr = &mcpStderr
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := mcp.NewClient(&mcp.Implementation{Name: "ragrep-smoke", Version: "1"}, nil)
+	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: command, TerminateDuration: time.Second}, nil)
+	if err != nil {
+		t.Fatalf("MCP connect: %v: %s", err, mcpStderr.String())
+	}
+	t.Cleanup(func() {
+		_ = session.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for command.ProcessState == nil && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+		}
+	})
+	callMCPTool(t, ctx, session, "add_document", map[string]any{"path": "notes/mcp.md", "content": "old MCP marker"})
+	search := callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "old MCP marker", "mode": "text"})
+	var searched mcpToolOutput[searchDocumentsData]
+	decodeMCPStructured(t, search, &searched)
+	if searched.Data == nil || len(searched.Data.Hits) != 1 {
+		t.Fatalf("document search=%+v", searched)
+	}
+	callMCPTool(t, ctx, session, "read_document", map[string]any{"path": "notes/mcp.md"})
+	if err := os.WriteFile(filepath.Join(root, "notes", "mcp.md"), []byte("new MCP marker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	callMCPTool(t, ctx, session, "reindex_documents", map[string]any{"paths": []string{"notes/mcp.md"}})
+	callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "new MCP marker", "mode": "text"})
+
+	codeSearch := callMCPTool(t, ctx, session, "search_code", map[string]any{"query": "MCPFixture", "mode": "text"})
+	var codeHits mcpToolOutput[searchCodeData]
+	decodeMCPStructured(t, codeSearch, &codeHits)
+	if codeHits.Data == nil || len(codeHits.Data.Hits) == 0 {
+		t.Fatalf("code search=%+v", codeHits)
+	}
+	key := codeHits.Data.Hits[0].Key
+	callMCPTool(t, ctx, session, "read_code_symbol", map[string]any{"key": key})
+	callMCPTool(t, ctx, session, "inspect_code_relation", map[string]any{"key": key, "relation": "tests"})
+	contextResult := callMCPTool(t, ctx, session, "build_code_context", map[string]any{"query": "MCPFixture", "selected_keys": []string{key}})
+	var built mcpToolOutput[buildCodeContextData]
+	decodeMCPStructured(t, contextResult, &built)
+	if built.Data == nil {
+		t.Fatal("build_code_context returned no data")
+	}
+	callMCPTool(t, ctx, session, "verify_code_context", map[string]any{"manifest": built.Data.Manifest})
+
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !daemonSmokeProcessRunning(daemonPID) {
+		t.Fatal("closing MCP stopped the shared daemon")
+	}
+	stopDaemonDocumentSmoke(t, executable, packageDir, environment, discoveryPath, daemonPID, address)
+	stopped = true
+	if mcpStderr.Len() != 0 {
+		t.Fatalf("MCP stderr=%q", mcpStderr.String())
+	}
+}
+
+func callMCPTool(t *testing.T, ctx context.Context, session *mcp.ClientSession, name string, arguments any) *mcp.CallToolResult {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: arguments})
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if result.IsError {
+		encoded, _ := json.Marshal(result)
+		t.Fatalf("%s returned tool error: %s", name, encoded)
+	}
+	return result
+}
+
+func decodeMCPStructured(t *testing.T, result *mcp.CallToolResult, destination any) {
+	t.Helper()
+	data, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, destination); err != nil {
+		t.Fatalf("decode structured result: %v: %s", err, data)
+	}
+}
 
 // End-to-end: index a small corpus and search it with the real model.
 // Skips when model assets are not cached (run 'ragrep init' first).

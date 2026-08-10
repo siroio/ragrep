@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/siroio/ragrep/internal/store"
@@ -128,6 +132,105 @@ func TestRunMCPServerPropagatesCancellation(t *testing.T) {
 	err := runMCPServer(ctx, serverTransport, newMCPBaseServer())
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("runMCPServer error = %v, want context.Canceled", err)
+	}
+}
+
+func TestServeMCPListsExactlyNineToolsAndStopsOnDisconnect(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	exited := make(chan error, 1)
+	go func() {
+		exited <- serveMCP(ctx, root, serverTransport, mcpBackends{
+			Documents: productionMCPBackend{}, Mutations: productionMCPBackend{},
+			Code: productionMCPBackend{}, Context: productionMCPBackend{},
+		})
+	}()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(tools.Tools); got != 9 {
+		t.Fatalf("tool count=%d, want 9", got)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-exited:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serveMCP exit: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("serveMCP did not stop after disconnect")
+	}
+}
+
+func TestMCPCommandTransportListsToolsAndCallsTextSearch(t *testing.T) {
+	root := testWorkspaceRoot(t)
+	if err := os.WriteFile(filepath.Join(root, ".ragrep", "index.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	packageDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(t.TempDir(), "ragrep-mcp")
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	build := exec.Command("go", "build", "-o", exe, ".")
+	build.Dir = packageDir
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	var stderr bytes.Buffer
+	command := exec.Command(exe, "mcp", "serve")
+	command.Dir = root
+	command.Env = isolatedDaemonEnvironment(t.TempDir())
+	command.Stderr = &stderr
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := mcp.NewClient(&mcp.Implementation{Name: "smoke", Version: "1"}, nil)
+	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: command, TerminateDuration: time.Second}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v; stderr=%s", err, stderr.String())
+	}
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(tools.Tools); got != 9 {
+		t.Fatalf("tool count=%d, want 9", got)
+	}
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "search_documents", Arguments: map[string]any{"query": "safe", "mode": "text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError {
+		t.Fatal("text search without daemon unexpectedly succeeded")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for command.ProcessState == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if command.ProcessState == nil {
+		_ = command.Process.Kill()
+		t.Fatal("MCP process did not exit after client disconnect")
+	}
+	if strings.Contains(stderr.String(), "initialized") || strings.Contains(stderr.String(), "indexed") {
+		t.Fatalf("MCP startup emitted CLI summary: %q", stderr.String())
 	}
 }
 

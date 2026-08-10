@@ -109,6 +109,37 @@ ragrep code verify --manifest pack.json --json          # manifestの陳腐化�
   起動される。未登録の言語や存在しないコマンドはエラーになり、自動ダウンロード・
   インストールは一切行わない（セキュリティ上、明示的な設定が必須）。
 
+## MCP server
+
+ローカルstdio MCPに対応したクライアントでは、次のように設定する。クライアントごとに
+設定名は異なるが、command・args・cwdの意味は同じである。
+
+```json
+{
+  "mcpServers": {
+    "ragrep": {
+      "command": "ragrep",
+      "args": ["mcp", "serve"],
+      "cwd": "/absolute/path/to/workspace"
+    }
+  }
+}
+```
+
+`cwd` が既定のワークスペースになり、各toolの `root` は別ワークスペースを明示するとき
+だけ使う。事前に `ragrep init` と文書・コードの索引を済ませ、共有daemonを起動しておく。
+MCP server自身はポートを開かず、次の9 toolだけをstdioで公開する。
+
+1. `search_documents` → `read_document` で必要な文書だけ読む
+2. 明示的に作成を頼まれた場合だけ `add_document` を使う
+3. 文書を外部編集した後は `reindex_documents` → 再検索する
+4. `search_code` → `read_code_symbol` → 必要なら `inspect_code_relation` と進む
+5. `build_code_context` の結果は、利用直前に `verify_code_context` で検証する
+
+`add_document` は新規作成専用で上書きしない。`reindex_documents` は指定パスを再索引する
+だけで削除済み文書をpruneしない。コード索引の更新はMCPから行わず、従来どおり
+`ragrep code index` を使う。
+
 ## 精度評価 (ragrep eval)
 
 `ragrep eval` はJSONL形式のクエリ→正解ドキュメントのペアを実行し、recall@kを測定する。

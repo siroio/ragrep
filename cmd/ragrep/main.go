@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/siroio/ragrep/internal/config"
 	"github.com/siroio/ragrep/internal/embed"
 	"github.com/siroio/ragrep/internal/store"
@@ -30,6 +31,7 @@ Usage:
   ragrep add [--tag t]... <path>            (reads content from stdin)
   ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
   ragrep code index|search|get|expand|pack|verify ...  code symbol indexing/search (see 'ragrep code -h')
+  ragrep mcp serve                         serve nine MCP tools over stdio
   ragrep daemon start|stop|status|serve
   ragrep workspace add|remove|list [path]
 
@@ -83,6 +85,8 @@ func run(args []string) int {
 		return cmdEval(rest)
 	case "code":
 		return cmdCode(rest)
+	case "mcp":
+		return cmdMCP(rest)
 	case "daemon":
 		return cmdDaemon(rest)
 	case "workspace":
@@ -91,6 +95,33 @@ func run(args []string) int {
 		fmt.Fprint(os.Stderr, usage)
 		return 1
 	}
+}
+
+const mcpUsage = `Usage:
+  ragrep mcp serve
+`
+
+func cmdMCP(args []string) int {
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
+		fmt.Fprint(os.Stderr, mcpUsage)
+		return 0
+	}
+	if len(args) != 1 || args[0] != "serve" {
+		fmt.Fprint(os.Stderr, mcpUsage)
+		return 1
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fail(err)
+	}
+	err = serveMCP(context.Background(), cwd, &mcp.StdioTransport{}, mcpBackends{
+		Documents: productionMCPBackend{}, Mutations: productionMCPBackend{},
+		Code: productionMCPBackend{}, Context: productionMCPBackend{},
+	})
+	if err != nil {
+		return fail(err)
+	}
+	return 0
 }
 
 func dbFlag(fs *flag.FlagSet) *string {

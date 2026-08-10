@@ -355,6 +355,25 @@ func TestRunDaemonAndWorkspaceTopLevelExitCodes(t *testing.T) {
 	}
 }
 
+func TestCmdMCPAcceptsOnlyServeAndHelp(t *testing.T) {
+	for _, args := range [][]string{{}, {"unknown"}, {"serve", "extra"}} {
+		if code := cmdMCP(args); code != 1 {
+			t.Fatalf("cmdMCP(%q) exit=%d, want 1", args, code)
+		}
+	}
+	for _, args := range [][]string{{"-h"}, {"--help"}, {"help"}} {
+		if code := cmdMCP(args); code != 0 {
+			t.Fatalf("cmdMCP(%q) exit=%d, want 0", args, code)
+		}
+	}
+}
+
+func TestRunDispatchesMCPHelp(t *testing.T) {
+	if code := run([]string{"mcp", "help"}); code != 0 {
+		t.Fatalf("mcp help exit=%d, want 0", code)
+	}
+}
+
 func TestRunWorkspaceCleanNegativeExitsTwo(t *testing.T) {
 	cache := t.TempDir()
 	t.Setenv("LOCALAPPDATA", cache)
