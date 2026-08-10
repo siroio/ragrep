@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -19,6 +21,9 @@ type documentIndexRequest struct {
 	Paths       []string
 	Prune       bool
 	IncludeCode bool
+
+	displayPaths []string
+	beforeRead   func(string)
 }
 
 type documentIndexResult struct {
@@ -32,32 +37,44 @@ type documentIndexResult struct {
 }
 
 type documentIndexEvent struct {
-	line   string
+	text   string
 	stderr bool
+	raw    bool
 }
 
 func (r *documentIndexResult) addWarning(warning string) {
 	r.Warnings = append(r.Warnings, warning)
-	r.events = append(r.events, documentIndexEvent{line: warning, stderr: true})
+	r.events = append(r.events, documentIndexEvent{text: warning, stderr: true})
 }
 
 func (r *documentIndexResult) addIndexed(path string) {
 	r.Indexed++
-	r.events = append(r.events, documentIndexEvent{line: "indexed " + path})
+	r.events = append(r.events, documentIndexEvent{text: "indexed " + path})
 }
 
 func (r *documentIndexResult) addPruned(path string) {
 	r.prunedPaths = append(r.prunedPaths, path)
-	r.events = append(r.events, documentIndexEvent{line: "pruned " + path})
+	r.events = append(r.events, documentIndexEvent{text: "pruned " + path})
+}
+
+func (r *documentIndexResult) addStderr(output string) {
+	if output != "" {
+		r.events = append(r.events, documentIndexEvent{text: output, stderr: true, raw: true})
+	}
 }
 
 type confinedDocumentRoot struct {
-	path string
-	root *os.Root
+	logicalPath string
+	path        string
+	root        *os.Root
 }
 
 func openConfinedDocumentRoot(path string) (*confinedDocumentRoot, error) {
-	evaluated, err := filepath.EvalSymlinks(path)
+	logical, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	evaluated, err := filepath.EvalSymlinks(logical)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +86,7 @@ func openConfinedDocumentRoot(path string) (*confinedDocumentRoot, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &confinedDocumentRoot{path: evaluated, root: root}, nil
+	return &confinedDocumentRoot{logicalPath: logical, path: evaluated, root: root}, nil
 }
 
 func (r *confinedDocumentRoot) validateExisting(path string) error {
@@ -106,8 +123,14 @@ type addDocumentResult struct {
 }
 
 type addDocumentDeps struct {
-	Index  func(context.Context, string, string, string, int64) error
-	Remove func(string) error
+	Index        func(context.Context, string, string, string, int64) error
+	Remove       func(string) error
+	beforeCreate func()
+}
+
+type documentWalkRoot struct {
+	absolute string
+	display  string
 }
 
 func runDocumentIndex(ctx context.Context, request documentIndexRequest) (documentIndexResult, error) {
@@ -128,7 +151,7 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 	}
 	defer confinedRoot.root.Close()
 
-	paths := make([]string, len(request.Paths))
+	paths := make([]documentWalkRoot, len(request.Paths))
 	normRoots := make([]string, len(request.Paths))
 	for i, requested := range request.Paths {
 		absolute, err := filepath.Abs(requested)
@@ -142,7 +165,11 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 		if err != nil {
 			return result, documentPathOutsideError(requested, root)
 		}
-		paths[i] = absolute
+		display := requested
+		if len(request.displayPaths) == len(request.Paths) {
+			display = request.displayPaths[i]
+		}
+		paths[i] = documentWalkRoot{absolute: absolute, display: display}
 	}
 
 	s, err := openStoreAt(request.DB)
@@ -167,7 +194,7 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 	}
 
 	for _, walkRoot := range paths {
-		err := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		err := filepath.WalkDir(walkRoot.absolute, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
@@ -179,42 +206,54 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 			}
 			name := d.Name()
 			if d.IsDir() {
-				if strings.HasPrefix(name, ".") && path != walkRoot {
+				if strings.HasPrefix(name, ".") && path != walkRoot.absolute {
 					return filepath.SkipDir
 				}
 				return nil
+			}
+			rel, err := normPath(path, root)
+			if err != nil {
+				return err
+			}
+			displayPath, err := documentDisplayPath(walkRoot, path)
+			if err != nil {
+				return err
 			}
 			if !request.IncludeCode && codeExtensions[strings.ToLower(filepath.Ext(name))] {
 				result.Excluded++
 				return nil
 			}
+			if request.beforeRead != nil {
+				request.beforeRead(rel)
+			}
+			safePath := filepath.FromSlash(rel)
 			if argv := cfg.ConverterFor(strings.ToLower(filepath.Ext(name))); argv != nil {
-				raw, err := os.ReadFile(path)
+				raw, err := confinedRoot.root.ReadFile(safePath)
 				if err != nil {
-					result.addWarning(fmt.Sprintf("warning: reading %s: %v", path, err))
+					result.addWarning(fmt.Sprintf("warning: reading %s: %v", displayPath, err))
 					result.Skipped++
 					return nil
 				}
-				rel, err := normPath(path, root)
-				if err != nil {
-					return err
-				}
 				srcHash := store.HashContent(string(raw))
 				if old, _ := s.DocHash(rel); old == srcHash {
-					if info, err := d.Info(); err == nil {
+					if info, err := confinedRoot.root.Stat(safePath); err == nil {
 						if err := s.TouchDoc(rel, info.ModTime().Unix()); err != nil {
 							return err
 						}
 					}
 					return nil
 				}
-				text, err := runConverter(argv, path)
+				text, converterStderr, err := runDocumentConverterSnapshot(ctx, argv, displayPath, raw)
+				result.addStderr(converterStderr)
 				if err != nil {
-					result.addWarning(fmt.Sprintf("warning: convert %s: %v", path, err))
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					result.addWarning(fmt.Sprintf("warning: convert %s: %v", displayPath, err))
 					result.Skipped++
 					return nil
 				}
-				info, err := d.Info()
+				info, err := confinedRoot.root.Stat(safePath)
 				if err != nil {
 					return err
 				}
@@ -228,18 +267,21 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 				return nil
 			}
 
-			info, err := d.Info()
-			if err != nil || info.Size() > maxFileSize || !isTextFile(path) {
+			info, err := confinedRoot.root.Stat(safePath)
+			if err != nil {
+				return err
+			}
+			if info.Size() > maxFileSize {
 				result.Skipped++
 				return nil
 			}
-			data, err := os.ReadFile(path)
+			data, err := confinedRoot.root.ReadFile(safePath)
 			if err != nil {
 				return err
 			}
-			rel, err := normPath(path, root)
-			if err != nil {
-				return err
+			if !isTextDocument(data) {
+				result.Skipped++
+				return nil
 			}
 			changed, err := s.UpsertDoc(rel, string(data), info.ModTime().Unix(), e.Embed)
 			if err != nil {
@@ -274,7 +316,7 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 			if !underRoot {
 				continue
 			}
-			_, statErr := os.Stat(filepath.Join(root, filepath.FromSlash(p)))
+			_, statErr := confinedRoot.root.Stat(filepath.FromSlash(p))
 			doPrune, err := pruneDecision(statErr)
 			if err != nil {
 				return result, err
@@ -291,7 +333,74 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 	return result, nil
 }
 
+func documentDisplayPath(root documentWalkRoot, absolute string) (string, error) {
+	rel, err := filepath.Rel(root.absolute, absolute)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." {
+		return root.display, nil
+	}
+	return filepath.Join(root.display, rel), nil
+}
+
+func isTextDocument(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	limit := min(len(data), 8192)
+	return !bytes.ContainsRune(data[:limit], 0)
+}
+
+func runDocumentConverterSnapshot(ctx context.Context, argv []string, displayPath string, raw []byte) (text, stderr string, err error) {
+	snapshot, err := os.CreateTemp("", "ragrep-converter-*"+filepath.Ext(displayPath))
+	if err != nil {
+		return "", "", err
+	}
+	snapshotPath := snapshot.Name()
+	defer os.Remove(snapshotPath)
+	if _, err := snapshot.Write(raw); err != nil {
+		snapshot.Close()
+		return "", "", sanitizedDocumentConverterError(err, snapshotPath, displayPath)
+	}
+	if err := snapshot.Close(); err != nil {
+		return "", "", sanitizedDocumentConverterError(err, snapshotPath, displayPath)
+	}
+	args := make([]string, len(argv)-1)
+	for i, arg := range argv[1:] {
+		args[i] = strings.ReplaceAll(arg, "{input}", snapshotPath)
+	}
+	var stdout, stderrBuffer bytes.Buffer
+	cmd := exec.CommandContext(ctx, argv[0], args...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderrBuffer
+	err = cmd.Run()
+	text = strings.ReplaceAll(stdout.String(), snapshotPath, displayPath)
+	stderr = strings.ReplaceAll(stderrBuffer.String(), snapshotPath, displayPath)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return text, stderr, ctxErr
+	}
+	return text, stderr, sanitizedDocumentConverterError(err, snapshotPath, displayPath)
+}
+
+func sanitizedDocumentConverterError(err error, snapshotPath, displayPath string) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), snapshotPath, displayPath))
+}
+
 func resolveDocumentWritePath(root, requested string) (absolute, key string, err error) {
+	confinedRoot, err := openConfinedDocumentRoot(root)
+	if err != nil {
+		return "", "", err
+	}
+	defer confinedRoot.root.Close()
+	return resolveDocumentWritePathAt(confinedRoot, requested)
+}
+
+func resolveDocumentWritePathAt(confinedRoot *confinedDocumentRoot, requested string) (absolute, key string, err error) {
+	root := confinedRoot.logicalPath
 	if strings.TrimSpace(requested) == "" || filepath.IsAbs(requested) {
 		return "", "", mcpInvalidArgument()
 	}
@@ -302,20 +411,11 @@ func resolveDocumentWritePath(root, requested string) (absolute, key string, err
 	if codeExtensions[strings.ToLower(filepath.Ext(clean))] {
 		return "", "", mcpInvalidArgument()
 	}
-	root, err = filepath.Abs(root)
-	if err != nil {
-		return "", "", err
-	}
 	absolute = filepath.Join(root, clean)
 	key, err = normPath(absolute, root)
 	if err != nil {
 		return "", "", documentPathOutsideError(requested, root)
 	}
-	confinedRoot, err := openConfinedDocumentRoot(root)
-	if err != nil {
-		return "", "", err
-	}
-	defer confinedRoot.root.Close()
 	parent := filepath.Dir(absolute)
 	for {
 		evaluatedParent, evalErr := filepath.EvalSymlinks(parent)
@@ -342,7 +442,12 @@ func runAddDocument(ctx context.Context, request addDocumentRequest, deps addDoc
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	absolute, key, err := resolveDocumentWritePath(request.Root, request.Path)
+	confinedRoot, err := openConfinedDocumentRoot(request.Root)
+	if err != nil {
+		return result, err
+	}
+	defer confinedRoot.root.Close()
+	_, key, err := resolveDocumentWritePathAt(confinedRoot, request.Path)
 	if err != nil {
 		return result, err
 	}
@@ -358,18 +463,22 @@ func runAddDocument(ctx context.Context, request addDocumentRequest, deps addDoc
 	if len(content) > maxFileSize {
 		return result, mcpInvalidArgument()
 	}
-	if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
+	safePath := filepath.FromSlash(key)
+	if err := confinedRoot.root.MkdirAll(filepath.Dir(safePath), 0o755); err != nil {
 		return result, err
 	}
-	checkedAbsolute, checkedKey, err := resolveDocumentWritePath(request.Root, request.Path)
+	_, checkedKey, err := resolveDocumentWritePathAt(confinedRoot, request.Path)
 	if err != nil {
 		return result, err
 	}
-	if checkedAbsolute != absolute || checkedKey != key {
+	if checkedKey != key {
 		return result, documentPathOutsideError(request.Path, request.Root)
 	}
+	if deps.beforeCreate != nil {
+		deps.beforeCreate()
+	}
 
-	f, err := os.OpenFile(absolute, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := confinedRoot.root.OpenFile(safePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if errors.Is(err, os.ErrExist) {
 		return result, documentMutationError("already_exists", fmt.Sprintf("%s already exists", key))
 	}
@@ -378,10 +487,10 @@ func runAddDocument(ctx context.Context, request addDocumentRequest, deps addDoc
 	}
 	remove := deps.Remove
 	if remove == nil {
-		remove = os.Remove
+		remove = func(path string) error { return confinedRoot.root.Remove(filepath.FromSlash(path)) }
 	}
 	rollback := func(cause error) error {
-		if removeErr := remove(absolute); removeErr != nil {
+		if removeErr := remove(key); removeErr != nil {
 			return documentMutationError("partial_failure", fmt.Sprintf("failed to roll back %s after %v: %v", key, cause, removeErr))
 		}
 		return cause
@@ -393,7 +502,7 @@ func runAddDocument(ctx context.Context, request addDocumentRequest, deps addDoc
 	if err := f.Close(); err != nil {
 		return result, rollback(err)
 	}
-	info, err := os.Stat(absolute)
+	info, err := confinedRoot.root.Stat(safePath)
 	if err != nil {
 		return result, rollback(err)
 	}

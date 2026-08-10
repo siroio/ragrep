@@ -319,9 +319,13 @@ func cmdIndex(args []string) int {
 	})
 	for _, event := range result.events {
 		if event.stderr {
-			fmt.Fprintln(os.Stderr, event.line)
+			if event.raw {
+				fmt.Fprint(os.Stderr, event.text)
+			} else {
+				fmt.Fprintln(os.Stderr, event.text)
+			}
 		} else {
-			fmt.Fprintln(os.Stdout, event.line)
+			fmt.Fprintln(os.Stdout, event.text)
 		}
 	}
 	if err != nil {

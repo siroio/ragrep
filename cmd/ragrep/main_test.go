@@ -1045,9 +1045,12 @@ func TestCmdIndexPreservesIndexedAndWarningOutputOrder(t *testing.T) {
 		t.Fatalf("index exit=%d, want 0; output=%s", code, output)
 	}
 	indexedAt := strings.Index(string(output), "indexed a.md")
-	warningAt := strings.Index(string(output), "warning: convert ")
+	warningAt := strings.Index(string(output), "warning: convert b.bad:")
 	if indexedAt < 0 || warningAt < 0 || indexedAt > warningAt {
 		t.Fatalf("output order changed; want indexed a.md before converter warning:\n%s", output)
+	}
+	if strings.Contains(string(output), root) {
+		t.Fatalf("relative index warning leaked absolute workspace path:\n%s", output)
 	}
 }
 

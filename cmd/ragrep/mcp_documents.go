@@ -288,7 +288,9 @@ func (productionMCPBackend) ReindexDocuments(ctx context.Context, ws mcpWorkspac
 			paths[i] = filepath.Join(ws.Root, filepath.FromSlash(path))
 		}
 	}
-	return runDocumentIndex(ctx, documentIndexRequest{DB: ws.DocumentDB, Paths: paths, Prune: false, IncludeCode: false})
+	return runDocumentIndex(ctx, documentIndexRequest{
+		DB: ws.DocumentDB, Paths: paths, Prune: false, IncludeCode: false, displayPaths: input.Paths,
+	})
 }
 
 func documentSearchDataFromHits(hits []store.Hit) searchDocumentsData {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,9 +11,37 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/siroio/ragrep/internal/store"
 )
+
+func TestDocumentConverterSnapshotHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_DOCUMENT_CONVERTER") != "1" {
+		return
+	}
+	input := os.Args[len(os.Args)-1]
+	if record := os.Getenv("DOCUMENT_CONVERTER_RECORD"); record != "" {
+		if err := os.WriteFile(record, []byte(input), 0o600); err != nil {
+			os.Exit(4)
+		}
+	}
+	if os.Getenv("DOCUMENT_CONVERTER_SLEEP") == "1" {
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	}
+	data, err := os.ReadFile(input)
+	if err != nil {
+		os.Exit(5)
+	}
+	fmt.Printf("input=%s;ext=%s;data=%s", input, filepath.Ext(input), data)
+	fmt.Fprintln(os.Stderr, "stderr-input="+input)
+	os.Exit(0)
+}
+
+func documentConverterTestArgv() []string {
+	return []string{os.Args[0], "-test.run=TestDocumentConverterSnapshotHelper", "--", "{input}"}
+}
 
 func mutationErrorCode(err error) string {
 	var domain *mcpDomainError
@@ -182,6 +211,55 @@ func TestRunAddDocumentRollsBackOnlyNewFile(t *testing.T) {
 	}
 }
 
+func TestRunAddDocumentDoesNotCreateThroughSwappedAncestor(t *testing.T) {
+	root, db := newDocumentMutationWorkspace(t)
+	if err := os.Mkdir(filepath.Join(root, "notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	_, err := runAddDocument(context.Background(), addDocumentRequest{DB: db, Root: root, Path: "notes/safe.md", Content: "workspace"}, addDocumentDeps{
+		beforeCreate: func() {
+			if err := os.Rename(filepath.Join(root, "notes"), filepath.Join(root, "moved")); err != nil {
+				t.Fatal(err)
+			}
+			makeDocumentDirectoryLink(t, filepath.Join(root, "notes"), out)
+		},
+	})
+	if err == nil {
+		t.Fatal("add through swapped ancestor succeeded; want confinement error")
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "safe.md")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("add wrote outside retained root: %v", statErr)
+	}
+}
+
+func TestRunAddDocumentRollbackDoesNotRemoveThroughSwappedAncestor(t *testing.T) {
+	root, db := newDocumentMutationWorkspace(t)
+	out := t.TempDir()
+	outsidePath := filepath.Join(out, "safe.md")
+	if err := os.WriteFile(outsidePath, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runAddDocument(context.Background(), addDocumentRequest{DB: db, Root: root, Path: "notes/safe.md", Content: "workspace"}, addDocumentDeps{
+		Index: func(context.Context, string, string, string, int64) error {
+			if err := os.Rename(filepath.Join(root, "notes"), filepath.Join(root, "moved")); err != nil {
+				t.Fatal(err)
+			}
+			makeDocumentDirectoryLink(t, filepath.Join(root, "notes"), out)
+			return errors.New("index failed")
+		},
+	})
+	if got := mutationErrorCode(err); got != "partial_failure" {
+		t.Fatalf("rollback after ancestor swap error = %v (code %q), want partial_failure", err, got)
+	}
+	if content, readErr := os.ReadFile(outsidePath); readErr != nil || string(content) != "outside" {
+		t.Fatalf("rollback touched outside file: content=%q error=%v", content, readErr)
+	}
+	if content, readErr := os.ReadFile(filepath.Join(root, "moved", "safe.md")); readErr != nil || string(content) != "workspace" {
+		t.Fatalf("original created file should remain after failed confined rollback: content=%q error=%v", content, readErr)
+	}
+}
+
 func TestRunAddDocumentRollbackFailureIsPartialFailure(t *testing.T) {
 	root, db := newDocumentMutationWorkspace(t)
 	path := filepath.Join("notes", "partial.md")
@@ -224,6 +302,98 @@ func TestRunDocumentIndexRejectsOutsideRootLinkBeforeMutation(t *testing.T) {
 	}
 	if _, err := os.Stat(db); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("linked root mutated DB before rejection: %v", err)
+	}
+}
+
+func TestRunDocumentIndexDoesNotReadThroughSwappedAncestor(t *testing.T) {
+	root, db := newDocumentMutationWorkspace(t)
+	if err := os.Mkdir(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "docs", "safe.md"), []byte("workspace"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "safe.md"), []byte("outside secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runDocumentIndex(context.Background(), documentIndexRequest{
+		DB: db, Paths: []string{filepath.Join(root, "docs", "safe.md")},
+		beforeRead: func(string) {
+			if err := os.Rename(filepath.Join(root, "docs"), filepath.Join(root, "moved")); err != nil {
+				t.Fatal(err)
+			}
+			makeDocumentDirectoryLink(t, filepath.Join(root, "docs"), out)
+		},
+	})
+	if err == nil {
+		t.Fatal("reindex through swapped ancestor succeeded; want confinement error")
+	}
+	s, openErr := store.Open(db)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer s.Close()
+	if _, getErr := s.GetDoc("docs/safe.md"); getErr != store.ErrNotFound {
+		t.Fatalf("reindex stored content after confined read failure: %v", getErr)
+	}
+}
+
+func TestRunDocumentConverterSnapshotPreservesDisplayPathExtensionAndCleansUp(t *testing.T) {
+	t.Setenv("GO_WANT_DOCUMENT_CONVERTER", "1")
+	record := filepath.Join(t.TempDir(), "snapshot-path.txt")
+	t.Setenv("DOCUMENT_CONVERTER_RECORD", record)
+	text, stderr, err := runDocumentConverterSnapshot(context.Background(), documentConverterTestArgv(), "docs/report.conv", []byte("source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "input=docs/report.conv;ext=.conv;data=source" {
+		t.Fatalf("converted text=%q, want caller-relative path and matching extension", text)
+	}
+	if stderr != "stderr-input=docs/report.conv\n" {
+		t.Fatalf("converter stderr=%q, want sanitized caller-relative path", stderr)
+	}
+	snapshot, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Ext(string(snapshot)) != ".conv" {
+		t.Fatalf("snapshot path=%q, want .conv extension", snapshot)
+	}
+	if _, err := os.Stat(string(snapshot)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("converter snapshot was not cleaned up: %v", err)
+	}
+}
+
+func TestRunDocumentConverterSnapshotHonorsCancellation(t *testing.T) {
+	t.Setenv("GO_WANT_DOCUMENT_CONVERTER", "1")
+	t.Setenv("DOCUMENT_CONVERTER_SLEEP", "1")
+	record := filepath.Join(t.TempDir(), "started.txt")
+	t.Setenv("DOCUMENT_CONVERTER_RECORD", record)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := runDocumentConverterSnapshot(ctx, documentConverterTestArgv(), "docs/report.conv", []byte("source"))
+		done <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(record); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("converter did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled converter error=%v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("converter ignored context cancellation")
 	}
 }
 
