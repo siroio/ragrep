@@ -58,20 +58,29 @@ func TestDaemonDocumentSearchRejectsUnauthorizedAndInvalidRequests(t *testing.T)
 		return nil, nil
 	}}
 	h := newDaemonHandlerWithDocuments(nil, service, "secret", nil, nil)
+	db := filepath.Join(t.TempDir(), "index.db")
+	jsonBody := func(t *testing.T, req daemonDocumentSearchRequest) string {
+		t.Helper()
+		body, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
 	for _, test := range []struct {
 		name, authorization, body string
 		wantStatus                int
 		wantCode                  string
 	}{
-		{"missing token", "", `{"db":"C:/index.db","query":"find","mode":"text","k":1}`, http.StatusUnauthorized, "unauthorized"},
-		{"wrong token", "Bearer wrong", `{"db":"C:/index.db","query":"find","mode":"text","k":1}`, http.StatusUnauthorized, "unauthorized"},
+		{"missing token", "", jsonBody(t, daemonDocumentSearchRequest{DB: db, Query: "find", Mode: "text", K: 1}), http.StatusUnauthorized, "unauthorized"},
+		{"wrong token", "Bearer wrong", jsonBody(t, daemonDocumentSearchRequest{DB: db, Query: "find", Mode: "text", K: 1}), http.StatusUnauthorized, "unauthorized"},
 		{"malformed JSON", "Bearer secret", `{"db":`, http.StatusBadRequest, "bad_request"},
-		{"trailing JSON", "Bearer secret", `{"db":"C:/index.db","query":"find","mode":"text","k":1} trailing`, http.StatusBadRequest, "bad_request"},
-		{"relative database", "Bearer secret", `{"db":"index.db","query":"find","mode":"text","k":1}`, http.StatusBadRequest, "bad_request"},
-		{"empty database", "Bearer secret", `{"db":"","query":"find","mode":"text","k":1}`, http.StatusBadRequest, "bad_request"},
-		{"empty query", "Bearer secret", `{"db":"C:/index.db","query":"","mode":"text","k":1}`, http.StatusBadRequest, "bad_request"},
-		{"unsupported mode", "Bearer secret", `{"db":"C:/index.db","query":"find","mode":"auto","k":1}`, http.StatusBadRequest, "bad_request"},
-		{"nonpositive k", "Bearer secret", `{"db":"C:/index.db","query":"find","mode":"text","k":0}`, http.StatusBadRequest, "bad_request"},
+		{"trailing JSON", "Bearer secret", jsonBody(t, daemonDocumentSearchRequest{DB: db, Query: "find", Mode: "text", K: 1}) + " trailing", http.StatusBadRequest, "bad_request"},
+		{"relative database", "Bearer secret", jsonBody(t, daemonDocumentSearchRequest{DB: "index.db", Query: "find", Mode: "text", K: 1}), http.StatusBadRequest, "bad_request"},
+		{"empty database", "Bearer secret", jsonBody(t, daemonDocumentSearchRequest{Query: "find", Mode: "text", K: 1}), http.StatusBadRequest, "bad_request"},
+		{"empty query", "Bearer secret", jsonBody(t, daemonDocumentSearchRequest{DB: db, Mode: "text", K: 1}), http.StatusBadRequest, "bad_request"},
+		{"unsupported mode", "Bearer secret", jsonBody(t, daemonDocumentSearchRequest{DB: db, Query: "find", Mode: "auto", K: 1}), http.StatusBadRequest, "bad_request"},
+		{"nonpositive k", "Bearer secret", jsonBody(t, daemonDocumentSearchRequest{DB: db, Query: "find", Mode: "text"}), http.StatusBadRequest, "bad_request"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/v1/search", strings.NewReader(test.body))
@@ -91,8 +100,9 @@ func TestDaemonDocumentSearchRejectsUnauthorizedAndInvalidRequests(t *testing.T)
 
 func TestDaemonDocumentSearchPropagatesRequestAndHits(t *testing.T) {
 	want := []store.Hit{{Doc: "notes/result.md", Para: 2, Snippet: "matched", Score: 0.75}}
+	db := filepath.Join(t.TempDir(), "index.db")
 	h := newDaemonHandlerWithDocuments(nil, fakeDaemonDocumentService{search: func(_ context.Context, req documentSearchRequest) ([]store.Hit, error) {
-		if !reflect.DeepEqual(req, documentSearchRequest{DB: `C:\docs\index.db`, Query: "find this", Mode: "hybrid", K: 3, Tags: []string{"guide", "api"}}) {
+		if !reflect.DeepEqual(req, documentSearchRequest{DB: db, Query: "find this", Mode: "hybrid", K: 3, Tags: []string{"guide", "api"}}) {
 			t.Fatalf("request=%+v", req)
 		}
 		return want, nil
@@ -100,7 +110,7 @@ func TestDaemonDocumentSearchPropagatesRequestAndHits(t *testing.T) {
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 	client := daemonClient{endpoint: ts.URL, token: "secret", client: ts.Client()}
-	hits, err := client.SearchDocuments(context.Background(), documentSearchRequest{DB: `C:\docs\index.db`, Query: "find this", Mode: "hybrid", K: 3, Tags: []string{"guide", "api"}})
+	hits, err := client.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "find this", Mode: "hybrid", K: 3, Tags: []string{"guide", "api"}})
 	if err != nil || len(hits) != 1 || hits[0] != want[0] {
 		t.Fatalf("hits=%+v err=%v", hits, err)
 	}
@@ -112,7 +122,7 @@ func TestDaemonDocumentSearchPreservesTypedErrors(t *testing.T) {
 	}}, "secret", nil, nil)
 	ts := httptest.NewServer(h)
 	defer ts.Close()
-	_, err := (daemonClient{endpoint: ts.URL, token: "secret", client: ts.Client()}).SearchDocuments(context.Background(), documentSearchRequest{DB: `C:\docs\index.db`, Query: "find", Mode: "text", K: 1})
+	_, err := (daemonClient{endpoint: ts.URL, token: "secret", client: ts.Client()}).SearchDocuments(context.Background(), documentSearchRequest{DB: filepath.Join(t.TempDir(), "index.db"), Query: "find", Mode: "text", K: 1})
 	var apiErr *apiError
 	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" || apiErr.Retryable {
 		t.Fatalf("error=%T %v", err, err)
