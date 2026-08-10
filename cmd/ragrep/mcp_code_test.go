@@ -140,7 +140,7 @@ func TestSearchCodeProductionBackendPropagatesExactDaemonRequestAndTypedError(t 
 	if err := os.WriteFile(db, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	want := searchRequest{Root: root, DB: db, Query: "Needle", Mode: "hybrid", K: 7}
+	want := searchRequest{Root: root, DB: db, Query: "Needle", Mode: "hybrid", K: 10}
 	client := fakeCodeDaemonClient{search: func(ctx context.Context, got searchRequest) (searchResponse, error) {
 		if ctx.Value(codeContextKey{}) != "kept" || got != want {
 			t.Fatalf("context/request=%v %+v, want kept %+v", ctx.Value(codeContextKey{}), got, want)
@@ -149,7 +149,7 @@ func TestSearchCodeProductionBackendPropagatesExactDaemonRequestAndTypedError(t 
 	}}
 	injectCodeDaemonClient(t, &client)
 	ctx := context.WithValue(context.Background(), codeContextKey{}, "kept")
-	data, err := (productionMCPBackend{}).SearchCode(ctx, mcpWorkspace{Root: root, CodeDB: db}, searchCodeInput{Query: "Needle", Mode: "hybrid", Limit: 7})
+	data, err := (productionMCPBackend{}).SearchCode(ctx, mcpWorkspace{Root: root, CodeDB: db}, searchCodeInput{Query: "Needle", Mode: "hybrid", Limit: 10})
 	if err != nil || !data.Fresh || data.Generation != 9 || !data.UsedVector {
 		t.Fatalf("data=%+v error=%v", data, err)
 	}
@@ -221,6 +221,33 @@ func TestReadCodeSymbolProductionBackendPropagatesExactRequestAndBody(t *testing
 	data, err := (productionMCPBackend{}).ReadCodeSymbol(context.Background(), mcpWorkspace{Root: root, CodeDB: db}, readCodeSymbolInput{Key: sym.Key})
 	if err != nil || data.Symbol.Body != sym.Body {
 		t.Fatalf("data=%+v error=%v", data, err)
+	}
+}
+
+func TestCodeProductionBackendMapsMissingKeysToNotFound(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	db := filepath.Join(root, ".ragrep", "code.db")
+	if err := os.WriteFile(db, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	notFound := &apiError{Code: "not_found", Message: "private daemon path and key"}
+	injectCodeDaemonClient(t, fakeCodeDaemonClient{
+		get: func(context.Context, getRequest) (codeindex.Symbol, error) {
+			return codeindex.Symbol{}, notFound
+		},
+		expand: func(context.Context, expandRequest) ([]codeExpandTarget, error) {
+			return nil, notFound
+		},
+	})
+	tools := codeQueryTools{defaultRoot: root, backend: productionMCPBackend{}}
+
+	readResult, readOut, err := tools.readCodeSymbol(context.Background(), readCodeSymbolInput{Key: "missing-key"})
+	if err != nil || !readResult.IsError || readOut.Error == nil || readOut.Error.Code != "not_found" || readOut.Error.Message != "not found" {
+		t.Fatalf("read result=%+v output=%+v error=%v", readResult, readOut, err)
+	}
+	relationResult, relationOut, err := tools.inspectCodeRelation(context.Background(), inspectCodeRelationInput{Key: "missing-key", Relation: "references"})
+	if err != nil || !relationResult.IsError || relationOut.Error == nil || relationOut.Error.Code != "not_found" || relationOut.Error.Message != "not found" {
+		t.Fatalf("relation result=%+v output=%+v error=%v", relationResult, relationOut, err)
 	}
 }
 

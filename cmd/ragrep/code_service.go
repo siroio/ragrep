@@ -122,8 +122,10 @@ func (s *codeService) enableConfirmation(ws *workspaceState, db string) {
 
 func (s *codeService) searchSnapshot(ctx context.Context, ws *workspaceState, req searchRequest, generation uint64) (searchResponse, error) {
 	k := req.K
-	if k <= 0 || k > 5 {
+	if k <= 0 {
 		k = 5
+	} else if k > 10 {
+		k = 10
 	}
 	query, err := canonicalSearchQuery(ws, req.Query)
 	if err != nil {
@@ -243,7 +245,11 @@ func (s *codeService) Pack(ctx context.Context, req packRequest) (codePackOutput
 		return codePackOutput{}, err
 	}
 	defer unlock()
-	search, err := s.searchSnapshot(ctx, ws, searchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: "auto", K: req.K}, generation)
+	k := req.K
+	if k <= 0 || k > 5 {
+		k = 5
+	}
+	search, err := s.searchSnapshot(ctx, ws, searchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: "auto", K: k}, generation)
 	if err != nil {
 		return codePackOutput{}, err
 	}

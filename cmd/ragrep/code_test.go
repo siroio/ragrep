@@ -676,6 +676,26 @@ func TestCmdCodeSearchDaemonJSONDefaultsToAutoFive(t *testing.T) {
 	}
 }
 
+func TestCmdCodeSearchDaemonKeepsLegacyFiveResultCap(t *testing.T) {
+	for _, k := range []string{"0", "10"} {
+		t.Run(k, func(t *testing.T) {
+			root := t.TempDir()
+			db := filepath.Join(root, ".ragrep", "code.db")
+			client := fakeCodeDaemonClient{search: func(_ context.Context, req searchRequest) (searchResponse, error) {
+				if req.K != 5 {
+					t.Fatalf("request K=%d, want legacy cap 5", req.K)
+				}
+				return searchResponse{Hits: []codestore.SymbolHit{{Key: "key-1"}}, Fresh: true}, nil
+			}}
+			injectCodeDaemonClient(t, client)
+			code, _, stderr := captureCodeCommand(t, []string{"code", "search", "-k", k, "--db", db, "Foo"})
+			if code != 0 || stderr != "" {
+				t.Fatalf("exit=%d stderr=%q", code, stderr)
+			}
+		})
+	}
+}
+
 func TestCmdCodeSearchDaemonModes(t *testing.T) {
 	for _, mode := range []string{"auto", "text", "hybrid"} {
 		t.Run(mode, func(t *testing.T) {

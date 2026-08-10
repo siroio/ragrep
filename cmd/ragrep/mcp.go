@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/config"
 	"github.com/siroio/ragrep/internal/store"
 )
@@ -95,7 +96,7 @@ func classifyMCPError(err error) mcpFailure {
 		return mcpFailureForCode("workspace_syncing")
 	case errors.Is(err, ErrStaleLiveKey):
 		return mcpFailureForCode("stale_live_key")
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, codestore.ErrNotFound):
 		return mcpFailureForCode("not_found")
 	case errors.Is(err, os.ErrNotExist):
 		return mcpFailureForCode("daemon_unavailable")

@@ -65,12 +65,12 @@ func registerCodeQueryTools(server *mcp.Server, tools codeQueryTools) {
 		return tools.searchCode(ctx, input)
 	})
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "read_code_symbol", Description: "Read metadata and source body for a stable key returned by search_code.", Annotations: annotations,
+		Name: "read_code_symbol", Description: "Read a selected search_code candidate's body as evidence before answering or following relations.", Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input readCodeSymbolInput) (*mcp.CallToolResult, mcpToolOutput[readCodeSymbolData], error) {
 		return tools.readCodeSymbol(ctx, input)
 	})
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "inspect_code_relation", Description: "Inspect one definition, references, callers, callees, or tests relation for a code symbol.", Annotations: annotations,
+		Name: "inspect_code_relation", Description: "Inspect one needed relation, then read the selected target body with read_code_symbol.", Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input inspectCodeRelationInput) (*mcp.CallToolResult, mcpToolOutput[inspectCodeRelationData], error) {
 		return tools.inspectCodeRelation(ctx, input)
 	})

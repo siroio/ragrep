@@ -136,17 +136,29 @@ func TestCodeServiceSearchWaitsForBarrier(t *testing.T) {
 	}
 }
 
-func TestCodeServiceSearchDefaultsAndCapsKAtFive(t *testing.T) {
+func TestCodeServiceSearchDefaultsToFiveAndCapsKAtTen(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
-	for i := range 6 {
+	for i := range 12 {
 		ws.save(t, fmt.Sprintf("handler%d.go", i), fmt.Sprintf("package service\nfunc Handler%d() { CommonOperation() }", i))
 	}
 
-	for _, k := range []int{0, 99} {
-		resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "CommonOperation", K: k})
-		if err != nil || len(resp.Hits) != 5 {
-			t.Fatalf("K=%d hits=%d err=%v", k, len(resp.Hits), err)
+	for _, tc := range []struct{ k, want int }{{0, 5}, {99, 10}} {
+		resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "CommonOperation", K: tc.k})
+		if err != nil || len(resp.Hits) != tc.want {
+			t.Fatalf("K=%d hits=%d want=%d err=%v", tc.k, len(resp.Hits), tc.want, err)
 		}
+	}
+}
+
+func TestCodeServiceSearchReturnsTenWhenRequested(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	for i := range 12 {
+		ws.save(t, fmt.Sprintf("operation%d.go", i), fmt.Sprintf("package service\nfunc Operation%d() { SharedOperation() }", i))
+	}
+
+	resp, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "SharedOperation", K: 10})
+	if err != nil || len(resp.Hits) != 10 {
+		t.Fatalf("K=10 hits=%d err=%v", len(resp.Hits), err)
 	}
 }
 

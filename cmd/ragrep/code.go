@@ -454,6 +454,10 @@ func cmdCodeSearch(args []string) int {
 		return fail(fmt.Errorf("usage: ragrep code search [--json] [--mode auto|text|hybrid] [-k N] <query>"))
 	}
 	query := fs.Arg(0)
+	limit := *k
+	if limit <= 0 || limit > 5 {
+		limit = 5
+	}
 
 	root, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
@@ -463,7 +467,7 @@ func cmdCodeSearch(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	resp, err := client.Search(context.Background(), searchRequest{Root: root, DB: dbPath, Query: query, Mode: *mode, K: *k})
+	resp, err := client.Search(context.Background(), searchRequest{Root: root, DB: dbPath, Query: query, Mode: *mode, K: limit})
 	if err != nil {
 		return codeDaemonError(err)
 	}
