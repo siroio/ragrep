@@ -1413,6 +1413,11 @@ func TestLSPRelationLocationsRequireWorkspaceFileURIProvenance(t *testing.T) {
 		slashedLocal = "/" + slashedLocal
 	}
 	localURI := (&url.URL{Scheme: "file", Path: slashedLocal}).String()
+	externalDisplay, err := filepath.Rel(root, external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalDisplay = filepath.ToSlash(externalDisplay)
 	locations := []lsp.Location{
 		{URI: localURI, Range: lsp.Range{Start: lsp.Position{Line: 7, Character: 3}}},
 		{URI: "pkg/fake.go"},
@@ -1421,16 +1426,16 @@ func TestLSPRelationLocationsRequireWorkspaceFileURIProvenance(t *testing.T) {
 		{URI: fileURI(external)},
 	}
 	got := locsFromLSP(root, locations)
-	if len(got) != 1 || got[0].Path != "dir with space/file.go" || got[0].Position.Line != 7 || got[0].Position.Character != 3 {
-		t.Fatalf("locations=%+v, want only decoded workspace-local file URI", got)
+	if len(got) != 5 || got[0].Path != "dir with space/file.go" || got[0].Position.Line != 7 || got[0].Position.Character != 3 || !got[0].workspaceLocal || got[1].workspaceLocal || got[2].workspaceLocal || got[3].workspaceLocal || got[4].workspaceLocal || got[4].Path != externalDisplay {
+		t.Fatalf("locations=%+v, want CLI-compatible locations with decoded local and external file URIs", got)
 	}
 	items := make([]lsp.CallHierarchyItem, len(locations))
 	for i, location := range locations {
 		items[i] = lsp.CallHierarchyItem{URI: location.URI, SelectionRange: location.Range}
 	}
 	got = locsFromCallHierarchyItems(root, items)
-	if len(got) != 1 || got[0].Path != "dir with space/file.go" || got[0].Position.Line != 7 || got[0].Position.Character != 3 {
-		t.Fatalf("call hierarchy locations=%+v, want only decoded workspace-local file URI", got)
+	if len(got) != 5 || got[0].Path != "dir with space/file.go" || got[0].Position.Line != 7 || got[0].Position.Character != 3 || !got[0].workspaceLocal || got[1].workspaceLocal || got[2].workspaceLocal || got[3].workspaceLocal || got[4].workspaceLocal || got[4].Path != externalDisplay {
+		t.Fatalf("call hierarchy locations=%+v, want CLI-compatible locations with decoded local and external file URIs", got)
 	}
 }
 
@@ -1491,10 +1496,19 @@ func TestCmdCodeExpandDedupsRelationsAndSkipsUnresolved(t *testing.T) {
 	// Two locations at different lines, both inside Caller's range (4-7):
 	// both resolve to caller-key -- a duplicate resolved relation. A third
 	// location outside the workspace root's indexed symbols never resolves.
+	externalPath := filepath.Join(t.TempDir(), "external.go")
+	localUnindexedPath := filepath.Join(root, "unindexed.go")
+	externalDisplay, err := filepath.Rel(root, externalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalDisplay = filepath.ToSlash(externalDisplay)
 	locationsJSON := "[" + strings.Join([]string{
 		lspLocationJSON(mainGo, 5),
 		lspLocationJSON(mainGo, 6),
-		lspLocationJSON(filepath.Join(root, "unindexed.go"), 0),
+		lspLocationJSON(localUnindexedPath, 0),
+		lspLocationJSON(externalPath, 0),
+		`{"uri":"pkg/fake.go","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}`,
 	}, ",") + "]"
 	src := strings.ReplaceAll(fakeLSPServerReferencesSrcTemplate, "LOCATIONS_JSON_PLACEHOLDER", locationsJSON)
 	exePath := buildFakeLSPServerFromSrc(t, root, "fakelsp-dup-refs", src)
@@ -1518,8 +1532,31 @@ func TestCmdCodeExpandDedupsRelationsAndSkipsUnresolved(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &targets); err != nil {
 		t.Fatalf("output not valid JSON: %v (%q)", err, buf.String())
 	}
-	if len(targets) != 3 {
-		t.Fatalf("targets = %#v, want 3 (two duplicate resolved + one unresolved)", targets)
+	if bytes.Contains(buf.Bytes(), []byte("_workspace_local")) {
+		t.Fatalf("private provenance leaked into CLI JSON: %s", buf.Bytes())
+	}
+	if len(targets) != 5 {
+		t.Fatalf("targets = %#v, want two resolved plus local, external, and scheme-less unresolved CLI targets", targets)
+	}
+	if targets[2].Resolved || targets[2].Path != "unindexed.go" || targets[3].Resolved || targets[3].Path != externalDisplay || targets[4].Resolved || targets[4].Path != "pkg/fake.go" {
+		t.Fatalf("CLI unresolved targets = %#v, want preserved local/external/scheme-less paths", targets[2:])
+	}
+
+	_, mcpOut, err := (codeQueryTools{defaultRoot: root, backend: productionMCPBackend{}}).inspectCodeRelation(context.Background(), inspectCodeRelationInput{
+		Key: "target-key", Relation: "references",
+	})
+	if err != nil || mcpOut.Error != nil || mcpOut.Data == nil || len(mcpOut.Data.Targets) != 3 {
+		t.Fatalf("MCP relation output=%+v err=%v, want resolved targets plus proven local unresolved target", mcpOut, err)
+	}
+	if !mcpOut.Data.Targets[0].Resolved || !mcpOut.Data.Targets[1].Resolved || mcpOut.Data.Targets[2].Resolved || mcpOut.Data.Targets[2].Path != "unindexed.go" {
+		t.Fatalf("unsafe MCP relation target escaped filtering: %+v", mcpOut.Data.Targets)
+	}
+	mcpJSON, err := json.Marshal(mcpOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(mcpJSON, []byte("_workspace_local")) {
+		t.Fatalf("private provenance leaked into MCP JSON: %s", mcpJSON)
 	}
 
 	// The persisted edge set must be deduped: exactly one references row
@@ -1875,6 +1912,93 @@ func TestCodeServicePackReturnsTenFreshCandidatesAndLiveBody(t *testing.T) {
 	}
 }
 
+func TestCodeServicePackManifestBoundaryRoundTripsAtLimits(t *testing.T) {
+	svc, ws, _ := newTestCodeService(t)
+	body := "package service\nfunc Boundary() {}"
+	sym := serviceSymbol("boundary.go", "Boundary", "func Boundary() {}")
+	sym.Key = strings.Repeat("k", maxMCPCodeKeyBytes)
+	sym.QualifiedName = strings.Repeat("q", maxCodeManifestQualifiedNameBytes)
+	putServiceSymbol(t, ws.store, sym, ws.save(t, sym.Path, body))
+	identity := strings.Repeat("i", maxCodeManifestIdentityBytes)
+	if _, err := ws.store.RecordIndexRun("index:boundary", identity, "go", identity, identity, identity, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	out, err := svc.Pack(context.Background(), packRequest{
+		Root: ws.root, Query: "Boundary", K: 10, Budget: 100_000, SelectedKeys: []string{sym.Key},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCodeManifest(out.Manifest); err != nil {
+		t.Fatalf("producer returned unverifiable manifest: %v (%+v)", err, out.Manifest)
+	}
+	verified, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: out.Manifest})
+	if err != nil || !verified.Clean || len(verified.Entries) != 1 || !verified.Entries[0].Resolved {
+		t.Fatalf("build-to-verify roundtrip=%+v err=%v", verified, err)
+	}
+}
+
+func TestRunCodePackRejectsOversizedManifestMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		qualified string
+		revision  string
+	}{
+		{name: "identity", qualified: "Boundary", revision: strings.Repeat("r", maxCodeManifestIdentityBytes+1)},
+		{name: "qualified name", qualified: strings.Repeat("q", maxCodeManifestQualifiedNameBytes+1), revision: "revision"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestCodeStore(t)
+			sym := codePackTestSymbol("boundary-key", "boundary.go", tc.qualified)
+			hash := codeindex.FileHash([]byte(sym.Body))
+			if _, err := s.UpsertSymbols(sym.Path, hash, []codeindex.Symbol{sym}, 0, fakeCodeEmbed); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.RecordIndexRun("index:boundary", tc.revision, "go", "gopls", "v1", codeModelID, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			out, err := runCodePack(s, nil, 100_000, []string{sym.Key}, s.GetSymbol)
+			if err == nil || err.Error() != "invalid manifest" || !reflect.DeepEqual(out, codePackOutput{}) {
+				t.Fatalf("out=%+v err=%v, want bounded invalid manifest failure", out, err)
+			}
+		})
+	}
+}
+
+func TestCmdCodePackRejectsOversizedStoredManifestIdentity(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".ragrep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(root, ".ragrep", "code.db")
+	s, err := codestore.Open(db, codeModelID, codeEmbedDim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("package service\nfunc Boundary() {}")
+	if err := os.WriteFile(filepath.Join(root, "boundary.go"), body, 0o644); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	sym := codePackTestSymbol("boundary-key", "boundary.go", "Boundary")
+	if _, err := s.UpsertSymbols(sym.Path, codeindex.FileHash(body), []codeindex.Symbol{sym}, 0, fakeCodeEmbed); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if _, err := s.RecordIndexRun("index:boundary", strings.Repeat("r", maxCodeManifestIdentityBytes+1), "go", "gopls", "v1", codeModelID, time.Now()); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	injectCodeServiceDaemon(t, root, db)
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "pack", "--db", db, "--query", "Boundary", "--select", sym.Key, "--json"})
+	if code != 1 || stdout != "" || stderr != "error: invalid manifest\n" {
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want bounded invalid manifest failure", code, stdout, stderr)
+	}
+}
+
 func TestCodeServicePackUsesAutoModeForExactSymbol(t *testing.T) {
 	svc, ws, embedder := newTestCodeService(t)
 	body := "package service\nfunc ExactPackHandler() {}"
@@ -1884,6 +2008,9 @@ func TestCodeServicePackUsesAutoModeForExactSymbol(t *testing.T) {
 	out, err := svc.Pack(context.Background(), packRequest{Root: ws.root, Query: sym.Name, Budget: 100_000})
 	if err != nil || len(out.Pack.Candidates) != 1 || out.Pack.Candidates[0].Key != sym.Key || embedder.calls.Load() != 0 {
 		t.Fatalf("out=%+v embed calls=%d err=%v", out, embedder.calls.Load(), err)
+	}
+	if len(out.Manifest.Symbols) != 0 || validateProducedCodeManifest(out.Manifest) != nil || validateCodeManifest(out.Manifest) == nil {
+		t.Fatalf("candidate-only manifest must be a valid producer result but not a verify input: %+v", out.Manifest)
 	}
 }
 
@@ -2028,10 +2155,10 @@ func TestRunCodePackBudgetRespectedAndTruncationSurfaces(t *testing.T) {
 	s := newTestCodeStore(t)
 	a := codePackTestSymbol("a", "x.go", "A")
 	b := codePackTestSymbol("b", "y.go", "B")
-	if _, err := s.UpsertSymbols(a.Path, "filehash-a", []codeindex.Symbol{a}, 0, fakeCodeEmbed); err != nil {
+	if _, err := s.UpsertSymbols(a.Path, codeindex.FileHash([]byte(a.Body)), []codeindex.Symbol{a}, 0, fakeCodeEmbed); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.UpsertSymbols(b.Path, "filehash-b", []codeindex.Symbol{b}, 0, fakeCodeEmbed); err != nil {
+	if _, err := s.UpsertSymbols(b.Path, codeindex.FileHash([]byte(b.Body)), []codeindex.Symbol{b}, 0, fakeCodeEmbed); err != nil {
 		t.Fatal(err)
 	}
 	when := time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
@@ -2073,7 +2200,7 @@ func TestRunCodePackBudgetRespectedAndTruncationSurfaces(t *testing.T) {
 func TestFormatCodePackOutputTextAndJSON(t *testing.T) {
 	s := newTestCodeStore(t)
 	a := codePackTestSymbol("a", "x.go", "A")
-	if _, err := s.UpsertSymbols(a.Path, "filehash-a", []codeindex.Symbol{a}, 0, fakeCodeEmbed); err != nil {
+	if _, err := s.UpsertSymbols(a.Path, codeindex.FileHash([]byte(a.Body)), []codeindex.Symbol{a}, 0, fakeCodeEmbed); err != nil {
 		t.Fatal(err)
 	}
 	out := runTestCodePack(t, s, "A", 10, 100_000, []string{"a"})

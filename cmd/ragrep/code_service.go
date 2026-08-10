@@ -586,13 +586,15 @@ func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 	}
 
 	var relations []codeindex.Relation
+	var relationLocations []codeLocation
 	switch req.Relation {
 	case "definition":
 		locs, err := client.Definition(ctx, lsp.DefinitionParams(pos))
 		if err != nil {
 			return nil, err
 		}
-		relations = codeindex.DefinitionRelations(sym.Key, locsFromLSP(ws.root, locs), serverName, resolve)
+		relationLocations = locsFromLSP(ws.root, locs)
+		relations = codeindex.DefinitionRelations(sym.Key, codeIndexLocations(relationLocations), serverName, resolve)
 	case "references", "tests":
 		locs, err := client.References(ctx, lsp.ReferenceParams{
 			TextDocumentPositionParams: pos,
@@ -601,7 +603,8 @@ func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 		if err != nil {
 			return nil, err
 		}
-		relations = codeindex.ReferenceRelations(sym.Key, locsFromLSP(ws.root, locs), serverName, resolve)
+		relationLocations = locsFromLSP(ws.root, locs)
+		relations = codeindex.ReferenceRelations(sym.Key, codeIndexLocations(relationLocations), serverName, resolve)
 	case "callers", "callees":
 		items, err := client.PrepareCallHierarchy(ctx, lsp.CallHierarchyPrepareParams(pos))
 		if err != nil {
@@ -618,7 +621,8 @@ func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 				for i, call := range calls {
 					froms[i] = call.From
 				}
-				relations = codeindex.CallerRelations(sym.Key, locsFromCallHierarchyItems(ws.root, froms), serverName, resolve)
+				relationLocations = locsFromCallHierarchyItems(ws.root, froms)
+				relations = codeindex.CallerRelations(sym.Key, codeIndexLocations(relationLocations), serverName, resolve)
 			} else {
 				calls, err := client.OutgoingCalls(ctx, lsp.CallHierarchyOutgoingCallsParams{Item: item})
 				if err != nil {
@@ -628,7 +632,8 @@ func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 				for i, call := range calls {
 					tos[i] = call.To
 				}
-				relations = codeindex.CalleeRelations(sym.Key, locsFromCallHierarchyItems(ws.root, tos), serverName, resolve)
+				relationLocations = locsFromCallHierarchyItems(ws.root, tos)
+				relations = codeindex.CalleeRelations(sym.Key, codeIndexLocations(relationLocations), serverName, resolve)
 			}
 		}
 	}
@@ -643,10 +648,10 @@ func (s *codeService) Expand(ctx context.Context, req expandRequest) ([]codeExpa
 	if err := ws.store.ReplaceRelations(runID, sym.Key, codeExpandReplaceGroup[req.Relation], codeindex.DedupResolvedRelations(relations)); err != nil {
 		return nil, err
 	}
-	filtered := relations[:0:0]
-	for _, relation := range relations {
+	filtered := make([]codeRelation, 0, len(relations))
+	for i, relation := range relations {
 		if relation.Kind == req.Relation {
-			filtered = append(filtered, relation)
+			filtered = append(filtered, codeRelation{Relation: relation, workspaceLocal: relation.ToKey != "" || relationLocations[i].workspaceLocal})
 		}
 	}
 	return expandTargets(ws.store, filtered)

@@ -317,7 +317,7 @@ func TestInspectCodeRelationAcceptsExactlyFiveRelationsAndReturnsTargets(t *test
 				}
 				return inspectCodeRelationData{Targets: []codeExpandTarget{
 					{Relation: relation, Resolved: true, Key: "target", Path: "pkg/target.go", StartLine: 4, EndLine: 8},
-					{Relation: relation, Resolved: false, Path: "pkg/missing.go", Line: 12, Character: 3},
+					{Relation: relation, Resolved: false, Path: "pkg/missing.go", Line: 12, Character: 3, workspaceLocal: true},
 				}}, nil
 			}}
 			_, out, err := (codeQueryTools{defaultRoot: root, backend: backend}).inspectCodeRelation(context.Background(), inspectCodeRelationInput{Key: "symbol-key", Relation: relation})
@@ -370,6 +370,7 @@ func TestInspectCodeRelationDiscardsUnsafeWorkspaceExternalPaths(t *testing.T) {
 	backend := fakeCodeQueryBackend{inspect: func(context.Context, mcpWorkspace, inspectCodeRelationInput) (inspectCodeRelationData, error) {
 		return inspectCodeRelationData{Targets: []codeExpandTarget{
 			{Relation: "references", Resolved: true, Key: "safe", Path: "pkg/safe.go"},
+			{Relation: "references", Resolved: false, Path: "pkg/fake.go"},
 			{Relation: "references", Resolved: false, Path: outside},
 			{Relation: "references", Resolved: false, Path: "../traversal.go"},
 			{Relation: "references", Resolved: false, Path: "pkg/../unclean.go"},
@@ -385,7 +386,7 @@ func TestInspectCodeRelationBoundsTargetsAndReportsTruncation(t *testing.T) {
 	root := newMCPCodeWorkspace(t)
 	targets := make([]codeExpandTarget, 25)
 	for i := range targets {
-		targets[i] = codeExpandTarget{Relation: "references", Resolved: i%2 == 0, Key: fmt.Sprintf("key-%d", i), Path: fmt.Sprintf("pkg/file-%02d.go", i), Line: i}
+		targets[i] = codeExpandTarget{Relation: "references", Resolved: i%2 == 0, Key: fmt.Sprintf("key-%d", i), Path: fmt.Sprintf("pkg/file-%02d.go", i), Line: i, workspaceLocal: true}
 	}
 	backend := fakeCodeQueryBackend{inspect: func(context.Context, mcpWorkspace, inspectCodeRelationInput) (inspectCodeRelationData, error) {
 		return inspectCodeRelationData{Targets: targets}, nil

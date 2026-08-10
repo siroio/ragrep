@@ -756,16 +756,24 @@ func workspacePathFromFileURI(uri, wsRoot string) (string, bool) {
 
 // locsFromLSP converts textDocument/definition or textDocument/references
 // results into codeindex.Loc, anchored at each location's Range.Start.
-func locsFromLSP(wsRoot string, locs []lsp.Location) []codeindex.Loc {
-	out := make([]codeindex.Loc, 0, len(locs))
+type codeLocation struct {
+	codeindex.Loc
+	workspaceLocal bool
+}
+
+func locsFromLSP(wsRoot string, locs []lsp.Location) []codeLocation {
+	out := make([]codeLocation, 0, len(locs))
 	for _, l := range locs {
-		path, ok := workspacePathFromFileURI(l.URI, wsRoot)
-		if !ok {
-			continue
+		path, workspaceLocal := workspacePathFromFileURI(l.URI, wsRoot)
+		if !workspaceLocal {
+			path = pathFromURI(l.URI, wsRoot)
 		}
-		out = append(out, codeindex.Loc{
-			Path:     path,
-			Position: codeindex.Position{Line: l.Range.Start.Line, Character: l.Range.Start.Character},
+		out = append(out, codeLocation{
+			Loc: codeindex.Loc{
+				Path:     path,
+				Position: codeindex.Position{Line: l.Range.Start.Line, Character: l.Range.Start.Character},
+			},
+			workspaceLocal: workspaceLocal,
 		})
 	}
 	return out
@@ -775,17 +783,28 @@ func locsFromLSP(wsRoot string, locs []lsp.Location) []codeindex.Loc {
 // items or callHierarchy/outgoingCalls' "To" items into codeindex.Loc,
 // anchored at each item's SelectionRange.Start (the identifier itself,
 // narrower and more precise than Range, which spans the whole declaration).
-func locsFromCallHierarchyItems(wsRoot string, items []lsp.CallHierarchyItem) []codeindex.Loc {
-	out := make([]codeindex.Loc, 0, len(items))
+func locsFromCallHierarchyItems(wsRoot string, items []lsp.CallHierarchyItem) []codeLocation {
+	out := make([]codeLocation, 0, len(items))
 	for _, it := range items {
-		path, ok := workspacePathFromFileURI(it.URI, wsRoot)
-		if !ok {
-			continue
+		path, workspaceLocal := workspacePathFromFileURI(it.URI, wsRoot)
+		if !workspaceLocal {
+			path = pathFromURI(it.URI, wsRoot)
 		}
-		out = append(out, codeindex.Loc{
-			Path:     path,
-			Position: codeindex.Position{Line: it.SelectionRange.Start.Line, Character: it.SelectionRange.Start.Character},
+		out = append(out, codeLocation{
+			Loc: codeindex.Loc{
+				Path:     path,
+				Position: codeindex.Position{Line: it.SelectionRange.Start.Line, Character: it.SelectionRange.Start.Character},
+			},
+			workspaceLocal: workspaceLocal,
 		})
+	}
+	return out
+}
+
+func codeIndexLocations(locations []codeLocation) []codeindex.Loc {
+	out := make([]codeindex.Loc, len(locations))
+	for i := range locations {
+		out[i] = locations[i].Loc
 	}
 	return out
 }
@@ -817,30 +836,37 @@ func resolverFor(s *codestore.Store) (codeindex.Resolver, *error) {
 // path/position of a location that didn't resolve to one -- never a
 // fabricated key.
 type codeExpandTarget struct {
-	Relation      string `json:"relation"`
-	Resolved      bool   `json:"resolved"`
-	Key           string `json:"key,omitempty"`
-	Kind          string `json:"kind,omitempty"`
-	QualifiedName string `json:"qualified_name,omitempty"`
-	Signature     string `json:"signature,omitempty"`
-	Path          string `json:"path"`
-	StartLine     int    `json:"start_line,omitempty"`
-	EndLine       int    `json:"end_line,omitempty"`
-	Line          int    `json:"line,omitempty"`      // unresolved only
-	Character     int    `json:"character,omitempty"` // unresolved only
+	Relation       string `json:"relation"`
+	Resolved       bool   `json:"resolved"`
+	Key            string `json:"key,omitempty"`
+	Kind           string `json:"kind,omitempty"`
+	QualifiedName  string `json:"qualified_name,omitempty"`
+	Signature      string `json:"signature,omitempty"`
+	Path           string `json:"path"`
+	StartLine      int    `json:"start_line,omitempty"`
+	EndLine        int    `json:"end_line,omitempty"`
+	Line           int    `json:"line,omitempty"`      // unresolved only
+	Character      int    `json:"character,omitempty"` // unresolved only
+	workspaceLocal bool
+}
+
+type codeRelation struct {
+	codeindex.Relation
+	workspaceLocal bool
 }
 
 // expandTargets builds one codeExpandTarget per relation, in order,
 // resolving each ToKey's declaration metadata via GetSymbol. Body is never
 // included -- see formatCodeSymbol's doc comment; `code get --body` is the
 // only way to read one.
-func expandTargets(s *codestore.Store, relations []codeindex.Relation) ([]codeExpandTarget, error) {
+func expandTargets(s *codestore.Store, relations []codeRelation) ([]codeExpandTarget, error) {
 	out := make([]codeExpandTarget, 0, len(relations))
 	for _, r := range relations {
 		if r.ToKey == "" {
 			out = append(out, codeExpandTarget{
 				Relation: r.Kind, Resolved: false,
 				Path: r.ToPath, Line: r.ToPosition.Line, Character: r.ToPosition.Character,
+				workspaceLocal: r.workspaceLocal,
 			})
 			continue
 		}
@@ -980,6 +1006,9 @@ func runCodePack(s *codestore.Store, hits []codestore.SymbolHit, budget int, sel
 
 	manifest, err := buildManifest(s, pack)
 	if err != nil {
+		return codePackOutput{}, err
+	}
+	if err := validateProducedCodeManifest(manifest); err != nil {
 		return codePackOutput{}, err
 	}
 
@@ -1201,7 +1230,15 @@ const (
 )
 
 func validateCodeManifest(manifest coderetrieval.Manifest) error {
-	if len(manifest.Symbols) == 0 || len(manifest.Symbols) > 3 {
+	return validateCodeManifestWithMinimum(manifest, 1)
+}
+
+func validateProducedCodeManifest(manifest coderetrieval.Manifest) error {
+	return validateCodeManifestWithMinimum(manifest, 0)
+}
+
+func validateCodeManifestWithMinimum(manifest coderetrieval.Manifest, minimumSymbols int) error {
+	if len(manifest.Symbols) < minimumSymbols || len(manifest.Symbols) > 3 {
 		return errors.New("invalid manifest")
 	}
 	for _, identity := range []string{manifest.IndexRevision, manifest.ServerName, manifest.ServerVersion, manifest.ModelID} {

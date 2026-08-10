@@ -118,6 +118,39 @@ type daemonExpandRequest struct {
 	Relation string `json:"relation"`
 }
 
+type daemonExpandTarget struct {
+	Relation       string `json:"relation"`
+	Resolved       bool   `json:"resolved"`
+	Key            string `json:"key,omitempty"`
+	Kind           string `json:"kind,omitempty"`
+	QualifiedName  string `json:"qualified_name,omitempty"`
+	Signature      string `json:"signature,omitempty"`
+	Path           string `json:"path"`
+	StartLine      int    `json:"start_line,omitempty"`
+	EndLine        int    `json:"end_line,omitempty"`
+	Line           int    `json:"line,omitempty"`
+	Character      int    `json:"character,omitempty"`
+	WorkspaceLocal bool   `json:"_workspace_local,omitempty"`
+}
+
+func newDaemonExpandTarget(target codeExpandTarget) daemonExpandTarget {
+	return daemonExpandTarget{
+		Relation: target.Relation, Resolved: target.Resolved, Key: target.Key, Kind: target.Kind,
+		QualifiedName: target.QualifiedName, Signature: target.Signature, Path: target.Path,
+		StartLine: target.StartLine, EndLine: target.EndLine, Line: target.Line, Character: target.Character,
+		WorkspaceLocal: target.workspaceLocal,
+	}
+}
+
+func (target daemonExpandTarget) codeTarget() codeExpandTarget {
+	return codeExpandTarget{
+		Relation: target.Relation, Resolved: target.Resolved, Key: target.Key, Kind: target.Kind,
+		QualifiedName: target.QualifiedName, Signature: target.Signature, Path: target.Path,
+		StartLine: target.StartLine, EndLine: target.EndLine, Line: target.Line, Character: target.Character,
+		workspaceLocal: target.WorkspaceLocal,
+	}
+}
+
 type daemonPackRequest struct {
 	Root         string   `json:"root"`
 	DB           string   `json:"db"`
@@ -354,7 +387,11 @@ func (h *daemonHandler) expand(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, status, apiErr)
 		return
 	}
-	writeJSON(w, http.StatusOK, targets)
+	wireTargets := make([]daemonExpandTarget, len(targets))
+	for i := range targets {
+		wireTargets[i] = newDaemonExpandTarget(targets[i])
+	}
+	writeJSON(w, http.StatusOK, wireTargets)
 }
 
 func (h *daemonHandler) get(w http.ResponseWriter, r *http.Request) {
@@ -578,9 +615,16 @@ func (c daemonClient) Index(ctx context.Context, req indexRequest) (indexResult,
 }
 
 func (c daemonClient) Expand(ctx context.Context, req expandRequest) ([]codeExpandTarget, error) {
-	var targets []codeExpandTarget
-	err := c.do(ctx, http.MethodPost, "/v1/code/expand", daemonExpandRequest{Root: req.Root, DB: req.DB, Key: req.Key, Relation: req.Relation}, &targets)
-	return targets, err
+	var wireTargets []daemonExpandTarget
+	err := c.do(ctx, http.MethodPost, "/v1/code/expand", daemonExpandRequest{Root: req.Root, DB: req.DB, Key: req.Key, Relation: req.Relation}, &wireTargets)
+	if err != nil {
+		return nil, err
+	}
+	targets := make([]codeExpandTarget, len(wireTargets))
+	for i := range wireTargets {
+		targets[i] = wireTargets[i].codeTarget()
+	}
+	return targets, nil
 }
 
 func (c daemonClient) Pack(ctx context.Context, req packRequest) (codePackOutput, error) {

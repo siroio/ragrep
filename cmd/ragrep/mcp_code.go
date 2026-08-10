@@ -236,7 +236,7 @@ func (tools codeQueryTools) inspectCodeRelation(ctx context.Context, input inspe
 	}
 	filtered := make([]codeExpandTarget, 0, len(data.Targets))
 	for _, target := range data.Targets {
-		if validCodeManifestPath(target.Path) {
+		if validCodeManifestPath(target.Path) && (target.Resolved || target.workspaceLocal) {
 			filtered = append(filtered, target)
 		}
 	}
