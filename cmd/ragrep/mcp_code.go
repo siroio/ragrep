@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/siroio/ragrep/internal/coderetrieval"
 	"github.com/siroio/ragrep/internal/codestore"
 )
 
@@ -56,6 +57,32 @@ type codeQueryTools struct {
 	backend     codeQueryBackend
 }
 
+type buildCodeContextInput struct {
+	Query        string   `json:"query"`
+	SelectedKeys []string `json:"selected_keys,omitempty"`
+	Budget       int      `json:"budget,omitempty"`
+	Root         string   `json:"root,omitempty"`
+}
+
+type buildCodeContextData = codePackOutput
+
+type verifyCodeContextInput struct {
+	Manifest coderetrieval.Manifest `json:"manifest"`
+	Root     string                 `json:"root,omitempty"`
+}
+
+type verifyCodeContextData = codeVerifyOutput
+
+type codeContextBackend interface {
+	BuildCodeContext(context.Context, mcpWorkspace, buildCodeContextInput) (buildCodeContextData, error)
+	VerifyCodeContext(context.Context, mcpWorkspace, verifyCodeContextInput) (verifyCodeContextData, error)
+}
+
+type codeContextTools struct {
+	defaultRoot string
+	backend     codeContextBackend
+}
+
 func registerCodeQueryTools(server *mcp.Server, tools codeQueryTools) {
 	closedWorld := false
 	annotations := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld}
@@ -74,6 +101,60 @@ func registerCodeQueryTools(server *mcp.Server, tools codeQueryTools) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input inspectCodeRelationInput) (*mcp.CallToolResult, mcpToolOutput[inspectCodeRelationData], error) {
 		return tools.inspectCodeRelation(ctx, input)
 	})
+}
+
+func registerCodeContextTools(server *mcp.Server, tools codeContextTools) {
+	closedWorld := false
+	annotations := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld}
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "build_code_context", Description: "Build bounded code evidence after search_code; retain its manifest and verify it before relying on the result.", Annotations: annotations,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input buildCodeContextInput) (*mcp.CallToolResult, mcpToolOutput[buildCodeContextData], error) {
+		return tools.buildCodeContext(ctx, input)
+	})
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "verify_code_context", Description: "Verify a build_code_context manifest immediately before using its evidence; rebuild context when clean is false.", Annotations: annotations,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input verifyCodeContextInput) (*mcp.CallToolResult, mcpToolOutput[verifyCodeContextData], error) {
+		return tools.verifyCodeContext(ctx, input)
+	})
+}
+
+func (tools codeContextTools) buildCodeContext(ctx context.Context, input buildCodeContextInput) (*mcp.CallToolResult, mcpToolOutput[buildCodeContextData], error) {
+	if err := ctx.Err(); err != nil {
+		return mcpToolFailure[buildCodeContextData](err)
+	}
+	if strings.TrimSpace(input.Query) == "" || input.Budget < 0 || len(input.SelectedKeys) > 3 {
+		return mcpToolFailure[buildCodeContextData](mcpInvalidArgument())
+	}
+	if input.Budget == 0 {
+		input.Budget = codePackDefaultBudget
+	}
+	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
+	if err != nil {
+		return mcpToolFailure[buildCodeContextData](err)
+	}
+	data, err := tools.backend.BuildCodeContext(ctx, ws, input)
+	if err != nil {
+		return mcpToolFailure[buildCodeContextData](err)
+	}
+	return mcpSuccess(fmt.Sprintf("%d code candidates", len(data.Pack.Candidates)), data)
+}
+
+func (tools codeContextTools) verifyCodeContext(ctx context.Context, input verifyCodeContextInput) (*mcp.CallToolResult, mcpToolOutput[verifyCodeContextData], error) {
+	if err := ctx.Err(); err != nil {
+		return mcpToolFailure[verifyCodeContextData](err)
+	}
+	if len(input.Manifest.Symbols) == 0 {
+		return mcpToolFailure[verifyCodeContextData](mcpInvalidArgument())
+	}
+	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
+	if err != nil {
+		return mcpToolFailure[verifyCodeContextData](err)
+	}
+	data, err := tools.backend.VerifyCodeContext(ctx, ws, input)
+	if err != nil {
+		return mcpToolFailure[verifyCodeContextData](err)
+	}
+	return mcpSuccess(fmt.Sprintf("code context clean=%v", data.Clean), data)
 }
 
 func (tools codeQueryTools) searchCode(ctx context.Context, input searchCodeInput) (*mcp.CallToolResult, mcpToolOutput[searchCodeData], error) {
@@ -203,6 +284,38 @@ func (productionMCPBackend) InspectCodeRelation(ctx context.Context, ws mcpWorks
 		return inspectCodeRelationData{}, codeDaemonMCPError(err)
 	}
 	return inspectCodeRelationData{Targets: targets}, nil
+}
+
+func (productionMCPBackend) BuildCodeContext(ctx context.Context, ws mcpWorkspace, input buildCodeContextInput) (buildCodeContextData, error) {
+	if err := requireCodeIndex(ws.CodeDB); err != nil {
+		return buildCodeContextData{}, err
+	}
+	client, err := codeDaemonClientFactory()
+	if err != nil {
+		return buildCodeContextData{}, err
+	}
+	out, err := client.Pack(ctx, packRequest{
+		Root: ws.Root, DB: ws.CodeDB, Query: input.Query, K: 10, Budget: input.Budget, SelectedKeys: input.SelectedKeys,
+	})
+	if err != nil {
+		return buildCodeContextData{}, codeDaemonMCPError(err)
+	}
+	return out, nil
+}
+
+func (productionMCPBackend) VerifyCodeContext(ctx context.Context, ws mcpWorkspace, input verifyCodeContextInput) (verifyCodeContextData, error) {
+	if err := requireCodeIndex(ws.CodeDB); err != nil {
+		return verifyCodeContextData{}, err
+	}
+	client, err := codeDaemonClientFactory()
+	if err != nil {
+		return verifyCodeContextData{}, err
+	}
+	out, err := client.Verify(ctx, verifyRequest{Root: ws.Root, DB: ws.CodeDB, Manifest: input.Manifest})
+	if err != nil {
+		return verifyCodeContextData{}, codeDaemonMCPError(err)
+	}
+	return out, nil
 }
 
 func requireCodeIndex(path string) error {

@@ -166,14 +166,30 @@ func mcpToolFailure[T any](err error) (*mcp.CallToolResult, mcpToolOutput[T], er
 }
 
 func newMCPBaseServer() *mcp.Server {
+	server, _ := newRagrepMCPServer(".", mcpBackends{
+		Documents: productionMCPBackend{}, Mutations: productionMCPBackend{},
+		Code: productionMCPBackend{}, Context: productionMCPBackend{},
+	})
+	return server
+}
+
+type mcpBackends struct {
+	Documents documentQueryBackend
+	Mutations documentMutationBackend
+	Code      codeQueryBackend
+	Context   codeContextBackend
+}
+
+func newRagrepMCPServer(defaultRoot string, backends mcpBackends) (*mcp.Server, error) {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "ragrep", Version: "0.1.0"},
 		&mcp.ServerOptions{Instructions: mcpServerInstructions},
 	)
-	registerDocumentQueryTools(server, documentQueryTools{defaultRoot: ".", backend: productionMCPBackend{}})
-	registerDocumentMutationTools(server, documentMutationTools{defaultRoot: ".", backend: productionMCPBackend{}})
-	registerCodeQueryTools(server, codeQueryTools{defaultRoot: ".", backend: productionMCPBackend{}})
-	return server
+	registerDocumentQueryTools(server, documentQueryTools{defaultRoot: defaultRoot, backend: backends.Documents})
+	registerDocumentMutationTools(server, documentMutationTools{defaultRoot: defaultRoot, backend: backends.Mutations})
+	registerCodeQueryTools(server, codeQueryTools{defaultRoot: defaultRoot, backend: backends.Code})
+	registerCodeContextTools(server, codeContextTools{defaultRoot: defaultRoot, backend: backends.Context})
+	return server, nil
 }
 
 func runMCPServer(ctx context.Context, transport mcp.Transport, server *mcp.Server) error {

@@ -5,10 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/siroio/ragrep/internal/codeindex"
+	"github.com/siroio/ragrep/internal/coderetrieval"
 	"github.com/siroio/ragrep/internal/codestore"
 )
 
@@ -339,5 +342,227 @@ func TestCodeHandlersRegisterReadOnlyClosedWorldTools(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Fatalf("missing tools: %v", want)
+	}
+}
+
+type fakeCodeContextBackend struct {
+	build  func(context.Context, mcpWorkspace, buildCodeContextInput) (buildCodeContextData, error)
+	verify func(context.Context, mcpWorkspace, verifyCodeContextInput) (verifyCodeContextData, error)
+}
+
+func (b fakeCodeContextBackend) BuildCodeContext(ctx context.Context, ws mcpWorkspace, in buildCodeContextInput) (buildCodeContextData, error) {
+	return b.build(ctx, ws, in)
+}
+
+func (b fakeCodeContextBackend) VerifyCodeContext(ctx context.Context, ws mcpWorkspace, in verifyCodeContextInput) (verifyCodeContextData, error) {
+	return b.verify(ctx, ws, in)
+}
+
+func TestBuildCodeContextDefaultsAndPreservesOrderedSelection(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	otherRoot := newMCPCodeWorkspace(t)
+	wantKeys := []string{"first", "second", "third"}
+	wantData := codePackOutput{
+		Pack: coderetrieval.ContextPack{
+			Candidates: []codestore.SymbolHit{{Key: "first", Name: "First"}},
+			Budget:     20000, UsedChars: 123, Truncated: true, Skipped: []string{"third"},
+		},
+		Manifest: coderetrieval.Manifest{IndexRevision: "rev", Symbols: []coderetrieval.SymbolRef{{Key: "first", Path: "pkg/a.go"}}},
+		Fresh:    false, Generation: 7,
+	}
+	backend := fakeCodeContextBackend{build: func(ctx context.Context, ws mcpWorkspace, in buildCodeContextInput) (buildCodeContextData, error) {
+		if ctx.Err() != nil || ws.Root != otherRoot || in.Query != "Needle" || in.Budget != 20000 || !reflect.DeepEqual(in.SelectedKeys, wantKeys) {
+			t.Fatalf("context/workspace/input=%v %+v %+v", ctx.Err(), ws, in)
+		}
+		return wantData, nil
+	}}
+	tools := codeContextTools{defaultRoot: root, backend: backend}
+	_, out, err := tools.buildCodeContext(context.Background(), buildCodeContextInput{Query: "Needle", SelectedKeys: wantKeys, Root: otherRoot})
+	if err != nil || out.Error != nil || out.Data == nil || !reflect.DeepEqual(*out.Data, wantData) {
+		t.Fatalf("output=%+v error=%v", out, err)
+	}
+}
+
+func TestBuildCodeContextValidationCancellationAndStaleKey(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	called := false
+	tools := codeContextTools{defaultRoot: root, backend: fakeCodeContextBackend{build: func(context.Context, mcpWorkspace, buildCodeContextInput) (buildCodeContextData, error) {
+		called = true
+		return buildCodeContextData{}, nil
+	}}}
+	for _, input := range []buildCodeContextInput{
+		{Query: " "},
+		{Query: "q", Budget: -1},
+		{Query: "q", SelectedKeys: []string{"a", "b", "c", "d"}},
+	} {
+		result, out, err := tools.buildCodeContext(context.Background(), input)
+		if err != nil || !result.IsError || out.Error == nil || out.Error.Code != "invalid_argument" {
+			t.Fatalf("input=%+v result=%+v output=%+v error=%v", input, result, out, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, out, err := tools.buildCodeContext(ctx, buildCodeContextInput{Query: "q"})
+	if err != nil || !result.IsError || out.Error == nil || out.Error.Code != "partial_failure" {
+		t.Fatalf("canceled result=%+v output=%+v error=%v", result, out, err)
+	}
+	if called {
+		t.Fatal("backend called for invalid or canceled input")
+	}
+
+	staleTools := codeContextTools{defaultRoot: root, backend: fakeCodeContextBackend{build: func(context.Context, mcpWorkspace, buildCodeContextInput) (buildCodeContextData, error) {
+		return buildCodeContextData{}, ErrStaleLiveKey
+	}}}
+	result, out, err = staleTools.buildCodeContext(context.Background(), buildCodeContextInput{Query: "q", SelectedKeys: []string{"stale"}})
+	if err != nil || !result.IsError || out.Error == nil || out.Error.Code != "stale_live_key" || out.Error.Recovery == "" {
+		t.Fatalf("stale result=%+v output=%+v error=%v", result, out, err)
+	}
+}
+
+func TestBuildCodeContextProductionBackendPropagatesPackRequest(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	db := filepath.Join(root, ".ragrep", "code.db")
+	if err := os.WriteFile(db, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := packRequest{Root: root, DB: db, Query: "Needle", K: 10, Budget: 4321, SelectedKeys: []string{"a", "b"}}
+	wantData := codePackOutput{Pack: coderetrieval.ContextPack{Budget: 4321}, Fresh: true, Generation: 11}
+	injectCodeDaemonClient(t, fakeCodeDaemonClient{pack: func(ctx context.Context, got packRequest) (codePackOutput, error) {
+		if ctx.Value(codeContextKey{}) != "kept" || !reflect.DeepEqual(got, want) {
+			t.Fatalf("context/request=%v %+v, want kept %+v", ctx.Value(codeContextKey{}), got, want)
+		}
+		return wantData, nil
+	}})
+	ctx := context.WithValue(context.Background(), codeContextKey{}, "kept")
+	data, err := (productionMCPBackend{}).BuildCodeContext(ctx, mcpWorkspace{Root: root, CodeDB: db}, buildCodeContextInput{Query: "Needle", Budget: 4321, SelectedKeys: []string{"a", "b"}})
+	if err != nil || !reflect.DeepEqual(data, wantData) {
+		t.Fatalf("data=%+v error=%v", data, err)
+	}
+}
+
+func TestVerifyCodeContextPassesManifestInMemoryAndCleanFalseIsData(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	otherRoot := newMCPCodeWorkspace(t)
+	wantManifest := coderetrieval.Manifest{IndexRevision: "rev", Symbols: []coderetrieval.SymbolRef{{Key: "a", Path: "pkg/a.go", FileHash: "hash"}}}
+	before, err := os.ReadDir(otherRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := fakeCodeContextBackend{verify: func(ctx context.Context, ws mcpWorkspace, in verifyCodeContextInput) (verifyCodeContextData, error) {
+		if ctx.Err() != nil || ws.Root != otherRoot || !reflect.DeepEqual(in.Manifest, wantManifest) {
+			t.Fatalf("context/workspace/input=%v %+v %+v", ctx.Err(), ws, in)
+		}
+		return codeVerifyOutput{Entries: []codeVerifyEntry{{Key: "a", Path: "pkg/a.go", Stale: true, Resolved: true, ResolvedKey: "a"}}, Clean: false}, nil
+	}}
+	_, out, err := (codeContextTools{defaultRoot: root, backend: backend}).verifyCodeContext(context.Background(), verifyCodeContextInput{Manifest: wantManifest, Root: otherRoot})
+	if err != nil || out.Error != nil || out.Data == nil || out.Data.Clean || len(out.Data.Entries) != 1 {
+		t.Fatalf("output=%+v error=%v", out, err)
+	}
+	after, err := os.ReadDir(otherRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("workspace entries changed: before=%v after=%v", before, after)
+	}
+}
+
+func TestVerifyCodeContextRejectsEmptyManifestAndCancellation(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	called := false
+	tools := codeContextTools{defaultRoot: root, backend: fakeCodeContextBackend{verify: func(context.Context, mcpWorkspace, verifyCodeContextInput) (verifyCodeContextData, error) {
+		called = true
+		return verifyCodeContextData{}, nil
+	}}}
+	result, out, err := tools.verifyCodeContext(context.Background(), verifyCodeContextInput{})
+	if err != nil || !result.IsError || out.Error == nil || out.Error.Code != "invalid_argument" {
+		t.Fatalf("empty manifest result=%+v output=%+v error=%v", result, out, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, out, err = tools.verifyCodeContext(ctx, verifyCodeContextInput{Manifest: coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{{Key: "a"}}}})
+	if err != nil || !result.IsError || out.Error == nil || out.Error.Code != "partial_failure" {
+		t.Fatalf("canceled result=%+v output=%+v error=%v", result, out, err)
+	}
+	if called {
+		t.Fatal("backend called for empty or canceled input")
+	}
+}
+
+func TestVerifyCodeContextProductionBackendPropagatesManifestDirectly(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	db := filepath.Join(root, ".ragrep", "code.db")
+	if err := os.WriteFile(db, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{{Key: "a", Path: "pkg/a.go"}}}
+	want := verifyRequest{Root: root, DB: db, Manifest: manifest}
+	injectCodeDaemonClient(t, fakeCodeDaemonClient{verify: func(ctx context.Context, got verifyRequest) (codeVerifyOutput, error) {
+		if ctx.Value(codeContextKey{}) != "kept" || !reflect.DeepEqual(got, want) {
+			t.Fatalf("context/request=%v %+v, want kept %+v", ctx.Value(codeContextKey{}), got, want)
+		}
+		return codeVerifyOutput{Clean: false}, nil
+	}})
+	ctx := context.WithValue(context.Background(), codeContextKey{}, "kept")
+	data, err := (productionMCPBackend{}).VerifyCodeContext(ctx, mcpWorkspace{Root: root, CodeDB: db}, verifyCodeContextInput{Manifest: manifest})
+	if err != nil || data.Clean {
+		t.Fatalf("data=%+v error=%v", data, err)
+	}
+}
+
+func TestContextHandlersRegisterExactToolProtocol(t *testing.T) {
+	server, err := newRagrepMCPServer(newMCPCodeWorkspace(t), mcpBackends{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0.1.0"}, nil)
+	session, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { session.Close() })
+	listed, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(listed.Tools))
+	readOnly := map[string]bool{
+		"search_documents": true, "read_document": true,
+		"search_code": true, "read_code_symbol": true, "inspect_code_relation": true,
+		"build_code_context": true, "verify_code_context": true,
+	}
+	for _, tool := range listed.Tools {
+		names = append(names, tool.Name)
+		schema, ok := tool.InputSchema.(map[string]any)
+		if !ok || schema["type"] != "object" {
+			t.Fatalf("tool %q input schema=%#v, want object", tool.Name, tool.InputSchema)
+		}
+		outputSchema, ok := tool.OutputSchema.(map[string]any)
+		if !ok || outputSchema["type"] != "object" {
+			t.Fatalf("tool %q output schema=%#v, want object", tool.Name, tool.OutputSchema)
+		}
+		if tool.Description == "" || tool.Annotations == nil || tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
+			t.Fatalf("tool %q description/annotations=%q %+v", tool.Name, tool.Description, tool.Annotations)
+		}
+		if tool.Annotations.ReadOnlyHint != readOnly[tool.Name] {
+			t.Fatalf("tool %q readOnly=%v, want %v", tool.Name, tool.Annotations.ReadOnlyHint, readOnly[tool.Name])
+		}
+		if tool.Name == "add_document" && (tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint || tool.Annotations.IdempotentHint) {
+			t.Fatalf("add_document annotations=%+v", tool.Annotations)
+		}
+		if tool.Name == "reindex_documents" && (tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint || !tool.Annotations.IdempotentHint) {
+			t.Fatalf("reindex_documents annotations=%+v", tool.Annotations)
+		}
+	}
+	sort.Strings(names)
+	want := []string{"add_document", "build_code_context", "inspect_code_relation", "read_code_symbol", "read_document", "reindex_documents", "search_code", "search_documents", "verify_code_context"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("tool names=%v, want %v", names, want)
 	}
 }
