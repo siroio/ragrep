@@ -31,6 +31,20 @@ class ExtractMarkdownTests(unittest.TestCase):
         self.assertNotIn("TRACKING NOISE", got)
         self.assertTrue(got.startswith("---\nsource: Manual/static-batching.html\nunity_version: 6000.3.11f1\n---\n"))
 
+    def test_skips_breadcrumbs_at_start_of_manual_section(self):
+        html = """<div id="content-wrap"><div class="section">
+        <div class="breadcrumbs clear"><ul><li>Getting started</li><li>Graphics</li></ul></div>
+        <h1>Static batching</h1>
+        <p>Combine meshes at build time.</p>
+        </div></div>"""
+
+        got = extract_markdown(html, "Manual/static-batching.html", "6000.3.11f1")
+
+        self.assertIn("# Static batching", got)
+        self.assertIn("Combine meshes at build time.", got)
+        self.assertNotIn("Getting started", got)
+        self.assertNotIn("Graphics", got)
+
     def test_renders_lists_tables_and_code(self):
         html = """<div id="content-wrap"><div class="section">
         <h2>Requirements</h2><ul><li>First</li><li>Second</li></ul>

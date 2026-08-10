@@ -13,7 +13,7 @@ import tempfile
 
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 SKIP_TAGS = {"script", "style"}
-SKIP_CLASSES = {"nextprev"}
+SKIP_CLASSES = {"breadcrumbs", "nextprev"}
 BR_MARKER = "\0"
 
 
