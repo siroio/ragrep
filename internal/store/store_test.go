@@ -193,6 +193,26 @@ func TestGet(t *testing.T) {
 	}
 }
 
+func TestParagraphCount(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("docs/three.md", "first\n\nsecond\n\nthird", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("docs/empty.md", "", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := s.ParagraphCount("docs/three.md"); err != nil || got != 3 {
+		t.Fatalf("ParagraphCount(three) = %d, %v; want 3, nil", got, err)
+	}
+	if got, err := s.ParagraphCount("docs/empty.md"); err != nil || got != 0 {
+		t.Fatalf("ParagraphCount(empty) = %d, %v; want 0, nil", got, err)
+	}
+	if _, err := s.ParagraphCount("docs/missing.md"); err != ErrNotFound {
+		t.Fatalf("ParagraphCount(missing) error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestFirstPath(t *testing.T) {
 	s := newTestStore(t)
 	p, err := s.FirstPath()

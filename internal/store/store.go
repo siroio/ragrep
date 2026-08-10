@@ -488,6 +488,18 @@ func (s *Store) GetDoc(relPath string) (string, error) {
 	return content, err
 }
 
+func (s *Store) ParagraphCount(relPath string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(p.id) FROM documents d
+		LEFT JOIN paragraphs p ON p.doc_id = d.id
+		WHERE d.path=? GROUP BY d.id`, relPath).Scan(&count)
+	if err == sql.ErrNoRows {
+		return 0, ErrNotFound
+	}
+	return count, err
+}
+
 func (s *Store) GetParas(relPath string, seq, context int) (string, error) {
 	rows, err := s.db.Query(`
 		SELECT p.text FROM paragraphs p JOIN documents d ON d.id = p.doc_id

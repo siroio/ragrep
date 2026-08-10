@@ -314,168 +314,23 @@ func cmdIndex(args []string) int {
 	if fset.NArg() == 0 {
 		return fail(fmt.Errorf("usage: ragrep index <path>..."))
 	}
-	wsRoot, err := workspaceRoot(*db)
-	if err != nil {
-		return fail(err)
-	}
-	// Validate every root arg is inside the workspace UP FRONT, before
-	// opening the store or loading the (slow) embedding model. Deferring this
-	// to normPath inside the walk only fires it when the walk reaches an
-	// indexable file -- an outside-root arg that's empty or binary-only would
-	// walk to "0 indexed" and exit 0, and a mix of good/bad args would
-	// partially index before failing on the bad one.
-	normRoots := make([]string, fset.NArg())
-	for i, r := range fset.Args() {
-		nr, err := normPath(r, wsRoot)
-		if err != nil {
-			return fail(err)
-		}
-		normRoots[i] = nr
-	}
-	s, err := openStoreAt(*db)
-	if err != nil {
-		return fail(err)
-	}
-	defer s.Close()
-	dir, err := embed.CacheDir()
-	if err != nil {
-		return fail(err)
-	}
-	e, err := embed.New(dir)
-	if err != nil {
-		return fail(err)
-	}
-	defer e.Close()
-
-	cfg, err := config.Load(wsRoot)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: loading config: %v\n", err)
-		cfg = config.Config{}
-	}
-
-	indexed, skipped, excluded := 0, 0, 0
-	for _, root := range fset.Args() {
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			name := d.Name()
-			if d.IsDir() {
-				if strings.HasPrefix(name, ".") && path != root {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if !*includeCode && codeExtensions[strings.ToLower(filepath.Ext(name))] {
-				excluded++
-				return nil
-			}
-			if argv := cfg.ConverterFor(strings.ToLower(filepath.Ext(name))); argv != nil {
-				raw, err := os.ReadFile(path)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "warning: reading %s: %v\n", path, err)
-					skipped++
-					return nil
-				}
-				rel, err := normPath(path, wsRoot)
-				if err != nil {
-					return err
-				}
-				srcHash := store.HashContent(string(raw))
-				if old, _ := s.DocHash(rel); old == srcHash {
-					// unchanged source: skip without running the converter,
-					// but refresh the stored mtime so a touched-but-unchanged
-					// file doesn't stay flagged stale forever.
-					if info, err := d.Info(); err == nil {
-						if err := s.TouchDoc(rel, info.ModTime().Unix()); err != nil {
-							return err
-						}
-					}
-					return nil
-				}
-				text, err := runConverter(argv, path)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "warning: convert %s: %v\n", path, err)
-					skipped++
-					return nil // one bad file must not kill the whole index run
-				}
-				info, err := d.Info()
-				if err != nil {
-					return err
-				}
-				// upsert with the SOURCE hash so unchanged files skip conversion next run
-				changed, err := s.UpsertDocWithHash(rel, text, info.ModTime().Unix(), srcHash, e.Embed)
-				if err != nil {
-					return fmt.Errorf("%s: %w", rel, err)
-				}
-				if changed {
-					fmt.Println("indexed", rel)
-					indexed++
-				}
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil || info.Size() > maxFileSize || !isTextFile(path) {
-				skipped++
-				return nil
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			rel, err := normPath(path, wsRoot)
-			if err != nil {
-				return err
-			}
-			changed, err := s.UpsertDoc(rel, string(data), info.ModTime().Unix(), e.Embed)
-			if err != nil {
-				return fmt.Errorf("%s: %w", rel, err)
-			}
-			if changed {
-				fmt.Println("indexed", rel)
-				indexed++
-			}
-			return nil
-		})
-		if err != nil {
-			return fail(err)
+	result, err := runDocumentIndex(context.Background(), documentIndexRequest{
+		DB: *db, Paths: fset.Args(), Prune: *prune, IncludeCode: *includeCode,
+	})
+	for _, event := range result.events {
+		if event.stderr {
+			fmt.Fprintln(os.Stderr, event.line)
+		} else {
+			fmt.Fprintln(os.Stdout, event.line)
 		}
 	}
-	pruned := 0
+	if err != nil {
+		return fail(err)
+	}
 	if *prune {
-		roots := normRoots
-		paths, err := s.ListPaths()
-		if err != nil {
-			return fail(err)
-		}
-		for _, p := range paths {
-			underRoot := false
-			for _, root := range roots {
-				if root == "." || p == root || strings.HasPrefix(p, root+"/") {
-					underRoot = true
-					break
-				}
-			}
-			if !underRoot {
-				continue
-			}
-			_, statErr := os.Stat(filepath.Join(wsRoot, filepath.FromSlash(p)))
-			doPrune, err := pruneDecision(statErr)
-			if err != nil {
-				return fail(err)
-			}
-			if !doPrune {
-				continue
-			}
-			if err := s.DeleteDoc(p); err != nil {
-				return fail(err)
-			}
-			fmt.Println("pruned", p)
-			pruned++
-		}
-		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code), %d pruned\n", indexed, skipped, excluded, pruned)
+		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code), %d pruned\n", result.Indexed, result.Skipped, result.Excluded, len(result.prunedPaths))
 	} else {
-		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code)\n", indexed, skipped, excluded)
+		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code)\n", result.Indexed, result.Skipped, result.Excluded)
 	}
 	return 0
 }
@@ -762,6 +617,9 @@ func cmdAdd(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	if _, _, err = resolveDocumentWritePath(wsRoot, key); err != nil {
+		return fail(err)
+	}
 
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -771,37 +629,12 @@ func cmdAdd(args []string) int {
 		return fail(fmt.Errorf("no content on stdin"))
 	}
 
-	content := withFrontmatter(string(data), []string(tags))
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fail(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return fail(err)
-	}
-
-	info, err := os.Stat(path)
+	result, err := runAddDocument(context.Background(), addDocumentRequest{
+		DB: *db, Root: wsRoot, Path: key, Content: string(data), Tags: []string(tags),
+	}, addDocumentDeps{})
 	if err != nil {
 		return fail(err)
 	}
-
-	s, err := openStoreAt(*db)
-	if err != nil {
-		return fail(err)
-	}
-	defer s.Close()
-	dir, err := embed.CacheDir()
-	if err != nil {
-		return fail(err)
-	}
-	e, err := embed.New(dir)
-	if err != nil {
-		return fail(err)
-	}
-	defer e.Close()
-
-	if _, err := s.UpsertDoc(key, content, info.ModTime().Unix(), e.Embed); err != nil {
-		return fail(err)
-	}
-	fmt.Println("indexed", key)
+	fmt.Println("indexed", result.Path)
 	return 0
 }

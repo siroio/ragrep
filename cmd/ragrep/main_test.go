@@ -732,6 +732,50 @@ func TestCmdAddRejectsOutsideRoot(t *testing.T) {
 	}
 }
 
+func TestCmdAddKeepsCLIPathRelativeToCurrentDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".ragrep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	subdir := filepath.Join(root, "subdir")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(subdir)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString("body"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	db := filepath.Join(root, ".ragrep", "index.db")
+	if code := run([]string{"add", "--db", db, filepath.Join("notes", "from-subdir.md")}); code != 0 {
+		t.Fatalf("add from workspace subdirectory: exit=%d, want 0", code)
+	}
+	wantPath := filepath.Join(subdir, "notes", "from-subdir.md")
+	if content, err := os.ReadFile(wantPath); err != nil || string(content) != "body" {
+		t.Fatalf("cwd-relative file = %q, %v; want body at %s", content, err, wantPath)
+	}
+	if _, err := os.Stat(filepath.Join(root, "notes", "from-subdir.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("add incorrectly wrote relative to workspace root: %v", err)
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got, err := s.GetDoc("subdir/notes/from-subdir.md"); err != nil || got != "body" {
+		t.Fatalf("indexed CLI key = %q, %v; want subdir/notes/from-subdir.md", got, err)
+	}
+}
+
 // cmdAdd's flagset must parse `--tag t]... <path>` (flags before the sole
 // positional), matching every other ragrep subcommand -- documenting this in
 // a flagset-only test protects it independent of the CLI usage strings.
@@ -962,6 +1006,48 @@ func TestCmdIndexRejectsOutsideRootEvenWhenEmpty(t *testing.T) {
 	}
 	if code := run([]string{"index", "--db", db, inside}); code != 0 {
 		t.Fatalf("index inside-root empty dir: exit=%d, want 0", code)
+	}
+}
+
+func TestCmdIndexPreservesIndexedAndWarningOutputOrder(t *testing.T) {
+	root := t.TempDir()
+	ragrepDir := filepath.Join(root, ".ragrep")
+	if err := os.Mkdir(ragrepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configJSON := `{"converters":{".bad":["ragrep-test-missing-converter","{input}"]}}`
+	if err := os.WriteFile(filepath.Join(ragrepDir, "config.json"), []byte(configJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.md"), []byte("indexed first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.bad"), []byte("converter fails second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = w, w
+	code := run([]string{"index", "--db", filepath.Join(ragrepDir, "index.db"), "."})
+	os.Stdout, os.Stderr = oldStdout, oldStderr
+	w.Close()
+	output, readErr := io.ReadAll(r)
+	r.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if code != 0 {
+		t.Fatalf("index exit=%d, want 0; output=%s", code, output)
+	}
+	indexedAt := strings.Index(string(output), "indexed a.md")
+	warningAt := strings.Index(string(output), "warning: convert ")
+	if indexedAt < 0 || warningAt < 0 || indexedAt > warningAt {
+		t.Fatalf("output order changed; want indexed a.md before converter warning:\n%s", output)
 	}
 }
 

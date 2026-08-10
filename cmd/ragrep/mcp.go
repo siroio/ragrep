@@ -170,6 +170,7 @@ func newMCPBaseServer() *mcp.Server {
 		&mcp.ServerOptions{Instructions: mcpServerInstructions},
 	)
 	registerDocumentQueryTools(server, documentQueryTools{defaultRoot: ".", backend: productionMCPBackend{}})
+	registerDocumentMutationTools(server, documentMutationTools{defaultRoot: ".", backend: productionMCPBackend{}})
 	return server
 }
 

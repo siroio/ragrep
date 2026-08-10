@@ -60,6 +60,32 @@ type documentQueryTools struct {
 	backend     documentQueryBackend
 }
 
+type addDocumentInput struct {
+	Path    string   `json:"path"`
+	Content string   `json:"content"`
+	Tags    []string `json:"tags,omitempty"`
+	Root    string   `json:"root,omitempty"`
+}
+
+type addDocumentData = addDocumentResult
+
+type reindexDocumentsInput struct {
+	Paths []string `json:"paths"`
+	Root  string   `json:"root,omitempty"`
+}
+
+type reindexDocumentsData = documentIndexResult
+
+type documentMutationBackend interface {
+	AddDocument(context.Context, mcpWorkspace, addDocumentInput) (addDocumentData, error)
+	ReindexDocuments(context.Context, mcpWorkspace, reindexDocumentsInput) (reindexDocumentsData, error)
+}
+
+type documentMutationTools struct {
+	defaultRoot string
+	backend     documentMutationBackend
+}
+
 func registerDocumentQueryTools(server *mcp.Server, tools documentQueryTools) {
 	closedWorld := false
 	annotations := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld}
@@ -77,6 +103,70 @@ func registerDocumentQueryTools(server *mcp.Server, tools documentQueryTools) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input readDocumentInput) (*mcp.CallToolResult, mcpToolOutput[readDocumentData], error) {
 		return tools.readDocument(ctx, input)
 	})
+}
+
+func registerDocumentMutationTools(server *mcp.Server, tools documentMutationTools) {
+	closedWorld := false
+	additive := false
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "add_document",
+		Description: "Create and index a new workspace document without overwriting existing files.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint: false, DestructiveHint: &additive, IdempotentHint: false, OpenWorldHint: &closedWorld,
+		},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input addDocumentInput) (*mcp.CallToolResult, mcpToolOutput[addDocumentData], error) {
+		return tools.addDocument(ctx, input)
+	})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "reindex_documents",
+		Description: "Reindex explicit workspace document paths without pruning or indexing source code.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint: false, DestructiveHint: &additive, IdempotentHint: true, OpenWorldHint: &closedWorld,
+		},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input reindexDocumentsInput) (*mcp.CallToolResult, mcpToolOutput[reindexDocumentsData], error) {
+		return tools.reindexDocuments(ctx, input)
+	})
+}
+
+func (tools documentMutationTools) addDocument(ctx context.Context, input addDocumentInput) (*mcp.CallToolResult, mcpToolOutput[addDocumentData], error) {
+	if err := ctx.Err(); err != nil {
+		return mcpToolFailure[addDocumentData](err)
+	}
+	if strings.TrimSpace(input.Path) == "" || input.Content == "" {
+		return mcpToolFailure[addDocumentData](mcpInvalidArgument())
+	}
+	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
+	if err != nil {
+		return mcpToolFailure[addDocumentData](err)
+	}
+	data, err := tools.backend.AddDocument(ctx, ws, input)
+	if err != nil {
+		return mcpToolFailure[addDocumentData](err)
+	}
+	return mcpSuccess("document added", data)
+}
+
+func (tools documentMutationTools) reindexDocuments(ctx context.Context, input reindexDocumentsInput) (*mcp.CallToolResult, mcpToolOutput[reindexDocumentsData], error) {
+	if err := ctx.Err(); err != nil {
+		return mcpToolFailure[reindexDocumentsData](err)
+	}
+	if len(input.Paths) == 0 {
+		return mcpToolFailure[reindexDocumentsData](mcpInvalidArgument())
+	}
+	for _, path := range input.Paths {
+		if strings.TrimSpace(path) == "" {
+			return mcpToolFailure[reindexDocumentsData](mcpInvalidArgument())
+		}
+	}
+	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
+	if err != nil {
+		return mcpToolFailure[reindexDocumentsData](err)
+	}
+	data, err := tools.backend.ReindexDocuments(ctx, ws, input)
+	if err != nil {
+		return mcpToolFailure[reindexDocumentsData](err)
+	}
+	return mcpSuccess(fmt.Sprintf("%d documents indexed", data.Indexed), data)
 }
 
 func (tools documentQueryTools) searchDocuments(ctx context.Context, input searchDocumentsInput) (*mcp.CallToolResult, mcpToolOutput[searchDocumentsData], error) {
@@ -181,6 +271,24 @@ func (productionMCPBackend) ReadDocument(ctx context.Context, ws mcpWorkspace, i
 		return readDocumentData{}, mcpInvalidArgument()
 	}
 	return readDocumentData{Path: key, Paragraph: input.Paragraph, Context: input.Context, Content: content}, nil
+}
+
+func (productionMCPBackend) AddDocument(ctx context.Context, ws mcpWorkspace, input addDocumentInput) (addDocumentData, error) {
+	return runAddDocument(ctx, addDocumentRequest{
+		DB: ws.DocumentDB, Root: ws.Root, Path: input.Path, Content: input.Content, Tags: input.Tags,
+	}, addDocumentDeps{})
+}
+
+func (productionMCPBackend) ReindexDocuments(ctx context.Context, ws mcpWorkspace, input reindexDocumentsInput) (reindexDocumentsData, error) {
+	paths := make([]string, len(input.Paths))
+	for i, path := range input.Paths {
+		if filepath.IsAbs(path) {
+			paths[i] = path
+		} else {
+			paths[i] = filepath.Join(ws.Root, filepath.FromSlash(path))
+		}
+	}
+	return runDocumentIndex(ctx, documentIndexRequest{DB: ws.DocumentDB, Paths: paths, Prune: false, IncludeCode: false})
 }
 
 func documentSearchDataFromHits(hits []store.Hit) searchDocumentsData {

@@ -18,6 +18,19 @@ type fakeDocumentQueryBackend struct {
 	read   func(context.Context, mcpWorkspace, readDocumentInput) (readDocumentData, error)
 }
 
+type fakeDocumentMutationBackend struct {
+	add     func(context.Context, mcpWorkspace, addDocumentInput) (addDocumentData, error)
+	reindex func(context.Context, mcpWorkspace, reindexDocumentsInput) (reindexDocumentsData, error)
+}
+
+func (b fakeDocumentMutationBackend) AddDocument(ctx context.Context, ws mcpWorkspace, in addDocumentInput) (addDocumentData, error) {
+	return b.add(ctx, ws, in)
+}
+
+func (b fakeDocumentMutationBackend) ReindexDocuments(ctx context.Context, ws mcpWorkspace, in reindexDocumentsInput) (reindexDocumentsData, error) {
+	return b.reindex(ctx, ws, in)
+}
+
 func (b fakeDocumentQueryBackend) SearchDocuments(ctx context.Context, ws mcpWorkspace, in searchDocumentsInput) (searchDocumentsData, error) {
 	return b.search(ctx, ws, in)
 }
@@ -39,6 +52,25 @@ func connectDocumentTools(t *testing.T, tools documentQueryTools) *mcp.ClientSes
 	t.Helper()
 	server := newMCPBaseServer()
 	registerDocumentQueryTools(server, tools)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0.1.0"}, nil)
+	session, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { session.Close() })
+	return session
+}
+
+func connectDocumentMutationTools(t *testing.T, tools documentMutationTools) *mcp.ClientSession {
+	t.Helper()
+	server := newMCPBaseServer()
+	registerDocumentMutationTools(server, tools)
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
 	if err != nil {
@@ -219,13 +251,18 @@ func TestDocumentHandlersUseDocumentDBAndReadonlyAnnotations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed.Tools) != 2 {
-		t.Fatalf("tools=%+v", listed.Tools)
-	}
+	found := 0
 	for _, tool := range listed.Tools {
+		if tool.Name != "search_documents" && tool.Name != "read_document" {
+			continue
+		}
+		found++
 		if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint || tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
 			t.Fatalf("tool %q annotations=%+v", tool.Name, tool.Annotations)
 		}
+	}
+	if found != 2 {
+		t.Fatalf("found %d document query tools, want 2; tools=%+v", found, listed.Tools)
 	}
 }
 
@@ -263,5 +300,172 @@ func TestSearchDocumentsProductionBackendRequiresIndexAndForwardsDaemonRequest(t
 	}
 	if strings.Contains(string(encoded), "mtime") || strings.Contains(string(encoded), ws.DocumentDB) {
 		t.Fatalf("public output leaked internal data: %s", encoded)
+	}
+}
+
+func TestAddDocumentDefaultsRootAndReturnsStructuredCountsAndTags(t *testing.T) {
+	root := newMCPDocumentWorkspace(t)
+	var gotWS mcpWorkspace
+	var gotInput addDocumentInput
+	backend := fakeDocumentMutationBackend{
+		add: func(_ context.Context, ws mcpWorkspace, input addDocumentInput) (addDocumentData, error) {
+			gotWS, gotInput = ws, input
+			return addDocumentData{Path: "notes/guide.md", Paragraphs: 2, Tags: []string{"guide", "api"}}, nil
+		},
+	}
+	session := connectDocumentMutationTools(t, documentMutationTools{defaultRoot: root, backend: backend})
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "add_document", Arguments: map[string]any{
+		"path": "notes/guide.md", "content": "first\n\nsecond", "tags": []string{"guide", "api"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := documentToolOutput[addDocumentData](t, result)
+	if result.IsError || out.Data == nil || out.Data.Path != "notes/guide.md" || out.Data.Paragraphs != 2 || strings.Join(out.Data.Tags, ",") != "guide,api" {
+		t.Fatalf("result=%+v output=%+v", result, out)
+	}
+	if gotWS.Root != root || gotInput.Path != "notes/guide.md" || gotInput.Content != "first\n\nsecond" || strings.Join(gotInput.Tags, ",") != "guide,api" {
+		t.Fatalf("workspace=%+v input=%+v", gotWS, gotInput)
+	}
+}
+
+func TestReindexDocumentsUsesExplicitRootAndRejectsEmptyPaths(t *testing.T) {
+	root := newMCPDocumentWorkspace(t)
+	otherRoot := newMCPDocumentWorkspace(t)
+	var gotWS mcpWorkspace
+	var gotInput reindexDocumentsInput
+	backend := fakeDocumentMutationBackend{
+		reindex: func(_ context.Context, ws mcpWorkspace, input reindexDocumentsInput) (reindexDocumentsData, error) {
+			gotWS, gotInput = ws, input
+			return reindexDocumentsData{Indexed: 3, Skipped: 1, Excluded: 2, Warnings: []string{"warning: one"}}, nil
+		},
+	}
+	tools := documentMutationTools{defaultRoot: root, backend: backend}
+	session := connectDocumentMutationTools(t, tools)
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "reindex_documents", Arguments: map[string]any{
+		"paths": []string{"docs", "notes"}, "root": otherRoot,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := documentToolOutput[reindexDocumentsData](t, result)
+	if result.IsError || out.Data == nil || out.Data.Indexed != 3 || out.Data.Skipped != 1 || out.Data.Excluded != 2 || len(out.Data.Warnings) != 1 {
+		t.Fatalf("result=%+v output=%+v", result, out)
+	}
+	if gotWS.Root != otherRoot || strings.Join(gotInput.Paths, ",") != "docs,notes" {
+		t.Fatalf("workspace=%+v input=%+v", gotWS, gotInput)
+	}
+
+	result, err = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "reindex_documents", Arguments: map[string]any{"paths": []string{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = documentToolOutput[reindexDocumentsData](t, result)
+	if !result.IsError || out.Error == nil || out.Error.Code != "invalid_argument" {
+		t.Fatalf("empty paths result=%+v output=%+v", result, out)
+	}
+}
+
+func TestAddDocumentDuplicateValidationAndCancellation(t *testing.T) {
+	root := newMCPDocumentWorkspace(t)
+	backend := fakeDocumentMutationBackend{
+		add: func(context.Context, mcpWorkspace, addDocumentInput) (addDocumentData, error) {
+			return addDocumentData{}, documentMutationError("already_exists", "duplicate")
+		},
+	}
+	tools := documentMutationTools{defaultRoot: root, backend: backend}
+	session := connectDocumentMutationTools(t, tools)
+	for _, arguments := range []map[string]any{
+		{"path": "", "content": "body"},
+		{"path": "notes/empty.md", "content": ""},
+	} {
+		result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "add_document", Arguments: arguments})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := documentToolOutput[addDocumentData](t, result)
+		if !result.IsError || out.Error == nil || out.Error.Code != "invalid_argument" {
+			t.Fatalf("arguments=%v result=%+v output=%+v", arguments, result, out)
+		}
+	}
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "add_document", Arguments: map[string]any{"path": "notes/existing.md", "content": "body"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := documentToolOutput[addDocumentData](t, result)
+	if !result.IsError || out.Error == nil || out.Error.Code != "already_exists" {
+		t.Fatalf("duplicate result=%+v output=%+v", result, out)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, out, err = tools.addDocument(ctx, addDocumentInput{Path: "notes/canceled.md", Content: "body"})
+	if err != nil || !result.IsError || out.Error == nil || out.Error.Code != "partial_failure" {
+		t.Fatalf("canceled add result=%+v output=%+v error=%v", result, out, err)
+	}
+}
+
+func TestDocumentMutationAnnotations(t *testing.T) {
+	root := newMCPDocumentWorkspace(t)
+	backend := fakeDocumentMutationBackend{
+		add: func(context.Context, mcpWorkspace, addDocumentInput) (addDocumentData, error) {
+			return addDocumentData{}, nil
+		},
+		reindex: func(context.Context, mcpWorkspace, reindexDocumentsInput) (reindexDocumentsData, error) {
+			return reindexDocumentsData{}, nil
+		},
+	}
+	session := connectDocumentMutationTools(t, documentMutationTools{defaultRoot: root, backend: backend})
+	listed, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIdempotent := map[string]bool{"add_document": false, "reindex_documents": true}
+	found := 0
+	for _, tool := range listed.Tools {
+		want, ok := wantIdempotent[tool.Name]
+		if !ok {
+			continue
+		}
+		found++
+		a := tool.Annotations
+		if a == nil || a.ReadOnlyHint || a.DestructiveHint == nil || *a.DestructiveHint || a.IdempotentHint != want || a.OpenWorldHint == nil || *a.OpenWorldHint {
+			t.Fatalf("tool %q annotations=%+v", tool.Name, a)
+		}
+	}
+	if found != 2 {
+		t.Fatalf("found %d mutation tools, want 2; tools=%+v", found, listed.Tools)
+	}
+}
+
+func TestReindexDocumentsProductionBackendNeverPrunesOrIncludesCode(t *testing.T) {
+	root, db := newDocumentMutationWorkspace(t)
+	if err := os.WriteFile(filepath.Join(root, "ignored.go"), []byte("package ignored"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("missing.md", "keep indexed", 1, func(string) ([]float32, error) { return make([]float32, 768), nil }); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	s.Close()
+
+	data, err := (productionMCPBackend{}).ReindexDocuments(context.Background(), mcpWorkspace{Root: root, DocumentDB: db}, reindexDocumentsInput{Paths: []string{"."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Indexed != 0 || data.Excluded != 1 {
+		t.Fatalf("reindex data=%+v, want code excluded and nothing indexed", data)
+	}
+	s, err = store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.GetDoc("missing.md"); err != nil {
+		t.Fatalf("reindex pruned missing.md: %v", err)
 	}
 }
