@@ -985,6 +985,9 @@ func cmdCodePack(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	if *k <= 0 || *k > 5 {
+		*k = 5
+	}
 	out, err := client.Pack(context.Background(), packRequest{
 		Root: root, DB: dbPath, Query: *query, K: *k, Budget: *budget, SelectedKeys: []string(selected),
 	})

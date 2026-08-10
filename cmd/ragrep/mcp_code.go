@@ -87,17 +87,17 @@ func registerCodeQueryTools(server *mcp.Server, tools codeQueryTools) {
 	closedWorld := false
 	annotations := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld}
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "search_code", Description: "Search indexed code symbols before reading a selected body.", Annotations: annotations,
+		Name: "search_code", Description: "Use to find indexed code candidates, then call read_code_symbol on the relevant result.", Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input searchCodeInput) (*mcp.CallToolResult, mcpToolOutput[searchCodeData], error) {
 		return tools.searchCode(ctx, input)
 	})
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "read_code_symbol", Description: "Read a selected search_code candidate's body as evidence before answering or following relations.", Annotations: annotations,
+		Name: "read_code_symbol", Description: "Use after search_code to read a body, then call inspect_code_relation or build_code_context if more evidence is needed.", Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input readCodeSymbolInput) (*mcp.CallToolResult, mcpToolOutput[readCodeSymbolData], error) {
 		return tools.readCodeSymbol(ctx, input)
 	})
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "inspect_code_relation", Description: "Inspect one needed relation, then read the selected target body with read_code_symbol.", Annotations: annotations,
+		Name: "inspect_code_relation", Description: "Use after read_code_symbol for one relation, then call read_code_symbol or build_code_context on relevant targets.", Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input inspectCodeRelationInput) (*mcp.CallToolResult, mcpToolOutput[inspectCodeRelationData], error) {
 		return tools.inspectCodeRelation(ctx, input)
 	})
@@ -107,12 +107,12 @@ func registerCodeContextTools(server *mcp.Server, tools codeContextTools) {
 	closedWorld := false
 	annotations := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld}
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "build_code_context", Description: "Build bounded code evidence after search_code; retain its manifest and verify it before relying on the result.", Annotations: annotations,
+		Name: "build_code_context", Description: "Use after search_code to build bounded evidence, then call verify_code_context before relying on it.", Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input buildCodeContextInput) (*mcp.CallToolResult, mcpToolOutput[buildCodeContextData], error) {
 		return tools.buildCodeContext(ctx, input)
 	})
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "verify_code_context", Description: "Verify a build_code_context manifest immediately before using its evidence; rebuild context when clean is false.", Annotations: annotations,
+		Name: "verify_code_context", Description: "Use immediately before relying on built evidence; call build_code_context again when clean is false.", Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input verifyCodeContextInput) (*mcp.CallToolResult, mcpToolOutput[verifyCodeContextData], error) {
 		return tools.verifyCodeContext(ctx, input)
 	})

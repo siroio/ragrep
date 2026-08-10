@@ -91,14 +91,14 @@ func registerDocumentQueryTools(server *mcp.Server, tools documentQueryTools) {
 	annotations := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_documents",
-		Description: "Search indexed workspace documents and return paragraph candidates.",
+		Description: "Use to find indexed document candidates, then call read_document on the relevant result.",
 		Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input searchDocumentsInput) (*mcp.CallToolResult, mcpToolOutput[searchDocumentsData], error) {
 		return tools.searchDocuments(ctx, input)
 	})
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "read_document",
-		Description: "Read an indexed document or a bounded paragraph window.",
+		Description: "Use after search_documents to read evidence; call search_documents or build_code_context if more context is needed.",
 		Annotations: annotations,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input readDocumentInput) (*mcp.CallToolResult, mcpToolOutput[readDocumentData], error) {
 		return tools.readDocument(ctx, input)
@@ -110,7 +110,7 @@ func registerDocumentMutationTools(server *mcp.Server, tools documentMutationToo
 	additive := false
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_document",
-		Description: "Create and index a new workspace document without overwriting existing files.",
+		Description: "Use only when explicitly asked to create a document; then call search_documents or read_document to confirm it.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint: false, DestructiveHint: &additive, IdempotentHint: false, OpenWorldHint: &closedWorld,
 		},
@@ -119,7 +119,7 @@ func registerDocumentMutationTools(server *mcp.Server, tools documentMutationToo
 	})
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "reindex_documents",
-		Description: "Reindex explicit workspace document paths without pruning or indexing source code.",
+		Description: "Use when document search is stale; then repeat search_documents.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint: false, DestructiveHint: &additive, IdempotentHint: true, OpenWorldHint: &closedWorld,
 		},

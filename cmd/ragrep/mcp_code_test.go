@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -532,6 +533,17 @@ func TestContextHandlersRegisterExactToolProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := make([]string, 0, len(listed.Tools))
+	descriptionParts := map[string][]string{
+		"search_documents":      {"Use to find", "read_document"},
+		"read_document":         {"Use after search_documents", "search_documents or build_code_context"},
+		"add_document":          {"Use only when", "search_documents or read_document"},
+		"reindex_documents":     {"Use when", "search_documents"},
+		"search_code":           {"Use to find", "read_code_symbol"},
+		"read_code_symbol":      {"Use after search_code", "inspect_code_relation or build_code_context"},
+		"inspect_code_relation": {"Use after read_code_symbol", "read_code_symbol or build_code_context"},
+		"build_code_context":    {"Use after search_code", "verify_code_context"},
+		"verify_code_context":   {"Use immediately before", "build_code_context again"},
+	}
 	readOnly := map[string]bool{
 		"search_documents": true, "read_document": true,
 		"search_code": true, "read_code_symbol": true, "inspect_code_relation": true,
@@ -547,8 +559,13 @@ func TestContextHandlersRegisterExactToolProtocol(t *testing.T) {
 		if !ok || outputSchema["type"] != "object" {
 			t.Fatalf("tool %q output schema=%#v, want object", tool.Name, tool.OutputSchema)
 		}
-		if tool.Description == "" || tool.Annotations == nil || tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
+		if tool.Annotations == nil || tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
 			t.Fatalf("tool %q description/annotations=%q %+v", tool.Name, tool.Description, tool.Annotations)
+		}
+		for _, part := range descriptionParts[tool.Name] {
+			if !strings.Contains(tool.Description, part) {
+				t.Fatalf("tool %q description=%q, want transition part %q", tool.Name, tool.Description, part)
+			}
 		}
 		if tool.Annotations.ReadOnlyHint != readOnly[tool.Name] {
 			t.Fatalf("tool %q readOnly=%v, want %v", tool.Name, tool.Annotations.ReadOnlyHint, readOnly[tool.Name])

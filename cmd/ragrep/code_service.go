@@ -246,8 +246,10 @@ func (s *codeService) Pack(ctx context.Context, req packRequest) (codePackOutput
 	}
 	defer unlock()
 	k := req.K
-	if k <= 0 || k > 5 {
+	if k <= 0 {
 		k = 5
+	} else if k > 10 {
+		k = 10
 	}
 	search, err := s.searchSnapshot(ctx, ws, searchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: "auto", K: k}, generation)
 	if err != nil {

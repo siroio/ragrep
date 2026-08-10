@@ -1790,9 +1790,9 @@ func TestCmdCodePackUsageErrors(t *testing.T) {
 	}
 }
 
-func TestCodeServicePackReturnsFreshLiveBodyAndCapsCandidates(t *testing.T) {
+func TestCodeServicePackReturnsTenFreshCandidatesAndLiveBody(t *testing.T) {
 	svc, ws, _ := newTestCodeService(t)
-	for i := range 6 {
+	for i := range 12 {
 		ws.save(t, fmt.Sprintf("handler%d.go", i), fmt.Sprintf("package service\nfunc Handler%d() { SharedOperation() }", i))
 	}
 	search, err := svc.Search(context.Background(), searchRequest{Root: ws.root, Query: "handler0.go"})
@@ -1801,13 +1801,13 @@ func TestCodeServicePackReturnsFreshLiveBodyAndCapsCandidates(t *testing.T) {
 	}
 
 	out, err := svc.Pack(context.Background(), packRequest{
-		Root: ws.root, Query: "SharedOperation", K: 99, Budget: 100_000,
+		Root: ws.root, Query: "SharedOperation", K: 10, Budget: 100_000,
 		SelectedKeys: []string{search.Hits[0].Key},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !out.Fresh || out.Generation == 0 || len(out.Pack.Candidates) != 5 {
+	if !out.Fresh || out.Generation == 0 || len(out.Pack.Candidates) != 10 {
 		t.Fatalf("out=%+v", out)
 	}
 	if len(out.Pack.Symbols) != 1 || !strings.Contains(out.Pack.Symbols[0].Body, "SharedOperation") {
@@ -1957,14 +1957,14 @@ func TestCmdCodePackUsesDaemonAndKeepsFormatter(t *testing.T) {
 	db := filepath.Join(root, ".ragrep", "code.db")
 	want := codePackOutput{Fresh: true, Generation: 7, Pack: coderetrieval.ContextPack{Budget: 1000}}
 	client := fakeCodeDaemonClient{pack: func(_ context.Context, req packRequest) (codePackOutput, error) {
-		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Query != "Foo" || req.K != 10 || req.Budget != 1000 || !reflect.DeepEqual(req.SelectedKeys, []string{"key"}) {
+		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Query != "Foo" || req.K != 5 || req.Budget != 1000 || !reflect.DeepEqual(req.SelectedKeys, []string{"key"}) {
 			t.Fatalf("request=%+v", req)
 		}
 		return want, nil
 	}}
 	injectCodeDaemonClient(t, client)
 
-	code, stdout, stderr := captureCodeCommand(t, []string{"code", "pack", "--db", db, "--query", "Foo", "--select", "key", "--budget", "1000", "--json"})
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "pack", "--db", db, "--query", "Foo", "--k", "99", "--select", "key", "--budget", "1000", "--json"})
 	if code != 0 || stderr != "" {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
