@@ -38,6 +38,21 @@ class ExtractMarkdownTests(unittest.TestCase):
         self.assertIn("| Mode | Value |", got)
         self.assertIn("```\nif (ready) {\n    Run();\n}\n```", got)
 
+    def test_skips_table_rows_in_excluded_subtrees(self):
+        html = """<div id="content-wrap"><div class="section">
+        <table>
+          <tr><th>Mode</th><th>Value</th></tr><tr><td>Fast</td><td>1</td></tr>
+          <tbody class="nextprev"><tr><td>PREVIOUS</td><td>NOISE</td></tr></tbody>
+          <script><tr><td>SCRIPT</td><td>NOISE</td></tr></script>
+          <style><tr><td>STYLE</td><td>NOISE</td></tr></style>
+        </table>
+        </div></div>"""
+        got = extract_markdown(html, "Manual/table.html", "6000.3.11f1")
+        self.assertIn("| Fast | 1 |", got)
+        self.assertNotIn("PREVIOUS", got)
+        self.assertNotIn("SCRIPT", got)
+        self.assertNotIn("STYLE", got)
+
     def test_renders_nested_lists(self):
         html = """<div id="content-wrap"><div class="section">
         <ul><li>Parent<ol><li>Child</li></ol></li></ul>

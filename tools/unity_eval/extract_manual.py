@@ -59,6 +59,13 @@ def descendants(node: Node):
             yield from descendants(child)
 
 
+def visible_descendants(node: Node):
+    for child in node.children:
+        if isinstance(child, Node) and not skipped(child):
+            yield child
+            yield from visible_descendants(child)
+
+
 def top_level_sections(node: Node) -> list[Node]:
     found: list[Node] = []
     for child in node.children:
@@ -133,7 +140,7 @@ def render_node(node: Node, blocks: list[str], list_depth: int) -> None:
         return
     if node.tag == "table":
         rows: list[list[str]] = []
-        for candidate in descendants(node):
+        for candidate in visible_descendants(node):
             if candidate.tag != "tr":
                 continue
             cells = [
