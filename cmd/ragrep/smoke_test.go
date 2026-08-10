@@ -151,25 +151,25 @@ func TestSmokeMCP(t *testing.T) {
 			_ = command.Process.Kill()
 		}
 	})
-	addedResult := callMCPTool(t, ctx, session, "add_document", map[string]any{"path": "notes/mcp.md", "content": "old MCP marker"})
+	addedResult := callMCPTool(t, ctx, session, "add_document", map[string]any{"path": "notes/mcp.md", "content": "oldmcpmarkerunique"})
 	var added mcpToolOutput[addDocumentData]
 	decodeMCPStructured(t, addedResult, &added)
 	if added.Data == nil || added.Data.Path != "notes/mcp.md" || added.Data.Paragraphs != 1 {
 		t.Fatalf("add result=%+v", added)
 	}
-	search := callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "old MCP marker", "mode": "text"})
+	search := callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "oldmcpmarkerunique", "mode": "text"})
 	var searched mcpToolOutput[searchDocumentsData]
 	decodeMCPStructured(t, search, &searched)
-	if searched.Data == nil || len(searched.Data.Hits) != 1 || searched.Data.Hits[0].Path != "notes/mcp.md" || !strings.Contains(searched.Data.Hits[0].Snippet, "old MCP marker") {
+	if searched.Data == nil || len(searched.Data.Hits) != 1 || searched.Data.Hits[0].Path != "notes/mcp.md" || !strings.Contains(searched.Data.Hits[0].Snippet, "oldmcpmarkerunique") {
 		t.Fatalf("document search=%+v", searched)
 	}
 	readResult := callMCPTool(t, ctx, session, "read_document", map[string]any{"path": "notes/mcp.md"})
 	var read mcpToolOutput[readDocumentData]
 	decodeMCPStructured(t, readResult, &read)
-	if read.Data == nil || read.Data.Path != "notes/mcp.md" || read.Data.Content != "old MCP marker" {
+	if read.Data == nil || read.Data.Path != "notes/mcp.md" || read.Data.Content != "oldmcpmarkerunique" {
 		t.Fatalf("read document=%+v", read)
 	}
-	if err := os.WriteFile(filepath.Join(root, "notes", "mcp.md"), []byte("new MCP marker"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "notes", "mcp.md"), []byte("newmcpmarkerunique"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	reindexResult := callMCPTool(t, ctx, session, "reindex_documents", map[string]any{"paths": []string{"notes/mcp.md"}})
@@ -178,11 +178,18 @@ func TestSmokeMCP(t *testing.T) {
 	if reindexed.Data == nil || reindexed.Data.Indexed != 1 || reindexed.Data.Skipped != 0 {
 		t.Fatalf("reindex=%+v", reindexed)
 	}
-	newSearchResult := callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "new MCP marker", "mode": "text"})
+	newSearchResult := callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "newmcpmarkerunique", "mode": "text"})
 	var newSearch mcpToolOutput[searchDocumentsData]
 	decodeMCPStructured(t, newSearchResult, &newSearch)
-	if newSearch.Data == nil || len(newSearch.Data.Hits) != 1 || newSearch.Data.Hits[0].Path != "notes/mcp.md" || !strings.Contains(newSearch.Data.Hits[0].Snippet, "new MCP marker") || strings.Contains(newSearch.Data.Hits[0].Snippet, "old MCP marker") {
+	if newSearch.Data == nil || len(newSearch.Data.Hits) != 1 || newSearch.Data.Hits[0].Path != "notes/mcp.md" || !strings.Contains(newSearch.Data.Hits[0].Snippet, "newmcpmarkerunique") || strings.Contains(newSearch.Data.Hits[0].Snippet, "oldmcpmarkerunique") {
 		t.Fatalf("new document search=%+v", newSearch)
+	}
+	oldSearchResult := callMCPTool(t, ctx, session, "search_documents", map[string]any{"query": "oldmcpmarkerunique", "mode": "text"})
+	var oldSearch mcpToolOutput[searchDocumentsData]
+	decodeMCPStructured(t, oldSearchResult, &oldSearch)
+	if oldSearch.Data == nil || len(oldSearch.Data.Hits) != 0 {
+		encoded, _ := json.Marshal(oldSearch)
+		t.Fatalf("old document search after reindex=%s", encoded)
 	}
 
 	codeSearch := callMCPTool(t, ctx, session, "search_code", map[string]any{"query": "MCPFixture", "mode": "text"})
