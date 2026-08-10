@@ -31,20 +31,28 @@ func seedDocumentDB(t *testing.T, path, doc, content string) {
 func TestDocumentStorePoolOpensConcurrentFirstUseOnce(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "index.db")
 	seedDocumentDB(t, db, "notes/result.md", "search result")
+	const searches = 8
 	var opens atomic.Int32
+	openerStarted := make(chan struct{})
+	releaseOpener := make(chan struct{})
 	svc := newDocumentService(nil, func(path string) (*store.Store, error) {
-		opens.Add(1)
+		if opens.Add(1) == 1 {
+			close(openerStarted)
+			<-releaseOpener
+		}
 		return store.Open(path)
 	})
 	t.Cleanup(func() { _ = svc.Close() })
 
 	start := make(chan struct{})
+	searchesReady := make(chan struct{}, searches)
 	var wg sync.WaitGroup
-	for range 8 {
+	for range searches {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			<-start
+			searchesReady <- struct{}{}
 			hits, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
 			if err != nil || len(hits) != 1 || hits[0].Doc != "notes/result.md" {
 				t.Errorf("hits=%+v err=%v", hits, err)
@@ -52,6 +60,11 @@ func TestDocumentStorePoolOpensConcurrentFirstUseOnce(t *testing.T) {
 		}()
 	}
 	close(start)
+	<-openerStarted
+	for range searches {
+		<-searchesReady
+	}
+	close(releaseOpener)
 	wg.Wait()
 	if got := opens.Load(); got != 1 {
 		t.Fatalf("open calls=%d, want 1", got)
@@ -106,7 +119,9 @@ func TestDocumentStorePoolReusesExistingFileAlias(t *testing.T) {
 
 func TestDocumentServiceCloseWaitsForLeaseAndRejectsLaterSearch(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "index.db")
+	otherDB := filepath.Join(filepath.Dir(db), "other.db")
 	seedDocumentDB(t, db, "notes/result.md", "search result")
+	seedDocumentDB(t, otherDB, "notes/other.md", "other result")
 	started := make(chan struct{})
 	release := make(chan struct{})
 	p := newEmbeddingPool(func() (textEmbedder, error) {
@@ -116,12 +131,20 @@ func TestDocumentServiceCloseWaitsForLeaseAndRejectsLaterSearch(t *testing.T) {
 			return fakeEmbed("search")
 		}), nil
 	})
-	var opened *store.Store
+	var opened []*store.Store
+	var openedMu sync.Mutex
 	svc := newDocumentService(p, func(path string) (*store.Store, error) {
-		var err error
-		opened, err = store.Open(path)
-		return opened, err
+		s, err := store.Open(path)
+		if err == nil {
+			openedMu.Lock()
+			opened = append(opened, s)
+			openedMu.Unlock()
+		}
+		return s, err
 	})
+	if _, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: otherDB, Query: "other", Mode: "text", K: 1}); err != nil {
+		t.Fatal(err)
+	}
 	searchDone := make(chan error, 1)
 	go func() {
 		_, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "vector", K: 1})
@@ -146,8 +169,16 @@ func TestDocumentServiceCloseWaitsForLeaseAndRejectsLaterSearch(t *testing.T) {
 	if err := <-closed; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := opened.SearchText("search", 1, nil); err == nil {
-		t.Fatal("store remains usable after service Close")
+	openedMu.Lock()
+	stores := append([]*store.Store(nil), opened...)
+	openedMu.Unlock()
+	if got := len(stores); got != 2 {
+		t.Fatalf("opened stores=%d, want 2", got)
+	}
+	for _, s := range stores {
+		if _, err := s.SearchText("search", 1, nil); err == nil {
+			t.Fatal("store remains usable after service Close")
+		}
 	}
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
