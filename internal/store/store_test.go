@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -12,6 +14,37 @@ func fakeEmbed(text string) ([]float32, error) {
 		v[i%embedDim] += float32(r % 13)
 	}
 	return v, nil
+}
+
+func TestUpsertDocContextRejectsCancellationBeforeCommit(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	embeds := 0
+	_, err := s.upsertDocWithHashContext(ctx, "docs/canceled.md", "first\n\nsecond", 1, HashContent("first\n\nsecond"), func(text string) ([]float32, error) {
+		embeds++
+		return fakeEmbed(text)
+	}, cancel)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("upsert error=%v, want context.Canceled", err)
+	}
+	if embeds != 2 {
+		t.Fatalf("embed calls=%d, want cancellation after final embed", embeds)
+	}
+	if _, err := s.GetDoc("docs/canceled.md"); err != ErrNotFound {
+		t.Fatalf("canceled upsert committed document: %v", err)
+	}
+}
+
+func TestUpsertDocContextRejectsCancellationBeforeZeroParagraphCommit(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := s.upsertDocWithHashContext(ctx, "docs/empty.md", "", 1, HashContent(""), fakeEmbed, cancel)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("zero-paragraph upsert error=%v, want context.Canceled", err)
+	}
+	if _, err := s.GetDoc("docs/empty.md"); err != ErrNotFound {
+		t.Fatalf("canceled zero-paragraph upsert committed document: %v", err)
+	}
 }
 
 func newTestStore(t *testing.T) *Store {
@@ -236,6 +269,26 @@ func TestExpandHitBodiesUsesAggregateRuneBudgetAndMarksTruncation(t *testing.T) 
 	}
 	if used := len([]rune(got[0].Body)) + len([]rune(got[1].Body)); used != 4 {
 		t.Fatalf("used %d runes, want aggregate budget 4", used)
+	}
+}
+
+func TestParagraphCount(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.UpsertDoc("docs/three.md", "first\n\nsecond\n\nthird", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertDoc("docs/empty.md", "", 1, fakeEmbed); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := s.ParagraphCount("docs/three.md"); err != nil || got != 3 {
+		t.Fatalf("ParagraphCount(three) = %d, %v; want 3, nil", got, err)
+	}
+	if got, err := s.ParagraphCount("docs/empty.md"); err != nil || got != 0 {
+		t.Fatalf("ParagraphCount(empty) = %d, %v; want 0, nil", got, err)
+	}
+	if _, err := s.ParagraphCount("docs/missing.md"); err != ErrNotFound {
+		t.Fatalf("ParagraphCount(missing) error = %v, want ErrNotFound", err)
 	}
 }
 
