@@ -123,6 +123,7 @@ func TestSearchDocumentsValidationEmptyResultsRootAndCancellation(t *testing.T) 
 		{"query": "   "},
 		{"query": "q", "mode": "unknown"},
 		{"query": "q", "limit": -1},
+		{"query": "q", "limit": 11},
 	} {
 		result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "search_documents", Arguments: arguments})
 		if err != nil {

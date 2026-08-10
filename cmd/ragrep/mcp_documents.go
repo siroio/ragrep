@@ -95,7 +95,7 @@ func (tools documentQueryTools) searchDocuments(ctx context.Context, input searc
 	if input.Limit == 0 {
 		input.Limit = 5
 	}
-	if input.Limit < 0 {
+	if input.Limit < 0 || input.Limit > 10 {
 		return mcpToolFailure[searchDocumentsData](mcpInvalidArgument())
 	}
 	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
