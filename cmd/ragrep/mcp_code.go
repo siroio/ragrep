@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/siroio/ragrep/internal/coderetrieval"
@@ -49,6 +52,7 @@ type inspectCodeRelationData struct {
 }
 
 const maxMCPRelationTargets = 20
+const maxMCPCodeKeyBytes = 1024
 
 type codeQueryBackend interface {
 	SearchCode(context.Context, mcpWorkspace, searchCodeInput) (searchCodeData, error)
@@ -203,7 +207,7 @@ func (tools codeQueryTools) readCodeSymbol(ctx context.Context, input readCodeSy
 	if err := ctx.Err(); err != nil {
 		return mcpToolFailure[readCodeSymbolData](err)
 	}
-	if strings.TrimSpace(input.Key) == "" {
+	if !validMCPCodeKey(input.Key) {
 		return mcpToolFailure[readCodeSymbolData](mcpInvalidArgument())
 	}
 	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
@@ -212,6 +216,9 @@ func (tools codeQueryTools) readCodeSymbol(ctx context.Context, input readCodeSy
 	}
 	data, err := tools.backend.ReadCodeSymbol(ctx, ws, input)
 	if err != nil {
+		if errors.Is(err, codestore.ErrNotFound) {
+			return mcpCodeKeyNotFound[readCodeSymbolData](input.Key)
+		}
 		return mcpToolFailure[readCodeSymbolData](err)
 	}
 	return mcpSuccess("code symbol read", data)
@@ -221,7 +228,7 @@ func (tools codeQueryTools) inspectCodeRelation(ctx context.Context, input inspe
 	if err := ctx.Err(); err != nil {
 		return mcpToolFailure[inspectCodeRelationData](err)
 	}
-	if strings.TrimSpace(input.Key) == "" || !validCodeRelation(input.Relation) {
+	if !validMCPCodeKey(input.Key) || !validCodeRelation(input.Relation) {
 		return mcpToolFailure[inspectCodeRelationData](mcpInvalidArgument())
 	}
 	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
@@ -230,6 +237,9 @@ func (tools codeQueryTools) inspectCodeRelation(ctx context.Context, input inspe
 	}
 	data, err := tools.backend.InspectCodeRelation(ctx, ws, input)
 	if err != nil {
+		if errors.Is(err, codestore.ErrNotFound) {
+			return mcpCodeKeyNotFound[inspectCodeRelationData](input.Key)
+		}
 		return mcpToolFailure[inspectCodeRelationData](err)
 	}
 	filtered := make([]codeExpandTarget, 0, len(data.Targets))
@@ -245,6 +255,33 @@ func (tools codeQueryTools) inspectCodeRelation(ctx context.Context, input inspe
 	}
 	data.Targets = filtered
 	return mcpSuccess(fmt.Sprintf("%d of %d relation targets", len(data.Targets), data.Total), data)
+}
+
+func validMCPCodeKey(key string) bool {
+	if strings.TrimSpace(key) == "" || len(key) > maxMCPCodeKeyBytes || !utf8.ValidString(key) {
+		return false
+	}
+	for _, r := range key {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func mcpCodeKeyNotFound[T any](key string) (*mcp.CallToolResult, mcpToolOutput[T], error) {
+	failure := mcpFailure{
+		Code: "not_found", Message: fmt.Sprintf("code symbol key %q was not found", key),
+		Recovery: "rerun search_code and use a returned key",
+	}
+	out := mcpToolOutput[T]{Error: &failure}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return nil, mcpToolOutput[T]{}, err
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(data)}}, StructuredContent: out, IsError: true,
+	}, out, nil
 }
 
 func validCodeRelation(relation string) bool {

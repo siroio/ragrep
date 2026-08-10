@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -245,14 +246,63 @@ func TestCodeProductionBackendMapsMissingKeysToNotFound(t *testing.T) {
 		},
 	})
 	tools := codeQueryTools{defaultRoot: root, backend: productionMCPBackend{}}
+	const key = `go:pkg/missing.go:Missing"Quoted`
+	const message = `code symbol key "go:pkg/missing.go:Missing\"Quoted" was not found`
+	const recovery = "rerun search_code and use a returned key"
 
-	readResult, readOut, err := tools.readCodeSymbol(context.Background(), readCodeSymbolInput{Key: "missing-key"})
-	if err != nil || !readResult.IsError || readOut.Error == nil || readOut.Error.Code != "not_found" || readOut.Error.Message != "not found" {
+	readResult, readOut, err := tools.readCodeSymbol(context.Background(), readCodeSymbolInput{Key: key})
+	if err != nil || !readResult.IsError || readOut.Error == nil || readOut.Error.Code != "not_found" || readOut.Error.Message != message || readOut.Error.Recovery != recovery {
 		t.Fatalf("read result=%+v output=%+v error=%v", readResult, readOut, err)
 	}
-	relationResult, relationOut, err := tools.inspectCodeRelation(context.Background(), inspectCodeRelationInput{Key: "missing-key", Relation: "references"})
-	if err != nil || !relationResult.IsError || relationOut.Error == nil || relationOut.Error.Code != "not_found" || relationOut.Error.Message != "not found" {
+	wantText, err := json.Marshal(readOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, ok := readResult.Content[0].(*mcp.TextContent)
+	if !ok || text.Text != string(wantText) {
+		t.Fatalf("read text=%#v, want exact JSON %s", readResult.Content, wantText)
+	}
+	relationResult, relationOut, err := tools.inspectCodeRelation(context.Background(), inspectCodeRelationInput{Key: key, Relation: "references"})
+	if err != nil || !relationResult.IsError || relationOut.Error == nil || relationOut.Error.Code != "not_found" || relationOut.Error.Message != message || relationOut.Error.Recovery != recovery {
 		t.Fatalf("relation result=%+v output=%+v error=%v", relationResult, relationOut, err)
+	}
+	encoded, err := json.Marshal([]any{readResult, readOut, relationResult, relationOut})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"private daemon path", "token", filepath.ToSlash(filepath.Join(root, ".ragrep", "code.db"))} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("not-found payload exposed %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestCodeKeyValidationRejectsControlsAndExcessiveLengthBeforeBackend(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	called := false
+	backend := fakeCodeQueryBackend{
+		read: func(context.Context, mcpWorkspace, readCodeSymbolInput) (readCodeSymbolData, error) {
+			called = true
+			return readCodeSymbolData{}, nil
+		},
+		inspect: func(context.Context, mcpWorkspace, inspectCodeRelationInput) (inspectCodeRelationData, error) {
+			called = true
+			return inspectCodeRelationData{}, nil
+		},
+	}
+	tools := codeQueryTools{defaultRoot: root, backend: backend}
+	for _, key := range []string{strings.Repeat("k", 1025), "key\nsecret", "key\x00secret", "key\x1fsecret", "key\x7fsecret", "key\u0085secret"} {
+		readResult, readOut, err := tools.readCodeSymbol(context.Background(), readCodeSymbolInput{Key: key})
+		if err != nil || !readResult.IsError || readOut.Error == nil || readOut.Error.Code != "invalid_argument" || readOut.Error.Message != "invalid argument" {
+			t.Fatalf("read key=%q result=%+v output=%+v error=%v", key, readResult, readOut, err)
+		}
+		relationResult, relationOut, err := tools.inspectCodeRelation(context.Background(), inspectCodeRelationInput{Key: key, Relation: "references"})
+		if err != nil || !relationResult.IsError || relationOut.Error == nil || relationOut.Error.Code != "invalid_argument" || relationOut.Error.Message != "invalid argument" {
+			t.Fatalf("relation key=%q result=%+v output=%+v error=%v", key, relationResult, relationOut, err)
+		}
+	}
+	if called {
+		t.Fatal("backend called for an unsafe code key")
 	}
 }
 
