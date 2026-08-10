@@ -44,6 +44,10 @@ func documentConverterTestArgv() []string {
 }
 
 func mutationErrorCode(err error) string {
+	var public *mcpSafePublicError
+	if errors.As(err, &public) {
+		return public.failure().Code
+	}
 	var domain *mcpDomainError
 	if errors.As(err, &domain) {
 		return domain.Failure.Code
@@ -211,6 +215,99 @@ func TestRunAddDocumentRollsBackOnlyNewFile(t *testing.T) {
 	}
 }
 
+func TestRunAddDocumentPostCommitFailuresKeepSourceAndIndexConsistent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		deps addDocumentDeps
+	}{
+		{name: "paragraph count", deps: addDocumentDeps{
+			Count: func(*store.Store, string) (int, error) { return 0, errors.New("count failed") },
+		}},
+		{name: "store close", deps: addDocumentDeps{
+			Close: func(s *store.Store) error {
+				if err := s.Close(); err != nil {
+					return err
+				}
+				return errors.New("close failed")
+			},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, db := newDocumentMutationWorkspace(t)
+			oldFactory := documentMutationEmbedderFactory
+			documentMutationEmbedderFactory = func() (textEmbedder, error) { return textEmbedderFunc(fakeEmbed), nil }
+			t.Cleanup(func() { documentMutationEmbedderFactory = oldFactory })
+			path := filepath.Join("notes", "committed.md")
+			_, err := runAddDocument(context.Background(), addDocumentRequest{
+				DB: db, Root: root, Path: path, Content: "committed body",
+			}, tc.deps)
+			if err == nil {
+				t.Fatal("injected post-commit failure unexpectedly succeeded")
+			}
+			if content, readErr := os.ReadFile(filepath.Join(root, path)); readErr != nil || string(content) != "committed body" {
+				t.Fatalf("post-commit failure removed source: content=%q error=%v", content, readErr)
+			}
+			s, openErr := store.Open(db)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			defer s.Close()
+			if content, getErr := s.GetDoc("notes/committed.md"); getErr != nil || content != "committed body" {
+				t.Fatalf("post-commit failure lost index: content=%q error=%v", content, getErr)
+			}
+		})
+	}
+}
+
+func TestDocumentMutationsSerializeAddAndReindex(t *testing.T) {
+	root, db := newDocumentMutationWorkspace(t)
+	oldFactory := documentMutationEmbedderFactory
+	documentMutationEmbedderFactory = func() (textEmbedder, error) { return textEmbedderFunc(fakeEmbed), nil }
+	t.Cleanup(func() { documentMutationEmbedderFactory = oldFactory })
+	indexStarted := make(chan struct{})
+	releaseAdd := make(chan struct{})
+	reindexRead := make(chan struct{})
+	addDone := make(chan error, 1)
+	go func() {
+		_, err := runAddDocument(context.Background(), addDocumentRequest{
+			DB: db, Root: root, Path: "notes/partial.md", Content: "partial",
+		}, addDocumentDeps{Index: func(context.Context, string, string, string, int64) error {
+			close(indexStarted)
+			<-releaseAdd
+			return errors.New("index failed")
+		}})
+		addDone <- err
+	}()
+	<-indexStarted
+
+	reindexDone := make(chan error, 1)
+	go func() {
+		_, err := runDocumentIndex(context.Background(), documentIndexRequest{
+			DB: db, Paths: []string{filepath.Join(root, "notes", "partial.md")},
+			beforeRead: func(string) { close(reindexRead) },
+		})
+		reindexDone <- err
+	}()
+	crossed := false
+	select {
+	case <-reindexRead:
+		crossed = true
+	case <-time.After(2 * time.Second):
+	}
+	close(releaseAdd)
+	if err := <-addDone; err == nil {
+		t.Fatal("injected add failure unexpectedly succeeded")
+	}
+	select {
+	case <-reindexDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reindex remained blocked after add finished")
+	}
+	if crossed {
+		t.Fatal("reindex read a file from an in-progress add")
+	}
+}
+
 func TestRunAddDocumentDoesNotCreateThroughSwappedAncestor(t *testing.T) {
 	root, db := newDocumentMutationWorkspace(t)
 	if err := os.Mkdir(filepath.Join(root, "notes"), 0o755); err != nil {
@@ -336,6 +433,50 @@ func TestRunDocumentIndexDoesNotReadThroughSwappedAncestor(t *testing.T) {
 	defer s.Close()
 	if _, getErr := s.GetDoc("docs/safe.md"); getErr != store.ErrNotFound {
 		t.Fatalf("reindex stored content after confined read failure: %v", getErr)
+	}
+}
+
+func TestRunDocumentIndexCancellationAfterEmbeddingStartsRollsBack(t *testing.T) {
+	root, db := newDocumentMutationWorkspace(t)
+	path := filepath.Join(root, "cancel.md")
+	if err := os.WriteFile(path, []byte("cancel this paragraph"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	oldFactory := documentMutationEmbedderFactory
+	documentMutationEmbedderFactory = func() (textEmbedder, error) {
+		return textEmbedderFunc(func(string) ([]float32, error) {
+			close(started)
+			<-release
+			return make([]float32, 768), nil
+		}), nil
+	}
+	t.Cleanup(func() { documentMutationEmbedderFactory = oldFactory })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := runDocumentIndex(ctx, documentIndexRequest{DB: db, Paths: []string{path}})
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("index returned while its synchronous embedder was still running: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled index error=%v, want context.Canceled", err)
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.GetDoc("cancel.md"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("canceled index committed a partial document: %v", err)
 	}
 }
 

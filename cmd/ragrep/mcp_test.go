@@ -107,6 +107,32 @@ func TestMCPToolFailureDoesNotExposeDBOrToken(t *testing.T) {
 	}
 }
 
+func TestMCPSafePublicErrorsPreserveOnlyValidatedRelativeKeys(t *testing.T) {
+	cases := []struct {
+		name, code, key, recovery string
+		err                       error
+	}{
+		{"rollback residue", "partial_failure", "notes/residue.md", "remove notes/residue.md and retry", mcpRollbackResidue("notes/residue.md")},
+		{"oversized document", "invalid_argument", "", "read indexed paragraphs instead", mcpWholeDocumentTooLarge()},
+		{"document not found", "not_found", "notes/missing.md", "rerun search and use a returned relative key", mcpDocumentNotFound("notes/missing.md")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			failure := classifyMCPError(tc.err)
+			if failure.Code != tc.code || failure.Recovery != tc.recovery {
+				t.Fatalf("failure=%+v, want code=%q recovery=%q", failure, tc.code, tc.recovery)
+			}
+			if tc.key != "" && !strings.Contains(failure.Message, tc.key) {
+				t.Fatalf("safe relative key missing from message: %+v", failure)
+			}
+		})
+	}
+	unsafe := classifyMCPError(mcpDocumentNotFound(`C:\private\token-secret.md`))
+	if strings.Contains(unsafe.Message+unsafe.Recovery, "private") || strings.Contains(unsafe.Message+unsafe.Recovery, "token-secret") {
+		t.Fatalf("unsafe public key leaked: %+v", unsafe)
+	}
+}
+
 func TestMCPToolOutputHasDataXorError(t *testing.T) {
 	success, successOut, err := mcpSuccess("found result", "value")
 	if err != nil {

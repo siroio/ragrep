@@ -74,7 +74,11 @@ type reindexDocumentsInput struct {
 	Root  string   `json:"root,omitempty"`
 }
 
-type reindexDocumentsData = documentIndexResult
+type reindexDocumentsData struct {
+	Indexed  int `json:"indexed"`
+	Skipped  int `json:"skipped"`
+	Excluded int `json:"excluded"`
+}
 
 type documentMutationBackend interface {
 	AddDocument(context.Context, mcpWorkspace, addDocumentInput) (addDocumentData, error)
@@ -154,7 +158,7 @@ func (tools documentMutationTools) reindexDocuments(ctx context.Context, input r
 		return mcpToolFailure[reindexDocumentsData](mcpInvalidArgument())
 	}
 	for _, path := range input.Paths {
-		if strings.TrimSpace(path) == "" {
+		if !isMCPWorkspaceRelativePath(path) {
 			return mcpToolFailure[reindexDocumentsData](mcpInvalidArgument())
 		}
 	}
@@ -206,7 +210,7 @@ func (tools documentQueryTools) readDocument(ctx context.Context, input readDocu
 	if err := ctx.Err(); err != nil {
 		return mcpToolFailure[readDocumentData](err)
 	}
-	if strings.TrimSpace(input.Path) == "" || (input.Paragraph != nil && *input.Paragraph < 0) || input.Context < 0 {
+	if !isMCPWorkspaceRelativePath(input.Path) || (input.Paragraph != nil && *input.Paragraph < 0) || input.Context < 0 {
 		return mcpToolFailure[readDocumentData](mcpInvalidArgument())
 	}
 	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
@@ -265,10 +269,13 @@ func (productionMCPBackend) ReadDocument(ctx context.Context, ws mcpWorkspace, i
 	}
 	content, err := getContent(s, key, "", paragraph, input.Context)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return readDocumentData{}, mcpDocumentNotFound(key)
+		}
 		return readDocumentData{}, err
 	}
 	if input.Paragraph == nil && len(content) > maxMCPWholeDocumentBytes {
-		return readDocumentData{}, mcpInvalidArgument()
+		return readDocumentData{}, mcpWholeDocumentTooLarge()
 	}
 	return readDocumentData{Path: key, Paragraph: input.Paragraph, Context: input.Context, Content: content}, nil
 }
@@ -282,15 +289,15 @@ func (productionMCPBackend) AddDocument(ctx context.Context, ws mcpWorkspace, in
 func (productionMCPBackend) ReindexDocuments(ctx context.Context, ws mcpWorkspace, input reindexDocumentsInput) (reindexDocumentsData, error) {
 	paths := make([]string, len(input.Paths))
 	for i, path := range input.Paths {
-		if filepath.IsAbs(path) {
-			paths[i] = path
-		} else {
-			paths[i] = filepath.Join(ws.Root, filepath.FromSlash(path))
-		}
+		paths[i] = filepath.Join(ws.Root, filepath.FromSlash(path))
 	}
-	return runDocumentIndex(ctx, documentIndexRequest{
-		DB: ws.DocumentDB, Paths: paths, Prune: false, IncludeCode: false, displayPaths: input.Paths,
+	result, err := runDocumentIndex(ctx, documentIndexRequest{
+		DB: ws.DocumentDB, Root: ws.Root, Paths: paths, Prune: false, IncludeCode: false, displayPaths: input.Paths,
 	})
+	if err != nil {
+		return reindexDocumentsData{}, err
+	}
+	return reindexDocumentsData{Indexed: result.Indexed, Skipped: result.Skipped, Excluded: result.Excluded}, nil
 }
 
 func documentSearchDataFromHits(hits []store.Hit) searchDocumentsData {
@@ -305,14 +312,19 @@ func documentSearchDataFromHits(hits []store.Hit) searchDocumentsData {
 }
 
 func mcpDocumentKey(path, root string) (string, error) {
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(root, path)
+	if !isMCPWorkspaceRelativePath(path) {
+		return "", mcpInvalidArgument()
 	}
+	path = filepath.Join(root, filepath.FromSlash(path))
 	key, err := normPath(path, root)
 	if err != nil {
 		return "", &mcpDomainError{Failure: mcpFailureForCode("path_outside_workspace")}
 	}
 	return key, nil
+}
+
+func isMCPWorkspaceRelativePath(path string) bool {
+	return strings.TrimSpace(path) != "" && !filepath.IsAbs(path) && filepath.VolumeName(path) == ""
 }
 
 func mcpInvalidArgument() error {

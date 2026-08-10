@@ -18,6 +18,7 @@ import (
 
 type documentIndexRequest struct {
 	DB          string
+	Root        string
 	Paths       []string
 	Prune       bool
 	IncludeCode bool
@@ -125,6 +126,8 @@ type addDocumentResult struct {
 type addDocumentDeps struct {
 	Index        func(context.Context, string, string, string, int64) error
 	Remove       func(string) error
+	Count        func(*store.Store, string) (int, error)
+	Close        func(*store.Store) error
 	beforeCreate func()
 }
 
@@ -141,17 +144,55 @@ var documentMutationEmbedderFactory = func() (textEmbedder, error) {
 	return embed.New(dir)
 }
 
+var documentMutationGate = func() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}()
+
+func lockDocumentMutation(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-documentMutationGate:
+		return nil
+	}
+}
+
+func unlockDocumentMutation() { documentMutationGate <- struct{}{} }
+
+func documentEmbedWithContext(ctx context.Context, embed store.EmbedFunc) store.EmbedFunc {
+	return func(text string) ([]float32, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		vector, err := embed(text)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return vector, nil
+	}
+}
+
 func runDocumentIndex(ctx context.Context, request documentIndexRequest) (documentIndexResult, error) {
 	var result documentIndexResult
-	if err := ctx.Err(); err != nil {
+	if err := lockDocumentMutation(ctx); err != nil {
 		return result, err
 	}
+	defer unlockDocumentMutation()
 	if len(request.Paths) == 0 {
 		return result, mcpInvalidArgument()
 	}
-	root, err := workspaceRoot(request.DB)
-	if err != nil {
-		return result, err
+	root := request.Root
+	if root == "" {
+		var err error
+		root, err = workspaceRoot(request.DB)
+		if err != nil {
+			return result, err
+		}
 	}
 	confinedRoot, err := openConfinedDocumentRoot(root)
 	if err != nil {
@@ -167,6 +208,13 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 			return result, err
 		}
 		if err := confinedRoot.validateExisting(absolute); err != nil {
+			if request.Root != "" && errors.Is(err, os.ErrNotExist) {
+				display := requested
+				if len(request.displayPaths) == len(request.Paths) {
+					display = request.displayPaths[i]
+				}
+				return result, mcpDocumentNotFound(filepath.ToSlash(display))
+			}
 			return result, err
 		}
 		normRoots[i], err = normPath(absolute, root)
@@ -261,7 +309,7 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 				if err != nil {
 					return err
 				}
-				changed, err := s.UpsertDocWithHash(rel, text, info.ModTime().Unix(), srcHash, e.Embed)
+				changed, err := s.UpsertDocWithHash(rel, text, info.ModTime().Unix(), srcHash, documentEmbedWithContext(ctx, e.Embed))
 				if err != nil {
 					return fmt.Errorf("%s: %w", rel, err)
 				}
@@ -287,7 +335,7 @@ func runDocumentIndex(ctx context.Context, request documentIndexRequest) (docume
 				result.Skipped++
 				return nil
 			}
-			changed, err := s.UpsertDoc(rel, string(data), info.ModTime().Unix(), e.Embed)
+			changed, err := s.UpsertDoc(rel, string(data), info.ModTime().Unix(), documentEmbedWithContext(ctx, e.Embed))
 			if err != nil {
 				return fmt.Errorf("%s: %w", rel, err)
 			}
@@ -443,9 +491,10 @@ func resolveDocumentWritePathAt(confinedRoot *confinedDocumentRoot, requested st
 
 func runAddDocument(ctx context.Context, request addDocumentRequest, deps addDocumentDeps) (addDocumentResult, error) {
 	var result addDocumentResult
-	if err := ctx.Err(); err != nil {
+	if err := lockDocumentMutation(ctx); err != nil {
 		return result, err
 	}
+	defer unlockDocumentMutation()
 	confinedRoot, err := openConfinedDocumentRoot(request.Root)
 	if err != nil {
 		return result, err
@@ -495,7 +544,7 @@ func runAddDocument(ctx context.Context, request addDocumentRequest, deps addDoc
 	}
 	rollback := func(cause error) error {
 		if removeErr := remove(key); removeErr != nil {
-			return documentMutationError("partial_failure", fmt.Sprintf("failed to roll back %s after %v: %v", key, cause, removeErr))
+			return mcpRollbackResidue(key)
 		}
 		return cause
 	}
@@ -519,15 +568,23 @@ func runAddDocument(ctx context.Context, request addDocumentRequest, deps addDoc
 	}
 	s, err := openStoreAt(request.DB)
 	if err != nil {
-		return result, rollback(err)
+		return result, err
 	}
-	paragraphs, countErr := s.ParagraphCount(key)
-	closeErr := s.Close()
+	count := deps.Count
+	if count == nil {
+		count = (*store.Store).ParagraphCount
+	}
+	closeStore := deps.Close
+	if closeStore == nil {
+		closeStore = (*store.Store).Close
+	}
+	paragraphs, countErr := count(s, key)
+	closeErr := closeStore(s)
 	if countErr != nil {
-		return result, rollback(countErr)
+		return result, countErr
 	}
 	if closeErr != nil {
-		return result, rollback(closeErr)
+		return result, closeErr
 	}
 	tags := store.ParseTags(content)
 	if tags == nil {
@@ -553,7 +610,7 @@ func indexNewDocument(ctx context.Context, db, key, content string, mtime int64)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err = s.UpsertDoc(key, content, mtime, e.Embed)
+	_, err = s.UpsertDoc(key, content, mtime, documentEmbedWithContext(ctx, e.Embed))
 	return err
 }
 

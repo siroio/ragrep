@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -225,12 +226,12 @@ func TestReadDocumentParagraphContextValidationAndWholeDocumentLimit(t *testing.
 			t.Fatalf("arguments=%v result=%+v output=%+v", arguments, result, out)
 		}
 		if arguments["path"] == "notes/large.md" {
-			if out.Error.Code != "invalid_argument" {
+			if out.Error.Code != "invalid_argument" || out.Error.Recovery != "read indexed paragraphs instead" {
 				t.Fatalf("large document error=%+v", out.Error)
 			}
 		} else if arguments["path"] != filepath.Join(filepath.Dir(root), "outside.md") && out.Error.Code != "invalid_argument" {
 			t.Fatalf("arguments=%v error=%+v", arguments, out.Error)
-		} else if arguments["path"] == filepath.Join(filepath.Dir(root), "outside.md") && out.Error.Code != "path_outside_workspace" {
+		} else if arguments["path"] == filepath.Join(filepath.Dir(root), "outside.md") && out.Error.Code != "invalid_argument" {
 			t.Fatalf("outside error=%+v", out.Error)
 		}
 	}
@@ -263,6 +264,36 @@ func TestDocumentHandlersUseDocumentDBAndReadonlyAnnotations(t *testing.T) {
 	}
 	if found != 2 {
 		t.Fatalf("found %d document query tools, want 2; tools=%+v", found, listed.Tools)
+	}
+}
+
+func TestDocumentToolsRejectAbsoluteAndVolumeQualifiedPaths(t *testing.T) {
+	root := newMCPDocumentWorkspace(t)
+	queryCalls, mutationCalls := 0, 0
+	queryTools := documentQueryTools{defaultRoot: root, backend: fakeDocumentQueryBackend{
+		read: func(context.Context, mcpWorkspace, readDocumentInput) (readDocumentData, error) {
+			queryCalls++
+			return readDocumentData{}, nil
+		},
+	}}
+	mutationTools := documentMutationTools{defaultRoot: root, backend: fakeDocumentMutationBackend{
+		reindex: func(context.Context, mcpWorkspace, reindexDocumentsInput) (reindexDocumentsData, error) {
+			mutationCalls++
+			return reindexDocumentsData{}, nil
+		},
+	}}
+	for _, path := range []string{filepath.Join(root, "inside.md"), `C:relative.md`} {
+		result, out, err := queryTools.readDocument(context.Background(), readDocumentInput{Path: path})
+		if err != nil || !result.IsError || out.Error == nil || out.Error.Code != "invalid_argument" {
+			t.Fatalf("read path=%q result=%+v output=%+v error=%v", path, result, out, err)
+		}
+		mutationResult, mutationOut, err := mutationTools.reindexDocuments(context.Background(), reindexDocumentsInput{Paths: []string{path}})
+		if err != nil || !mutationResult.IsError || mutationOut.Error == nil || mutationOut.Error.Code != "invalid_argument" {
+			t.Fatalf("reindex path=%q result=%+v output=%+v error=%v", path, mutationResult, mutationOut, err)
+		}
+	}
+	if queryCalls != 0 || mutationCalls != 0 {
+		t.Fatalf("invalid paths reached backends: read=%d reindex=%d", queryCalls, mutationCalls)
 	}
 }
 
@@ -337,7 +368,7 @@ func TestReindexDocumentsUsesExplicitRootAndRejectsEmptyPaths(t *testing.T) {
 	backend := fakeDocumentMutationBackend{
 		reindex: func(_ context.Context, ws mcpWorkspace, input reindexDocumentsInput) (reindexDocumentsData, error) {
 			gotWS, gotInput = ws, input
-			return reindexDocumentsData{Indexed: 3, Skipped: 1, Excluded: 2, Warnings: []string{"warning: one"}}, nil
+			return reindexDocumentsData{Indexed: 3, Skipped: 1, Excluded: 2}, nil
 		},
 	}
 	tools := documentMutationTools{defaultRoot: root, backend: backend}
@@ -349,7 +380,7 @@ func TestReindexDocumentsUsesExplicitRootAndRejectsEmptyPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := documentToolOutput[reindexDocumentsData](t, result)
-	if result.IsError || out.Data == nil || out.Data.Indexed != 3 || out.Data.Skipped != 1 || out.Data.Excluded != 2 || len(out.Data.Warnings) != 1 {
+	if result.IsError || out.Data == nil || out.Data.Indexed != 3 || out.Data.Skipped != 1 || out.Data.Excluded != 2 {
 		t.Fatalf("result=%+v output=%+v", result, out)
 	}
 	if gotWS.Root != otherRoot || strings.Join(gotInput.Paths, ",") != "docs,notes" {
@@ -363,6 +394,20 @@ func TestReindexDocumentsUsesExplicitRootAndRejectsEmptyPaths(t *testing.T) {
 	out = documentToolOutput[reindexDocumentsData](t, result)
 	if !result.IsError || out.Error == nil || out.Error.Code != "invalid_argument" {
 		t.Fatalf("empty paths result=%+v output=%+v", result, out)
+	}
+}
+
+func TestReindexDocumentsDataContainsOnlyPublicCounters(t *testing.T) {
+	typeOf := reflect.TypeOf(reindexDocumentsData{})
+	if typeOf.NumField() != 3 {
+		t.Fatalf("reindex DTO fields=%v, want only indexed/skipped/excluded", typeOf)
+	}
+	encoded, err := json.Marshal(reindexDocumentsData{Indexed: 2, Skipped: 1, Excluded: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"indexed":2,"skipped":1,"excluded":3}` {
+		t.Fatalf("reindex JSON=%s", encoded)
 	}
 }
 
@@ -467,5 +512,48 @@ func TestReindexDocumentsProductionBackendNeverPrunesOrIncludesCode(t *testing.T
 	defer s.Close()
 	if _, err := s.GetDoc("missing.md"); err != nil {
 		t.Fatalf("reindex pruned missing.md: %v", err)
+	}
+}
+
+func TestReindexDocumentsProductionBackendUsesWorkspaceRootWithCustomDB(t *testing.T) {
+	root, _ := newDocumentMutationWorkspace(t)
+	db := filepath.Join(root, "state", "documents.db")
+	if err := os.Mkdir(filepath.Dir(db), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "guide.md"), []byte("workspace document"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldFactory := documentMutationEmbedderFactory
+	documentMutationEmbedderFactory = func() (textEmbedder, error) { return textEmbedderFunc(fakeEmbed), nil }
+	t.Cleanup(func() { documentMutationEmbedderFactory = oldFactory })
+
+	data, err := (productionMCPBackend{}).ReindexDocuments(context.Background(), mcpWorkspace{
+		Root: root, DocumentDB: db,
+	}, reindexDocumentsInput{Paths: []string{"guide.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Indexed != 1 {
+		t.Fatalf("reindex data=%+v, want one indexed workspace document", data)
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.GetDoc("guide.md"); err != nil {
+		t.Fatalf("workspace-relative key was not indexed: %v", err)
+	}
+}
+
+func TestReindexDocumentsMissingSourceIsNotFound(t *testing.T) {
+	root, db := newDocumentMutationWorkspace(t)
+	_, err := (productionMCPBackend{}).ReindexDocuments(context.Background(), mcpWorkspace{
+		Root: root, DocumentDB: db,
+	}, reindexDocumentsInput{Paths: []string{"missing.md"}})
+	failure := classifyMCPError(err)
+	if failure.Code != "not_found" || !strings.Contains(failure.Message, "missing.md") {
+		t.Fatalf("missing source failure=%+v, want safe not_found with relative key", failure)
 	}
 }

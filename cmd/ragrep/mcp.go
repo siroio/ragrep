@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/siroio/ragrep/internal/codestore"
@@ -29,6 +30,53 @@ type mcpFailure struct {
 
 type mcpDomainError struct {
 	Failure mcpFailure
+}
+
+type mcpSafePublicError struct {
+	kind string
+	key  string
+}
+
+func (e *mcpSafePublicError) Error() string { return e.failure().Message }
+
+func (e *mcpSafePublicError) failure() mcpFailure {
+	key, ok := safeMCPRelativeKey(e.key)
+	switch e.kind {
+	case "rollback_residue":
+		if ok {
+			return mcpFailure{Code: "partial_failure", Message: "unindexed document remains at " + key, Recovery: "remove " + key + " and retry"}
+		}
+	case "whole_document_too_large":
+		return mcpFailure{Code: "invalid_argument", Message: "document is too large to return as a whole", Recovery: "read indexed paragraphs instead"}
+	case "document_not_found":
+		if ok {
+			return mcpFailure{Code: "not_found", Message: "document not found: " + key, Recovery: "rerun search and use a returned relative key"}
+		}
+	}
+	return mcpFailureForCode("partial_failure")
+}
+
+func safeMCPRelativeKey(key string) (string, bool) {
+	if strings.TrimSpace(key) == "" || filepath.IsAbs(key) || filepath.VolumeName(key) != "" {
+		return "", false
+	}
+	normalized := filepath.ToSlash(filepath.Clean(filepath.FromSlash(key)))
+	if normalized == "." || normalized == ".." || strings.HasPrefix(normalized, "../") {
+		return "", false
+	}
+	return normalized, true
+}
+
+func mcpRollbackResidue(key string) error {
+	return &mcpSafePublicError{kind: "rollback_residue", key: key}
+}
+
+func mcpWholeDocumentTooLarge() error {
+	return &mcpSafePublicError{kind: "whole_document_too_large"}
+}
+
+func mcpDocumentNotFound(key string) error {
+	return &mcpSafePublicError{kind: "document_not_found", key: key}
 }
 
 func (e *mcpDomainError) Error() string {
@@ -85,6 +133,10 @@ func resolveMCPWorkspace(defaultRoot, requestedRoot string) (mcpWorkspace, error
 }
 
 func classifyMCPError(err error) mcpFailure {
+	var public *mcpSafePublicError
+	if errors.As(err, &public) {
+		return public.failure()
+	}
 	var domain *mcpDomainError
 	if errors.As(err, &domain) {
 		return normalizedMCPFailure(domain.Failure)
@@ -127,7 +179,7 @@ func mcpFailureForCode(code string) mcpFailure {
 	case "already_exists":
 		return mcpFailure{Code: code, Message: "already exists"}
 	case "not_found":
-		return mcpFailure{Code: code, Message: "not found"}
+		return mcpFailure{Code: code, Message: "not found", Recovery: "rerun search and use a returned relative key"}
 	case "workspace_syncing":
 		return mcpFailure{Code: code, Message: "workspace is synchronizing", Retryable: true, Recovery: "repeat search after synchronization completes"}
 	case "stale_live_key":
