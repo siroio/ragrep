@@ -320,6 +320,82 @@ class FreezeCasesTests(unittest.TestCase):
             self.assertFalse(public_output.parent.exists())
             self.assertFalse(private_output.parent.exists())
 
+    def test_direct_api_rejects_naive_generated_at_before_filesystem_write(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            inputs = self.make_inputs(root)
+            public_output = root / "public" / "v1"
+            private_output = root / "private" / "v1"
+
+            with self.assertRaisesRegex(ValueError, "generated_at.*timezone"):
+                freeze_case_set(
+                    **{
+                        key: inputs[key]
+                        for key in (
+                            "corpus_root",
+                            "corpus_manifest",
+                            "development",
+                            "holdout_gold",
+                            "allocation",
+                            "review",
+                        )
+                    },
+                    public_output=public_output,
+                    private_output=private_output,
+                    doc_prefix="prepared-corpus",
+                    generated_at=datetime(2026, 8, 11, 18, 30),
+                    validation_kwargs=inputs["validation_kwargs"],
+                )
+
+            self.assertFalse(public_output.parent.exists())
+            self.assertFalse(private_output.parent.exists())
+
+    def test_rejects_missing_or_non_string_manifest_unity_version(self):
+        for manifest_value in ({}, {"unity_version": 6000}):
+            with self.subTest(manifest=manifest_value):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    inputs = self.make_inputs(root)
+                    inputs["corpus_manifest"].write_text(
+                        json.dumps(manifest_value) + "\n", encoding="utf-8"
+                    )
+
+                    with self.assertRaisesRegex(ValueError, "unity_version"):
+                        self.freeze(
+                            inputs,
+                            root / "public" / "v1",
+                            root / "private" / "v1",
+                        )
+
+    def test_cli_reports_malformed_corpus_manifest_concisely(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            corpus_manifest = root / "corpus-manifest.json"
+            corpus_manifest.write_text("{}\n", encoding="utf-8")
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                result = main(
+                    [
+                        "--corpus", str(root / "corpus"),
+                        "--corpus-manifest", str(corpus_manifest),
+                        "--development", str(root / "missing-development.jsonl"),
+                        "--holdout-gold", str(root / "missing-holdout.jsonl"),
+                        "--allocation", str(root / "missing-allocation.json"),
+                        "--review", str(root / "missing-review.jsonl"),
+                        "--public-output", str(root / "public" / "v1"),
+                        "--private-output", str(root / "private" / "v1"),
+                        "--doc-prefix", "prepared-corpus",
+                        "--generated-at", "2026-08-11T18:30:00+09:00",
+                    ]
+                )
+
+            self.assertEqual(result, 1)
+            self.assertEqual(
+                stderr.getvalue(),
+                "error: corpus manifest requires a non-empty string unity_version\n",
+            )
+
     def test_rejects_allocation_case_mismatch(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -329,6 +405,21 @@ class FreezeCasesTests(unittest.TestCase):
             inputs["allocation"].write_text(json.dumps(slots) + "\n", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "dev-001.*family"):
+                validate_allocation(
+                    inputs["allocation"],
+                    [inputs["development_case"]],
+                    [inputs["holdout_case"]],
+                )
+
+    def test_rejects_allocation_slot_with_extra_field(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            inputs = self.make_inputs(root)
+            slots = json.loads(inputs["allocation"].read_text(encoding="utf-8"))
+            slots[0]["note"] = "not part of the final allocation schema"
+            inputs["allocation"].write_text(json.dumps(slots) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "dev-001.*fields"):
                 validate_allocation(
                     inputs["allocation"],
                     [inputs["development_case"]],
@@ -360,6 +451,31 @@ class FreezeCasesTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     with self.assertRaisesRegex(ValueError, message):
+                        validate_reviews(inputs["review"], cases)
+
+    def test_rejects_duplicate_review_round_regardless_of_record_order(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            inputs = self.make_inputs(root)
+            cases = [inputs["development_case"], inputs["holdout_case"]]
+            approved = {"id": "dev-001", "round": 2, "verdict": "approved"}
+            changes = {
+                "id": "dev-001",
+                "round": 2,
+                "verdict": "changes_requested",
+            }
+            holdout = {"id": "holdout-001", "round": 1, "verdict": "approved"}
+
+            for duplicate_records in ((approved, changes), (changes, approved)):
+                with self.subTest(first=duplicate_records[0]["verdict"]):
+                    inputs["review"].write_text(
+                        "".join(
+                            json.dumps(record) + "\n"
+                            for record in (*duplicate_records, holdout)
+                        ),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, "dev-001.*round 2"):
                         validate_reviews(inputs["review"], cases)
 
     def test_manifest_is_deterministic_for_fixed_timestamp(self):

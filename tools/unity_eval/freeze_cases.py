@@ -67,6 +67,8 @@ def validate_allocation(
         difference = sorted(set(actual) ^ set(expected))
         raise ValueError(f"{difference[0]}: allocation case mismatch")
     for identifier, wanted in expected.items():
+        if set(actual[identifier]) != set(wanted):
+            raise ValueError(f"{identifier}: allocation fields mismatch")
         for key, value in wanted.items():
             if actual[identifier].get(key) != value:
                 raise ValueError(f"{identifier}: allocation {key} mismatch")
@@ -74,11 +76,16 @@ def validate_allocation(
 
 def validate_reviews(review_path: Path, cases: list[dict]) -> None:
     latest = {}
+    seen_rounds = set()
     for record in load_jsonl(review_path):
         identifier = record.get("id")
         round_number = record.get("round")
         if not isinstance(identifier, str) or not isinstance(round_number, int) or isinstance(round_number, bool):
             raise ValueError("review requires an ID and integer round")
+        key = (identifier, round_number)
+        if key in seen_rounds:
+            raise ValueError(f"{identifier}: duplicate review round {round_number}")
+        seen_rounds.add(key)
         if identifier not in latest or round_number > latest[identifier]["round"]:
             latest[identifier] = record
     expected_ids = {case["id"] for case in cases}
@@ -107,6 +114,12 @@ def freeze_case_set(
         raise ValueError(f"output already exists: {public_output}")
     if private_output.exists():
         raise ValueError(f"output already exists: {private_output}")
+    if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+        raise ValueError("generated_at requires a timezone")
+    corpus_data = json.loads(corpus_manifest.read_text(encoding="utf-8"))
+    unity_version = corpus_data.get("unity_version") if isinstance(corpus_data, dict) else None
+    if not isinstance(unity_version, str) or not unity_version.strip():
+        raise ValueError("corpus manifest requires a non-empty string unity_version")
     development_cases = load_jsonl(development)
     holdout_cases = load_jsonl(holdout_gold)
     validate_case_sets(
@@ -117,8 +130,6 @@ def freeze_case_set(
     )
     validate_allocation(allocation, development_cases, holdout_cases)
     validate_reviews(review, development_cases + holdout_cases)
-    corpus_data = json.loads(corpus_manifest.read_text(encoding="utf-8"))
-    unity_version = corpus_data["unity_version"]
     validate_cases.prefixed_doc("document.md", doc_prefix)
     normalized_generated_at = generated_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
