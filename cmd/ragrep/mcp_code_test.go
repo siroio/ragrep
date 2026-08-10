@@ -533,7 +533,7 @@ func TestBuildCodeContextProductionBackendPropagatesPackRequest(t *testing.T) {
 func TestVerifyCodeContextPassesManifestInMemoryAndCleanFalseIsData(t *testing.T) {
 	root := newMCPCodeWorkspace(t)
 	otherRoot := newMCPCodeWorkspace(t)
-	wantManifest := coderetrieval.Manifest{IndexRevision: "rev", Symbols: []coderetrieval.SymbolRef{{Key: "a", Path: "pkg/a.go", FileHash: "hash"}}}
+	wantManifest := coderetrieval.Manifest{IndexRevision: "rev", Symbols: []coderetrieval.SymbolRef{{Key: "a", Path: "pkg/a.go", FileHash: strings.Repeat("a", 64)}}}
 	before, err := os.ReadDir(otherRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -613,6 +613,58 @@ func TestVerifyCodeContextValidatesEveryManifestPathBeforeBackend(t *testing.T) 
 	}
 	if called {
 		t.Fatal("backend called before all manifest entries were validated")
+	}
+}
+
+func TestVerifyCodeContextRejectsForgedManifestFieldsBeforeBackend(t *testing.T) {
+	root := newMCPCodeWorkspace(t)
+	called := false
+	tools := codeContextTools{defaultRoot: root, backend: fakeCodeContextBackend{verify: func(context.Context, mcpWorkspace, verifyCodeContextInput) (verifyCodeContextData, error) {
+		called = true
+		return verifyCodeContextData{}, nil
+	}}}
+	validRef := coderetrieval.SymbolRef{
+		Key: "go:pkg/a.go:A", QualifiedName: "pkg.A", Path: "pkg/a.go",
+		StartLine: 1, EndLine: 2, FileHash: strings.Repeat("a", 64),
+	}
+	validManifest := func() coderetrieval.Manifest {
+		return coderetrieval.Manifest{
+			IndexRevision: "revision", ServerName: "gopls", ServerVersion: "v1", ModelID: "model",
+			Symbols: []coderetrieval.SymbolRef{validRef},
+		}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*coderetrieval.Manifest)
+	}{
+		{"huge index revision", func(m *coderetrieval.Manifest) { m.IndexRevision = strings.Repeat("x", 257) }},
+		{"control server name", func(m *coderetrieval.Manifest) { m.ServerName = "gopls\nsecret" }},
+		{"invalid utf8 server version", func(m *coderetrieval.Manifest) { m.ServerVersion = string([]byte{0xff}) }},
+		{"huge model id", func(m *coderetrieval.Manifest) { m.ModelID = strings.Repeat("m", 257) }},
+		{"huge key", func(m *coderetrieval.Manifest) { m.Symbols[0].Key = strings.Repeat("k", 1025) }},
+		{"control key", func(m *coderetrieval.Manifest) { m.Symbols[0].Key = "key\x00secret" }},
+		{"huge qualified name", func(m *coderetrieval.Manifest) { m.Symbols[0].QualifiedName = strings.Repeat("q", 1025) }},
+		{"control qualified name", func(m *coderetrieval.Manifest) { m.Symbols[0].QualifiedName = "pkg.\nSecret" }},
+		{"invalid file hash", func(m *coderetrieval.Manifest) { m.Symbols[0].FileHash = strings.Repeat("A", 64) }},
+		{"negative start line", func(m *coderetrieval.Manifest) { m.Symbols[0].StartLine = -1 }},
+		{"end before start", func(m *coderetrieval.Manifest) { m.Symbols[0].EndLine = 0 }},
+		{"invalid later entry", func(m *coderetrieval.Manifest) {
+			m.Symbols = append(m.Symbols, validRef)
+			m.Symbols[1].FileHash = "short"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := validManifest()
+			tc.mutate(&manifest)
+			result, out, err := tools.verifyCodeContext(context.Background(), verifyCodeContextInput{Manifest: manifest})
+			if err != nil || !result.IsError || out.Error == nil || *out.Error != (mcpFailure{Code: "invalid_argument", Message: "invalid argument"}) {
+				t.Fatalf("result=%+v output=%+v error=%v", result, out, err)
+			}
+		})
+	}
+	if called {
+		t.Fatal("backend called before the complete manifest was validated")
 	}
 }
 

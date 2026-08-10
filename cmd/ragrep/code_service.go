@@ -270,13 +270,8 @@ func (s *codeService) Pack(ctx context.Context, req packRequest) (codePackOutput
 }
 
 func (s *codeService) Verify(ctx context.Context, req verifyRequest) (codeVerifyOutput, error) {
-	if len(req.Manifest.Symbols) == 0 || len(req.Manifest.Symbols) > 3 {
-		return codeVerifyOutput{}, fmt.Errorf("verify manifest must contain 1 to 3 symbols")
-	}
-	for _, ref := range req.Manifest.Symbols {
-		if !validCodeManifestPath(ref.Path) {
-			return codeVerifyOutput{}, fmt.Errorf("invalid manifest path %q", ref.Path)
-		}
+	if err := validateCodeManifest(req.Manifest); err != nil {
+		return codeVerifyOutput{}, err
 	}
 	ws, err := s.workspace(req.Root, req.DB)
 	if err != nil {

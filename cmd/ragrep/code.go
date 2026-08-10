@@ -16,7 +16,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/siroio/ragrep/internal/codeindex"
 	"github.com/siroio/ragrep/internal/coderetrieval"
@@ -704,6 +706,9 @@ func utf16Len(s string) int {
 // still informative even though it won't match anything codestore.SymbolAt
 // can resolve. Mirrors fileURI's construction in reverse.
 func pathFromURI(uri, wsRoot string) string {
+	if path, ok := workspacePathFromFileURI(uri, wsRoot); ok {
+		return path
+	}
 	parsed, err := url.Parse(uri)
 	if err != nil || !strings.EqualFold(parsed.Scheme, "file") {
 		return uri
@@ -722,13 +727,44 @@ func pathFromURI(uri, wsRoot string) string {
 	return filepath.ToSlash(abs)
 }
 
+func workspacePathFromFileURI(uri, wsRoot string) (string, bool) {
+	parsed, err := url.Parse(uri)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "file") || parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
+		return "", false
+	}
+	p := parsed.Path
+	if len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+		p = p[1:]
+	}
+	abs := filepath.FromSlash(p)
+	if !filepath.IsAbs(abs) {
+		return "", false
+	}
+	rel, err := filepath.Rel(wsRoot, abs)
+	if err != nil {
+		return "", false
+	}
+	rel = filepath.ToSlash(rel)
+	if !validCodeManifestPath(rel) {
+		return "", false
+	}
+	return rel, true
+}
+
 // locsFromLSP converts textDocument/definition or textDocument/references
 // results into codeindex.Loc, anchored at each location's Range.Start.
 func locsFromLSP(wsRoot string, locs []lsp.Location) []codeindex.Loc {
 	out := make([]codeindex.Loc, 0, len(locs))
 	for _, l := range locs {
+		path, ok := workspacePathFromFileURI(l.URI, wsRoot)
+		if !ok {
+			continue
+		}
 		out = append(out, codeindex.Loc{
-			Path:     pathFromURI(l.URI, wsRoot),
+			Path:     path,
 			Position: codeindex.Position{Line: l.Range.Start.Line, Character: l.Range.Start.Character},
 		})
 	}
@@ -742,8 +778,12 @@ func locsFromLSP(wsRoot string, locs []lsp.Location) []codeindex.Loc {
 func locsFromCallHierarchyItems(wsRoot string, items []lsp.CallHierarchyItem) []codeindex.Loc {
 	out := make([]codeindex.Loc, 0, len(items))
 	for _, it := range items {
+		path, ok := workspacePathFromFileURI(it.URI, wsRoot)
+		if !ok {
+			continue
+		}
 		out = append(out, codeindex.Loc{
-			Path:     pathFromURI(it.URI, wsRoot),
+			Path:     path,
 			Position: codeindex.Position{Line: it.SelectionRange.Start.Line, Character: it.SelectionRange.Start.Character},
 		})
 	}
@@ -1152,6 +1192,59 @@ func validCodeManifestPath(path string) bool {
 	}
 	clean := filepath.ToSlash(filepath.Clean(native))
 	return clean == path && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
+}
+
+const (
+	maxMCPCodeKeyBytes                = 1024
+	maxCodeManifestQualifiedNameBytes = 1024
+	maxCodeManifestIdentityBytes      = 256
+)
+
+func validateCodeManifest(manifest coderetrieval.Manifest) error {
+	if len(manifest.Symbols) == 0 || len(manifest.Symbols) > 3 {
+		return errors.New("invalid manifest")
+	}
+	for _, identity := range []string{manifest.IndexRevision, manifest.ServerName, manifest.ServerVersion, manifest.ModelID} {
+		if !validCodeManifestText(identity, maxCodeManifestIdentityBytes) {
+			return errors.New("invalid manifest")
+		}
+	}
+	for _, ref := range manifest.Symbols {
+		if !validMCPCodeKey(ref.Key) || !validCodeManifestText(ref.QualifiedName, maxCodeManifestQualifiedNameBytes) ||
+			!validCodeManifestPath(ref.Path) || !validCodeFileHash(ref.FileHash) ||
+			ref.StartLine < 0 || ref.EndLine < ref.StartLine {
+			return errors.New("invalid manifest")
+		}
+	}
+	return nil
+}
+
+func validMCPCodeKey(key string) bool {
+	return strings.TrimSpace(key) != "" && validCodeManifestText(key, maxMCPCodeKeyBytes)
+}
+
+func validCodeManifestText(value string, maxBytes int) bool {
+	if len(value) > maxBytes || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func validCodeFileHash(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	for i := range hash {
+		if (hash[i] < '0' || hash[i] > '9') && (hash[i] < 'a' || hash[i] > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func hasASCIIDrivePrefix(path string) bool {

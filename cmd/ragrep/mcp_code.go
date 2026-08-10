@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/siroio/ragrep/internal/coderetrieval"
@@ -52,7 +50,6 @@ type inspectCodeRelationData struct {
 }
 
 const maxMCPRelationTargets = 20
-const maxMCPCodeKeyBytes = 1024
 
 type codeQueryBackend interface {
 	SearchCode(context.Context, mcpWorkspace, searchCodeInput) (searchCodeData, error)
@@ -151,13 +148,8 @@ func (tools codeContextTools) verifyCodeContext(ctx context.Context, input verif
 	if err := ctx.Err(); err != nil {
 		return mcpToolFailure[verifyCodeContextData](err)
 	}
-	if len(input.Manifest.Symbols) == 0 || len(input.Manifest.Symbols) > 3 {
+	if err := validateCodeManifest(input.Manifest); err != nil {
 		return mcpToolFailure[verifyCodeContextData](mcpInvalidArgument())
-	}
-	for _, ref := range input.Manifest.Symbols {
-		if !validCodeManifestPath(ref.Path) {
-			return mcpToolFailure[verifyCodeContextData](mcpInvalidArgument())
-		}
 	}
 	ws, err := resolveMCPWorkspace(tools.defaultRoot, input.Root)
 	if err != nil {
@@ -255,18 +247,6 @@ func (tools codeQueryTools) inspectCodeRelation(ctx context.Context, input inspe
 	}
 	data.Targets = filtered
 	return mcpSuccess(fmt.Sprintf("%d of %d relation targets", len(data.Targets), data.Total), data)
-}
-
-func validMCPCodeKey(key string) bool {
-	if strings.TrimSpace(key) == "" || len(key) > maxMCPCodeKeyBytes || !utf8.ValidString(key) {
-		return false
-	}
-	for _, r := range key {
-		if unicode.IsControl(r) {
-			return false
-		}
-	}
-	return true
 }
 
 func mcpCodeKeyNotFound[T any](key string) (*mcp.CallToolResult, mcpToolOutput[T], error) {

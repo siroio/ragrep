@@ -1404,6 +1404,36 @@ func TestPathFromURIUnescapesWorkspaceFilePath(t *testing.T) {
 	}
 }
 
+func TestLSPRelationLocationsRequireWorkspaceFileURIProvenance(t *testing.T) {
+	root := t.TempDir()
+	local := filepath.Join(root, "dir with space", "file.go")
+	external := filepath.Join(t.TempDir(), "outside.go")
+	slashedLocal := filepath.ToSlash(local)
+	if !strings.HasPrefix(slashedLocal, "/") {
+		slashedLocal = "/" + slashedLocal
+	}
+	localURI := (&url.URL{Scheme: "file", Path: slashedLocal}).String()
+	locations := []lsp.Location{
+		{URI: localURI, Range: lsp.Range{Start: lsp.Position{Line: 7, Character: 3}}},
+		{URI: "pkg/fake.go"},
+		{URI: "https://example.invalid/fake.go"},
+		{URI: "file:///%zz"},
+		{URI: fileURI(external)},
+	}
+	got := locsFromLSP(root, locations)
+	if len(got) != 1 || got[0].Path != "dir with space/file.go" || got[0].Position.Line != 7 || got[0].Position.Character != 3 {
+		t.Fatalf("locations=%+v, want only decoded workspace-local file URI", got)
+	}
+	items := make([]lsp.CallHierarchyItem, len(locations))
+	for i, location := range locations {
+		items[i] = lsp.CallHierarchyItem{URI: location.URI, SelectionRange: location.Range}
+	}
+	got = locsFromCallHierarchyItems(root, items)
+	if len(got) != 1 || got[0].Path != "dir with space/file.go" || got[0].Position.Line != 7 || got[0].Position.Character != 3 {
+		t.Fatalf("call hierarchy locations=%+v, want only decoded workspace-local file URI", got)
+	}
+}
+
 // A symbol referenced twice from the same enclosing symbol (two locations
 // both resolving to the same caller) must not crash `code expand
 // --relation references` with symbol_edges' UNIQUE(from_key, to_key, kind,
@@ -2229,10 +2259,29 @@ func TestCodeServiceVerifyWaitsForBarrier(t *testing.T) {
 	t.Cleanup(func() { close(unblock) })
 
 	out, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: coderetrieval.Manifest{
-		Symbols: []coderetrieval.SymbolRef{{Key: "missing", Path: "missing.go"}},
+		Symbols: []coderetrieval.SymbolRef{{Key: "missing", Path: "missing.go", FileHash: strings.Repeat("a", 64)}},
 	}})
 	if !errors.Is(err, ErrWorkspaceSyncing) || len(out.Entries) != 0 || out.Clean {
 		t.Fatalf("out=%+v err=%v", out, err)
+	}
+}
+
+func TestCodeServiceVerifyValidatesManifestBeforeWorkspaceResolution(t *testing.T) {
+	resolveCalls := 0
+	svc := newCodeServiceForDB(func(string, string) (*workspaceState, error) {
+		resolveCalls++
+		return nil, errors.New("workspace resolution must not run")
+	}, nil, nil)
+	t.Cleanup(func() { _ = svc.Close() })
+	manifest := coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{
+		{Key: "first", QualifiedName: "First", Path: "first.go", FileHash: strings.Repeat("a", 64)},
+		{Key: "second", QualifiedName: "Second", Path: "second.go", FileHash: "forged"},
+	}}
+	if _, err := svc.Verify(context.Background(), verifyRequest{Root: "not-resolved", Manifest: manifest}); err == nil || !strings.Contains(err.Error(), "invalid manifest") {
+		t.Fatalf("Verify error=%v, want invalid manifest", err)
+	}
+	if resolveCalls != 0 {
+		t.Fatalf("workspace resolver called %d times before complete manifest validation", resolveCalls)
 	}
 }
 
@@ -2276,7 +2325,7 @@ func TestCodeServiceVerifyRejectsOversizedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, err := svc.Verify(context.Background(), verifyRequest{Root: ws.root, Manifest: coderetrieval.Manifest{Symbols: []coderetrieval.SymbolRef{{
-		Key: "missing", QualifiedName: "Missing", Path: "huge.go",
+		Key: "missing", QualifiedName: "Missing", Path: "huge.go", FileHash: strings.Repeat("a", 64),
 	}}}})
 	if err == nil || len(out.Entries) != 0 {
 		t.Fatalf("oversized verify out=%+v err=%v, want rejection before verification", out, err)
