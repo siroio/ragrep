@@ -9,12 +9,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/siroio/ragrep/internal/codeindex"
 	"github.com/siroio/ragrep/internal/coderetrieval"
 	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/lsp"
+	"github.com/siroio/ragrep/internal/store"
 )
 
 type apiError struct {
@@ -36,6 +38,14 @@ type daemonSearchRequest struct {
 	Query string `json:"query"`
 	Mode  string `json:"mode,omitempty"`
 	K     int    `json:"k,omitempty"`
+}
+
+type daemonDocumentSearchRequest struct {
+	DB    string   `json:"db"`
+	Query string   `json:"query"`
+	Mode  string   `json:"mode"`
+	K     int      `json:"k"`
+	Tags  []string `json:"tags,omitempty"`
 }
 
 type daemonSearchResponse struct {
@@ -107,18 +117,23 @@ type daemonCodeVerifier interface {
 }
 
 type daemonHandler struct {
-	service  daemonCodeSearcher
-	token    string
-	registry *workspaceRegistry
-	stop     func()
+	service         daemonCodeSearcher
+	documentService documentSearcher
+	token           string
+	registry        *workspaceRegistry
+	stop            func()
 }
 
 func newDaemonHandler(service daemonCodeSearcher, token string) http.Handler {
-	return &daemonHandler{service: service, token: token}
+	return newDaemonHandlerWithDocuments(service, nil, token, nil, nil)
 }
 
 func newDaemonServerHandler(service daemonCodeSearcher, token string, registry *workspaceRegistry, stop func()) http.Handler {
-	return &daemonHandler{service: service, token: token, registry: registry, stop: stop}
+	return newDaemonHandlerWithDocuments(service, nil, token, registry, stop)
+}
+
+func newDaemonHandlerWithDocuments(service daemonCodeSearcher, documents documentSearcher, token string, registry *workspaceRegistry, stop func()) http.Handler {
+	return &daemonHandler{service: service, documentService: documents, token: token, registry: registry, stop: stop}
 }
 
 func (h *daemonHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +156,8 @@ func (h *daemonHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/search":
 		h.search(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/search":
+		h.searchDocuments(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/get":
 		h.get(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/code/index":
@@ -156,6 +173,41 @@ func (h *daemonHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeAPIError(w, http.StatusNotFound, &apiError{Code: "not_found", Message: "not found"})
 	}
+}
+
+func (h *daemonHandler) searchDocuments(w http.ResponseWriter, r *http.Request) {
+	var req daemonDocumentSearchRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: err.Error()})
+		return
+	}
+	if req.DB == "" || !filepath.IsAbs(req.DB) {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: "db must be an absolute path"})
+		return
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: "query must not be empty"})
+		return
+	}
+	if req.Mode != "text" && req.Mode != "vector" && req.Mode != "hybrid" {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: fmt.Sprintf("unsupported search mode %q", req.Mode)})
+		return
+	}
+	if req.K <= 0 {
+		writeAPIError(w, http.StatusBadRequest, &apiError{Code: "bad_request", Message: "k must be positive"})
+		return
+	}
+	if h.documentService == nil {
+		writeAPIError(w, http.StatusInternalServerError, &apiError{Code: "internal_error", Message: "document service unavailable"})
+		return
+	}
+	hits, err := h.documentService.SearchDocuments(r.Context(), documentSearchRequest{DB: req.DB, Query: req.Query, Mode: req.Mode, K: req.K, Tags: req.Tags})
+	if err != nil {
+		status, apiErr := classifyAPIError(err)
+		writeAPIError(w, status, apiErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, hits)
 }
 
 func (h *daemonHandler) pack(w http.ResponseWriter, r *http.Request) {
@@ -436,6 +488,10 @@ type codeDaemonClient interface {
 	Verify(context.Context, verifyRequest) (codeVerifyOutput, error)
 }
 
+type documentDaemonClient interface {
+	SearchDocuments(context.Context, documentSearchRequest) ([]store.Hit, error)
+}
+
 var codeDaemonClientFactory = loadCodeDaemonClient
 
 func (c daemonClient) Status(ctx context.Context) (daemonStatus, error) {
@@ -454,6 +510,12 @@ func (c daemonClient) Search(ctx context.Context, req searchRequest) (searchResp
 	}
 	err := c.do(ctx, http.MethodPost, "/v1/code/search", daemonSearchRequest{Root: req.Root, DB: req.DB, Query: req.Query, Mode: req.Mode, K: req.K}, &wire)
 	return searchResponse{Hits: wire.Hits, Fresh: wire.Fresh, Generation: wire.Generation, Degraded: wire.Degraded, UsedVector: wire.UsedVector}, err
+}
+
+func (c daemonClient) SearchDocuments(ctx context.Context, req documentSearchRequest) ([]store.Hit, error) {
+	var hits []store.Hit
+	err := c.do(ctx, http.MethodPost, "/v1/search", daemonDocumentSearchRequest{DB: req.DB, Query: req.Query, Mode: req.Mode, K: req.K, Tags: req.Tags}, &hits)
+	return hits, err
 }
 
 func (c daemonClient) Get(ctx context.Context, req getRequest) (codeindex.Symbol, error) {

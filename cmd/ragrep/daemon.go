@@ -1082,10 +1082,10 @@ func serveDaemon() error {
 		listener.Close()
 		return err
 	}
-	service := newCodeServiceForDB(registry.ResolveCode, nil, nil)
+	service, documents := newDaemonServices(registry)
 	cleanupPath := ""
 	cleanupDiscovery := daemonDiscovery{}
-	defer func() { cleanupDaemon(cleanupPath, cleanupDiscovery, listener, registry, service) }()
+	defer func() { cleanupDaemon(cleanupPath, cleanupDiscovery, listener, registry, documents, service) }()
 	token, err := newDaemonToken()
 	if err != nil {
 		return err
@@ -1098,7 +1098,7 @@ func serveDaemon() error {
 	cleanupDiscovery = discovery
 	registry.RestoreExplicitAsync()
 	stop := make(chan struct{}, 1)
-	server := newDaemonHTTPServer(newDaemonServerHandler(service, token, registry, func() {
+	server := newDaemonHTTPServer(newDaemonHandlerWithDocuments(service, documents, token, registry, func() {
 		select {
 		case stop <- struct{}{}:
 		default:
@@ -1113,6 +1113,11 @@ func serveDaemon() error {
 		return nil
 	}
 	return err
+}
+
+func newDaemonServices(registry *workspaceRegistry) (*codeService, *documentService) {
+	service := newCodeServiceForDB(registry.ResolveCode, nil, nil)
+	return service, newDocumentService(service.embeddings, openStoreAt)
 }
 
 func cleanupDaemon(discoveryPath string, owned daemonDiscovery, resources ...io.Closer) {

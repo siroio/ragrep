@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/siroio/ragrep/internal/codeindex"
 	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/lsp"
+	"github.com/siroio/ragrep/internal/store"
 )
 
 type fakeDaemonCodeService struct {
@@ -40,6 +42,81 @@ func (s fakeDaemonCodeService) Search(ctx context.Context, req searchRequest) (s
 
 func (s fakeDaemonCodeService) Get(ctx context.Context, req getRequest) (codeindex.Symbol, error) {
 	return s.get(ctx, req)
+}
+
+type fakeDaemonDocumentService struct {
+	search func(context.Context, documentSearchRequest) ([]store.Hit, error)
+}
+
+func (s fakeDaemonDocumentService) SearchDocuments(ctx context.Context, req documentSearchRequest) ([]store.Hit, error) {
+	return s.search(ctx, req)
+}
+
+func TestDaemonDocumentSearchRejectsUnauthorizedAndInvalidRequests(t *testing.T) {
+	service := fakeDaemonDocumentService{search: func(context.Context, documentSearchRequest) ([]store.Hit, error) {
+		t.Fatal("invalid document request reached service")
+		return nil, nil
+	}}
+	h := newDaemonHandlerWithDocuments(nil, service, "secret", nil, nil)
+	for _, test := range []struct {
+		name, authorization, body string
+		wantStatus                int
+		wantCode                  string
+	}{
+		{"missing token", "", `{"db":"C:/index.db","query":"find","mode":"text","k":1}`, http.StatusUnauthorized, "unauthorized"},
+		{"wrong token", "Bearer wrong", `{"db":"C:/index.db","query":"find","mode":"text","k":1}`, http.StatusUnauthorized, "unauthorized"},
+		{"malformed JSON", "Bearer secret", `{"db":`, http.StatusBadRequest, "bad_request"},
+		{"trailing JSON", "Bearer secret", `{"db":"C:/index.db","query":"find","mode":"text","k":1} trailing`, http.StatusBadRequest, "bad_request"},
+		{"relative database", "Bearer secret", `{"db":"index.db","query":"find","mode":"text","k":1}`, http.StatusBadRequest, "bad_request"},
+		{"empty database", "Bearer secret", `{"db":"","query":"find","mode":"text","k":1}`, http.StatusBadRequest, "bad_request"},
+		{"empty query", "Bearer secret", `{"db":"C:/index.db","query":"","mode":"text","k":1}`, http.StatusBadRequest, "bad_request"},
+		{"unsupported mode", "Bearer secret", `{"db":"C:/index.db","query":"find","mode":"auto","k":1}`, http.StatusBadRequest, "bad_request"},
+		{"nonpositive k", "Bearer secret", `{"db":"C:/index.db","query":"find","mode":"text","k":0}`, http.StatusBadRequest, "bad_request"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/search", strings.NewReader(test.body))
+			req.Header.Set("Authorization", test.authorization)
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != test.wantStatus {
+				t.Fatalf("status=%d, want %d body=%s", rr.Code, test.wantStatus, rr.Body.String())
+			}
+			var got apiError
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil || got.Code != test.wantCode {
+				t.Fatalf("error=%+v decode=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestDaemonDocumentSearchPropagatesRequestAndHits(t *testing.T) {
+	want := []store.Hit{{Doc: "notes/result.md", Para: 2, Snippet: "matched", Score: 0.75}}
+	h := newDaemonHandlerWithDocuments(nil, fakeDaemonDocumentService{search: func(_ context.Context, req documentSearchRequest) ([]store.Hit, error) {
+		if !reflect.DeepEqual(req, documentSearchRequest{DB: `C:\docs\index.db`, Query: "find this", Mode: "hybrid", K: 3, Tags: []string{"guide", "api"}}) {
+			t.Fatalf("request=%+v", req)
+		}
+		return want, nil
+	}}, "secret", nil, nil)
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	client := daemonClient{endpoint: ts.URL, token: "secret", client: ts.Client()}
+	hits, err := client.SearchDocuments(context.Background(), documentSearchRequest{DB: `C:\docs\index.db`, Query: "find this", Mode: "hybrid", K: 3, Tags: []string{"guide", "api"}})
+	if err != nil || len(hits) != 1 || hits[0] != want[0] {
+		t.Fatalf("hits=%+v err=%v", hits, err)
+	}
+}
+
+func TestDaemonDocumentSearchPreservesTypedErrors(t *testing.T) {
+	h := newDaemonHandlerWithDocuments(nil, fakeDaemonDocumentService{search: func(context.Context, documentSearchRequest) ([]store.Hit, error) {
+		return nil, codestore.ErrNotFound
+	}}, "secret", nil, nil)
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	_, err := (daemonClient{endpoint: ts.URL, token: "secret", client: ts.Client()}).SearchDocuments(context.Background(), documentSearchRequest{DB: `C:\docs\index.db`, Query: "find", Mode: "text", K: 1})
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" || apiErr.Retryable {
+		t.Fatalf("error=%T %v", err, err)
+	}
 }
 
 func TestDaemonRejectsMissingAndWrongToken(t *testing.T) {
@@ -1285,12 +1362,98 @@ func TestCleanupDaemonRemovesDiscoveryAfterResourcesClose(t *testing.T) {
 			return nil
 		}
 	}
-	cleanupDaemon(path, discovery, closer("listener"), closer("service"), closer("registry"))
-	if got := strings.Join(order, ","); got != "listener,service,registry" {
+	cleanupDaemon(path, discovery, closer("listener"), closer("registry"), closer("document"), closer("code"))
+	if got := strings.Join(order, ","); got != "listener,registry,document,code" {
 		t.Fatalf("cleanup order=%s", got)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("discovery remains after cleanup: %v", err)
+	}
+}
+
+func TestServeDaemonDocumentServicesShareEmbeddingAndCloseInOrder(t *testing.T) {
+	registry, err := newWorkspaceRegistry(filepath.Join(t.TempDir(), "workspaces.json"), time.Minute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, documents := newDaemonServices(registry)
+	db := filepath.Join(t.TempDir(), "index.db")
+	seedDocumentDB(t, db, "notes/result.md", "search result")
+	hits, err := documents.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("hits=%+v err=%v", hits, err)
+	}
+	if documents.embeddings != service.embeddings {
+		t.Fatal("document and code services do not share an embedding pool")
+	}
+	service.embeddings.stateMu.Lock()
+	constructed := service.embeddings.embedder != nil
+	service.embeddings.stateMu.Unlock()
+	if constructed {
+		t.Fatal("text document search initialized the embedding model")
+	}
+	documents.mu.Lock()
+	_, entry := documents.findEntryLocked(db)
+	documentStore := entry.store
+	documents.mu.Unlock()
+	var order []string
+	cleanupDaemon("", daemonDiscovery{},
+		closeFunc(func() error { order = append(order, "listener"); return nil }),
+		closeFunc(func() error { order = append(order, "registry"); return registry.Close() }),
+		closeFunc(func() error { order = append(order, "document"); return documents.Close() }),
+		closeFunc(func() error {
+			order = append(order, "code")
+			if _, err := documentStore.SearchText("search", 1, nil); err == nil {
+				t.Fatal("document store remained open when code service closed the shared pool")
+			}
+			return service.Close()
+		}),
+	)
+	if got := strings.Join(order, ","); got != "listener,registry,document,code" {
+		t.Fatalf("cleanup order=%s", got)
+	}
+	service.embeddings.stateMu.Lock()
+	closed := service.embeddings.closed
+	service.embeddings.stateMu.Unlock()
+	if !closed {
+		t.Fatal("code service did not close the shared embedding pool")
+	}
+}
+
+func TestServeDaemonDocumentSearchExposesTextSearch(t *testing.T) {
+	cache := t.TempDir()
+	configDir := t.TempDir()
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	t.Setenv("APPDATA", configDir)
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	originalAddress := daemonBindAddress
+	daemonBindAddress = "127.0.0.1:0"
+	t.Cleanup(func() { daemonBindAddress = originalAddress })
+
+	db := filepath.Join(t.TempDir(), "index.db")
+	seedDocumentDB(t, db, "notes/result.md", "search result")
+	served := make(chan error, 1)
+	go func() { served <- serveDaemon() }()
+	discovery, err := waitForDaemon(2 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := daemonClient{endpoint: discovery.Endpoint, token: discovery.Token}
+	hits, err := client.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+	if err != nil || len(hits) != 1 || hits[0].Doc != "notes/result.md" {
+		t.Fatalf("hits=%+v err=%v", hits, err)
+	}
+	if err := client.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon did not stop")
 	}
 }
 
