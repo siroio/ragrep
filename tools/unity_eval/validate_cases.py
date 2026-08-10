@@ -2,7 +2,7 @@ import argparse
 from collections import Counter
 from html import unescape
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import sys
 
@@ -45,7 +45,8 @@ def validate_answerability(case: dict) -> None:
 def _normalized_heading(value: str) -> str:
     value = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", value)
     value = re.sub(r"<[^>]+>", "", value)
-    value = re.sub(r"[*_`~]", "", value)
+    value = re.sub(r"(?<!\w)(\*{1,3}|_{1,3})(?=\S)(.*?)(?<=\S)\1(?!\w)", r"\2", value)
+    value = re.sub(r"[`~]", "", value)
     return " ".join(unescape(value).split())
 
 
@@ -66,9 +67,13 @@ def _validate_evidence(case: dict, corpus_root: Path) -> None:
         if not isinstance(doc_name, str) or not doc_name.strip() or not isinstance(heading, str) or not heading.strip():
             raise ValueError(f'{case["id"]}: evidence doc and heading must be non-empty strings')
         relative = Path(doc_name)
-        if relative.is_absolute() or ".." in relative.parts or relative.suffix.lower() != ".md":
+        windows_path = PureWindowsPath(doc_name)
+        if relative.is_absolute() or windows_path.is_absolute() or ".." in relative.parts or relative.suffix.lower() != ".md":
             raise ValueError(f'{case["id"]}: invalid evidence document {doc_name}')
-        document = corpus_root / relative
+        root = corpus_root.resolve()
+        document = (root / relative).resolve()
+        if not document.is_relative_to(root):
+            raise ValueError(f'{case["id"]}: invalid evidence document {doc_name}')
         if not document.is_file():
             raise ValueError(f'{case["id"]}: missing evidence document {doc_name}')
         if not _has_heading(document, heading):
@@ -80,10 +85,12 @@ def _validate_evidence(case: dict, corpus_root: Path) -> None:
 def _validate_case(case: dict, corpus_root: Path, known_types: set[str]) -> None:
     if not isinstance(case, dict) or set(case) != REQUIRED_KEYS:
         raise ValueError("case must contain exactly the required keys")
-    identifier = case["id"]
     for key in ("id", "query", "type"):
         if not isinstance(case[key], str) or not case[key].strip():
-            raise ValueError(f"{identifier}: {key} must be a non-empty string")
+            raise ValueError(f"{key} must be a non-empty string")
+    identifier = case["id"]
+    if not isinstance(case["answer"], str):
+        raise ValueError(f"{identifier}: answer must be a string")
     if not isinstance(case["answerable"], bool):
         raise ValueError(f"{identifier}: answerable must be a boolean")
     if not isinstance(case["required_points"], list) or any(not isinstance(point, str) or not point.strip() for point in case["required_points"]):
@@ -99,18 +106,19 @@ def _validate_case(case: dict, corpus_root: Path, known_types: set[str]) -> None
 def validate_case_sets(development: list[dict], holdout: list[dict], corpus_root: Path,
                        expected_split_counts: tuple[int, int] = (30, 70),
                        expected_type_counts: dict[str, int] = DEFAULT_TYPE_COUNTS) -> None:
+    all_cases = development + holdout
+    for case in all_cases:
+        _validate_case(case, corpus_root, set(expected_type_counts))
     if (len(development), len(holdout)) != expected_split_counts:
         raise ValueError(f"split counts mismatch: development={len(development)} holdout={len(holdout)} expected={expected_split_counts}")
-    all_cases = development + holdout
-    ids = [case.get("id") if isinstance(case, dict) else None for case in all_cases]
+    ids = [case["id"] for case in all_cases]
     duplicates = sorted(identifier for identifier, count in Counter(ids).items() if count > 1)
     if duplicates:
         raise ValueError(f"duplicate case ID: {duplicates[0]}")
-    for case in all_cases:
-        _validate_case(case, corpus_root, set(expected_type_counts))
     actual = Counter(case["type"] for case in all_cases)
     if actual != Counter(expected_type_counts):
-        raise ValueError(f"type counts mismatch: actual={dict(sorted(actual.items()))} expected={expected_type_counts}")
+        details = ", ".join(f"{name}={actual[name]} expected={expected_type_counts[name]}" for name in sorted(expected_type_counts))
+        raise ValueError(f"type counts mismatch: {details}")
 
 
 def write_retrieval_cases(cases: list[dict], output: Path) -> int:
