@@ -275,19 +275,34 @@ func TestSmokeDaemonDocument(t *testing.T) {
 
 	environmentRoot := t.TempDir()
 	environment := isolatedDaemonEnvironment(environmentRoot)
-	copyDaemonSmokeEmbedCache(t, filepath.Join(environmentRoot, "cache", "ragrep"))
-	firstRoot, firstDB := daemonDocumentSmokeWorkspace(t, "alpha unique document phrase")
-	secondRoot, secondDB := daemonDocumentSmokeWorkspace(t, "beta isolated document phrase")
-	for _, workspace := range []struct {
-		root string
-		db   string
-	}{
-		{firstRoot, firstDB},
-		{secondRoot, secondDB},
-	} {
-		if _, stderr, err := runBuiltRagrep(executable, workspace.root, environment, "index", "--db", workspace.db, "docs"); err != nil {
-			t.Fatalf("direct index %s: %v: %s", workspace.root, err, stderr)
+	isolatedEmbedCache := filepath.Join(environmentRoot, "cache", "ragrep")
+	hostModelCached := copyDaemonSmokeEmbedCache(t, isolatedEmbedCache)
+	firstContent := "alpha unique document phrase"
+	secondContent := "beta isolated document phrase"
+	firstRoot, firstDB := daemonDocumentSmokeWorkspace(t, firstContent)
+	secondRoot, secondDB := daemonDocumentSmokeWorkspace(t, secondContent)
+	if hostModelCached {
+		for _, workspace := range []struct {
+			root string
+			db   string
+		}{
+			{firstRoot, firstDB},
+			{secondRoot, secondDB},
+		} {
+			if _, stderr, err := runBuiltRagrep(executable, workspace.root, environment, "index", "--db", workspace.db, "docs"); err != nil {
+				t.Fatalf("direct index %s: %v: %s", workspace.root, err, stderr)
+			}
 		}
+	} else {
+		seedDaemonDocumentSmokeDB(t, firstDB, firstContent)
+		seedDaemonDocumentSmokeDB(t, secondDB, secondContent)
+		t.Log("host model is unavailable; seeded text fixtures and will skip hybrid checks")
+	}
+	if err := os.RemoveAll(isolatedEmbedCache); err != nil {
+		t.Fatal(err)
+	}
+	if embed.ModelCached(isolatedEmbedCache) {
+		t.Fatal("isolated cache still contains a model before the first text search")
 	}
 
 	discoveryPath := daemonSmokeDiscoveryPath(environmentRoot, runtime.GOOS)
@@ -314,12 +329,21 @@ func TestSmokeDaemonDocument(t *testing.T) {
 	if !daemonSmokeHasDocument(first, "docs/document.md") {
 		t.Fatalf("first text search=%+v", first)
 	}
+	t.Log("text search auto-started the daemon with an empty isolated model cache")
 	discovery, err := readDaemonDiscovery(discoveryPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	daemonPID = discovery.PID
 	daemonEndpointAddress = strings.TrimPrefix(discovery.Endpoint, "http://")
+	if !hostModelCached {
+		stopDaemonDocumentSmoke(t, executable, packageDir, environment, discoveryPath, daemonPID, daemonEndpointAddress)
+		stopped = true
+		return
+	}
+	if !copyDaemonSmokeEmbedCache(t, isolatedEmbedCache) {
+		t.Fatal("host model disappeared before hybrid checks")
+	}
 
 	firstHybrid := daemonDocumentSmokeSearch(t, executable, firstRoot, environment, firstDB, "hybrid", "alpha unique document phrase")
 	if !daemonSmokeHasDocument(firstHybrid, "docs/document.md") {
@@ -348,6 +372,12 @@ func TestSmokeDaemonDocument(t *testing.T) {
 		t.Fatalf("direct index visibility=%+v", indexed)
 	}
 
+	stopDaemonDocumentSmoke(t, executable, packageDir, environment, discoveryPath, daemonPID, daemonEndpointAddress)
+	stopped = true
+}
+
+func stopDaemonDocumentSmoke(t *testing.T, executable, packageDir string, environment []string, discoveryPath string, daemonPID int, daemonEndpointAddress string) {
+	t.Helper()
 	if _, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "stop"); err != nil {
 		t.Fatalf("daemon stop: %v: %s", err, stderr)
 	}
@@ -357,7 +387,6 @@ func TestSmokeDaemonDocument(t *testing.T) {
 	if _, err := os.Stat(discoveryPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("discovery remains after stop: %v", err)
 	}
-	stopped = true
 }
 
 func daemonDocumentSmokeWorkspace(t *testing.T, content string) (string, string) {
@@ -375,18 +404,21 @@ func daemonDocumentSmokeWorkspace(t *testing.T, content string) (string, string)
 	return root, filepath.Join(root, ".ragrep", "index.db")
 }
 
-func copyDaemonSmokeEmbedCache(t *testing.T, destination string) {
+func copyDaemonSmokeEmbedCache(t *testing.T, destination string) bool {
 	t.Helper()
 	source, err := embed.CacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !embed.ModelCached(source) {
-		t.Skip("model not cached; run 'ragrep init' to enable this test")
+		return false
 	}
 	if err := filepath.WalkDir(source, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		if !d.IsDir() && filepath.Base(path) == "daemon.json" {
+			return nil
 		}
 		rel, err := filepath.Rel(source, path)
 		if err != nil {
@@ -401,6 +433,21 @@ func copyDaemonSmokeEmbedCache(t *testing.T, destination string) {
 			return err
 		}
 		return os.WriteFile(target, data, 0o755)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return true
+}
+
+func seedDaemonDocumentSmokeDB(t *testing.T, db, content string) {
+	t.Helper()
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.UpsertDoc("docs/document.md", content, 1, func(string) ([]float32, error) {
+		return make([]float32, 768), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
