@@ -476,6 +476,28 @@ func TestFormatCodeSymbol(t *testing.T) {
 	}
 }
 
+func TestNewCodeSymbolOutputIncludesBodyOnlyWhenRequested(t *testing.T) {
+	sym := testSymbol()
+
+	withoutBody := newCodeSymbolOutput(sym, false)
+	if withoutBody.Key != sym.Key || withoutBody.Language != sym.Language || withoutBody.Kind != sym.Kind ||
+		withoutBody.Name != sym.Name || withoutBody.QualifiedName != sym.QualifiedName ||
+		withoutBody.Signature != sym.Signature || withoutBody.Documentation != sym.Documentation ||
+		withoutBody.Container != sym.Container || withoutBody.Path != sym.Path ||
+		withoutBody.StartLine != sym.Range.Start.Line || withoutBody.StartChar != sym.Range.Start.Character ||
+		withoutBody.EndLine != sym.Range.End.Line || withoutBody.EndChar != sym.Range.End.Character {
+		t.Fatalf("without body=%+v, want all symbol metadata", withoutBody)
+	}
+	if withoutBody.Body != "" {
+		t.Fatalf("without body Body=%q, want empty", withoutBody.Body)
+	}
+
+	withBody := newCodeSymbolOutput(sym, true)
+	if withBody.Body != sym.Body {
+		t.Fatalf("with body Body=%q, want %q", withBody.Body, sym.Body)
+	}
+}
+
 // --- code search / code get CLI-level argument errors and not-found paths
 // (open a real (empty) code.db, but never touch the embedding model) ---
 

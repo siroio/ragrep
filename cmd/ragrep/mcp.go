@@ -171,6 +171,7 @@ func newMCPBaseServer() *mcp.Server {
 	)
 	registerDocumentQueryTools(server, documentQueryTools{defaultRoot: ".", backend: productionMCPBackend{}})
 	registerDocumentMutationTools(server, documentMutationTools{defaultRoot: ".", backend: productionMCPBackend{}})
+	registerCodeQueryTools(server, codeQueryTools{defaultRoot: ".", backend: productionMCPBackend{}})
 	return server
 }
 

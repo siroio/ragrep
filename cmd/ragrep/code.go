@@ -528,7 +528,7 @@ type codeSymbolOutput struct {
 	Body          string `json:"body,omitempty"`
 }
 
-func formatCodeSymbol(w io.Writer, sym codeindex.Symbol, includeBody, asJSON bool) error {
+func newCodeSymbolOutput(sym codeindex.Symbol, includeBody bool) codeSymbolOutput {
 	out := codeSymbolOutput{
 		Key: sym.Key, Language: sym.Language, Kind: sym.Kind, Name: sym.Name,
 		QualifiedName: sym.QualifiedName, Signature: sym.Signature, Documentation: sym.Documentation,
@@ -539,6 +539,11 @@ func formatCodeSymbol(w io.Writer, sym codeindex.Symbol, includeBody, asJSON boo
 	if includeBody {
 		out.Body = sym.Body
 	}
+	return out
+}
+
+func formatCodeSymbol(w io.Writer, sym codeindex.Symbol, includeBody, asJSON bool) error {
+	out := newCodeSymbolOutput(sym, includeBody)
 	if asJSON {
 		return json.NewEncoder(w).Encode(out)
 	}
