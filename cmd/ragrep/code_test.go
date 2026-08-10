@@ -2084,6 +2084,24 @@ func TestCmdCodeVerifyUsageErrors(t *testing.T) {
 	}
 }
 
+func TestValidCodeManifestPathIsPlatformIndependent(t *testing.T) {
+	invalid := []string{
+		"", "C:foo.go", "C:/foo.go", "c:foo.go", "z:/foo.go", "safe\x00.go",
+		"../foo.go", `..\foo.go`, `pkg\..\foo.go`, "//server/share.go", "/foo.go",
+		"pkg/../foo.go", "./foo.go", "pkg//foo.go",
+	}
+	for _, path := range invalid {
+		if validCodeManifestPath(path) {
+			t.Errorf("validCodeManifestPath(%q)=true, want false", path)
+		}
+	}
+	for _, path := range []string{"foo.go", "pkg/foo.go", "pkg/nested/file_test.go", "pkg/日本語.go"} {
+		if !validCodeManifestPath(path) {
+			t.Errorf("validCodeManifestPath(%q)=false, want true", path)
+		}
+	}
+}
+
 func TestCmdCodeVerifyMissingManifestFile(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "code.db")
 	if code := run([]string{"code", "verify", "--db", db, "--manifest", filepath.Join(t.TempDir(), "nope.json")}); code != 1 {

@@ -1143,7 +1143,7 @@ func loadManifest(data []byte) (coderetrieval.Manifest, error) {
 }
 
 func validCodeManifestPath(path string) bool {
-	if path == "" || strings.Contains(path, `\`) {
+	if path == "" || strings.ContainsRune(path, 0) || strings.Contains(path, `\`) || hasASCIIDrivePrefix(path) {
 		return false
 	}
 	native := filepath.FromSlash(path)
@@ -1152,6 +1152,10 @@ func validCodeManifestPath(path string) bool {
 	}
 	clean := filepath.ToSlash(filepath.Clean(native))
 	return clean == path && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
+}
+
+func hasASCIIDrivePrefix(path string) bool {
+	return len(path) >= 2 && path[1] == ':' && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z'))
 }
 
 func cmdCodeVerify(args []string) int {
