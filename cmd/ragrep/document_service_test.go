@@ -44,25 +44,39 @@ func TestDocumentStorePoolOpensConcurrentFirstUseOnce(t *testing.T) {
 	})
 	t.Cleanup(func() { _ = svc.Close() })
 
-	start := make(chan struct{})
-	searchesReady := make(chan struct{}, searches)
 	var wg sync.WaitGroup
-	for range searches {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			searchesReady <- struct{}{}
-			hits, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
-			if err != nil || len(hits) != 1 || hits[0].Doc != "notes/result.md" {
-				t.Errorf("hits=%+v err=%v", hits, err)
-			}
-		}()
+	search := func() {
+		defer wg.Done()
+		hits, err := svc.SearchDocuments(context.Background(), documentSearchRequest{DB: db, Query: "search", Mode: "text", K: 1})
+		if err != nil || len(hits) != 1 || hits[0].Doc != "notes/result.md" {
+			t.Errorf("hits=%+v err=%v", hits, err)
+		}
 	}
-	close(start)
+	wg.Add(1)
+	go search()
 	<-openerStarted
-	for range searches {
-		<-searchesReady
+	for range searches - 1 {
+		wg.Add(1)
+		go search()
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		svc.mu.Lock()
+		_, entry := svc.findEntryLocked(db)
+		waiters := 0
+		if entry != nil {
+			waiters = entry.waiters
+		}
+		svc.mu.Unlock()
+		if waiters == searches-1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(releaseOpener)
+			t.Fatalf("waiters=%d, want %d", waiters, searches-1)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	close(releaseOpener)
 	wg.Wait()

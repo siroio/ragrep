@@ -27,6 +27,8 @@ type documentStoreEntry struct {
 	err      error
 	ready    chan struct{}
 	released chan struct{}
+	opening  bool
+	waiters  int
 	leases   int
 }
 
@@ -81,11 +83,15 @@ func (s *documentService) acquire(ctx context.Context, db string) (*store.Store,
 		}
 		key, entry := s.findEntryLocked(path)
 		created := entry == nil
+		waiting := false
 		if created {
 			released := make(chan struct{})
 			close(released)
-			entry = &documentStoreEntry{path: path, ready: make(chan struct{}), released: released}
+			entry = &documentStoreEntry{path: path, ready: make(chan struct{}), released: released, opening: true}
 			s.entries[key] = entry
+		} else if entry.opening {
+			entry.waiters++
+			waiting = true
 		}
 		s.mu.Unlock()
 
@@ -94,6 +100,7 @@ func (s *documentService) acquire(ctx context.Context, db string) (*store.Store,
 			s.mu.Lock()
 			entry.store = opened
 			entry.err = openErr
+			entry.opening = false
 			close(entry.ready)
 			s.mu.Unlock()
 		}
@@ -102,6 +109,11 @@ func (s *documentService) acquire(ctx context.Context, db string) (*store.Store,
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
 		case <-entry.ready:
+		}
+		if waiting {
+			s.mu.Lock()
+			entry.waiters--
+			s.mu.Unlock()
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
