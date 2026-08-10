@@ -493,6 +493,12 @@ type documentDaemonClient interface {
 }
 
 var codeDaemonClientFactory = loadCodeDaemonClient
+var documentDaemonClientFactory = loadDocumentDaemonClient
+
+func loadDocumentDaemonClient() (documentDaemonClient, error) {
+	client, _, err := loadDaemonClient()
+	return client, err
+}
 
 func (c daemonClient) Status(ctx context.Context) (daemonStatus, error) {
 	var status daemonStatus

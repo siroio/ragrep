@@ -115,6 +115,192 @@ func TestRunDocumentSearchRejectsUnknownAndCanceledContext(t *testing.T) {
 	}
 }
 
+type testDocumentDaemonClient struct {
+	hits []store.Hit
+	err  error
+	got  documentSearchRequest
+}
+
+func (c *testDocumentDaemonClient) SearchDocuments(_ context.Context, req documentSearchRequest) ([]store.Hit, error) {
+	c.got = req
+	return c.hits, c.err
+}
+
+type documentDaemonClientFunc func(context.Context, documentSearchRequest) ([]store.Hit, error)
+
+func (f documentDaemonClientFunc) SearchDocuments(ctx context.Context, req documentSearchRequest) ([]store.Hit, error) {
+	return f(ctx, req)
+}
+
+func directDocumentSearchClient() documentDaemonClient {
+	return documentDaemonClientFunc(func(_ context.Context, req documentSearchRequest) ([]store.Hit, error) {
+		s, err := openStoreAt(req.DB)
+		if err != nil {
+			return nil, err
+		}
+		defer s.Close()
+		return runSearch(s, req.Mode, req.Query, req.K, req.Tags)
+	})
+}
+
+func injectDocumentDaemonClient(t *testing.T, client documentDaemonClient, factoryErr error) *int {
+	t.Helper()
+	old := documentDaemonClientFactory
+	calls := 0
+	documentDaemonClientFactory = func() (documentDaemonClient, error) {
+		calls++
+		return client, factoryErr
+	}
+	t.Cleanup(func() { documentDaemonClientFactory = old })
+	return &calls
+}
+
+func captureSearch(t *testing.T, args []string) (int, string, string) {
+	t.Helper()
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		stdoutReader.Close()
+		stdoutWriter.Close()
+		t.Fatal(err)
+	}
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = stdoutWriter, stderrWriter
+	code := cmdSearch(args)
+	stdoutWriter.Close()
+	stderrWriter.Close()
+	os.Stdout, os.Stderr = oldStdout, oldStderr
+	stdout, _ := io.ReadAll(stdoutReader)
+	stderr, _ := io.ReadAll(stderrReader)
+	stdoutReader.Close()
+	stderrReader.Close()
+	return code, string(stdout), string(stderr)
+}
+
+func TestCmdSearchDaemonForwardsCanonicalRequestAndPreservesTextFormat(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.MkdirAll(filepath.Join(root, "notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "notes", "result.md")
+	if err := os.WriteFile(path, []byte("current content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testDocumentDaemonClient{hits: []store.Hit{{Doc: "notes/result.md", Para: 2, Lines: "3-4", Score: 0.75, Snippet: "matching text", Heading: "Result", Mtime: info.ModTime().Unix()}}}
+	calls := injectDocumentDaemonClient(t, client, nil)
+
+	code, stdout, stderr := captureSearch(t, []string{"--db", filepath.Join(".ragrep", "index.db"), "--mode", "text", "-k", "7", "--tag", "one", "--tag", "two", "matching"})
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	if *calls != 1 {
+		t.Fatalf("factory calls=%d, want 1", *calls)
+	}
+	wantDB, err := filepath.Abs(filepath.Join(".ragrep", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRequest := documentSearchRequest{DB: wantDB, Query: "matching", Mode: "text", K: 7, Tags: []string{"one", "two"}}
+	if client.got.DB != wantRequest.DB || client.got.Query != wantRequest.Query || client.got.Mode != wantRequest.Mode || client.got.K != wantRequest.K || !slicesEqual(client.got.Tags, wantRequest.Tags) {
+		t.Fatalf("request=%+v, want %+v", client.got, wantRequest)
+	}
+	if stdout != "notes/result.md#2 (lines 3-4, score 0.7500) | Result\n  matching text\n" {
+		t.Fatalf("stdout=%q", stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr=%q, want empty", stderr)
+	}
+	if _, err := os.Stat(wantDB); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("CLI must not open the document DB: stat err=%v", err)
+	}
+}
+
+func TestCmdSearchDaemonPreservesJSONNoHitsErrorsAndStaleWarning(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.MkdirAll(filepath.Join(root, "notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "notes", "stale.md"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hit := store.Hit{Doc: "notes/stale.md", Para: 0, Lines: "1", Score: 1, Snippet: "old", Mtime: 0}
+	client := &testDocumentDaemonClient{hits: []store.Hit{hit}}
+	calls := injectDocumentDaemonClient(t, client, nil)
+
+	code, stdout, stderr := captureSearch(t, []string{"--db", filepath.Join(".ragrep", "index.db"), "--json", "query"})
+	if code != 0 || *calls != 1 {
+		t.Fatalf("exit=%d calls=%d stderr=%q", code, *calls, stderr)
+	}
+	hit.Stale = true
+	wantJSON, err := json.Marshal([]store.Hit{hit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != string(wantJSON)+"\n" {
+		t.Fatalf("stdout=%q, want %q", stdout, string(wantJSON)+"\n")
+	}
+	if !strings.Contains(stderr, "warning: 1 hit(s) reference files modified since indexing") {
+		t.Fatalf("stale stderr=%q", stderr)
+	}
+
+	client.hits = nil
+	code, stdout, stderr = captureSearch(t, []string{"--db", filepath.Join(".ragrep", "index.db"), "query"})
+	if code != 2 || stdout != "" || stderr != "no hits\n" {
+		t.Fatalf("no hits: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	client.err = &apiError{Code: "internal_error", Message: "daemon unavailable"}
+	code, _, _ = captureSearch(t, []string{"--db", filepath.Join(".ragrep", "index.db"), "query"})
+	if code != 1 {
+		t.Fatalf("typed daemon error exit=%d, want 1", code)
+	}
+	client.err = errors.New("connection refused")
+	code, _, _ = captureSearch(t, []string{"--db", filepath.Join(".ragrep", "index.db"), "query"})
+	if code != 1 {
+		t.Fatalf("operational daemon error exit=%d, want 1", code)
+	}
+}
+
+func TestCmdSearchDaemonValidatesBeforeFactory(t *testing.T) {
+	client := &testDocumentDaemonClient{}
+	calls := injectDocumentDaemonClient(t, client, nil)
+	for _, args := range [][]string{
+		{"--mode", "invalid", "query"},
+		{"-k", "0", "query"},
+		{"--mode", "text"},
+		{"--mode", "text", "one", "two"},
+	} {
+		code, _, _ := captureSearch(t, args)
+		if code != 1 {
+			t.Fatalf("args=%v exit=%d, want 1", args, code)
+		}
+	}
+	if *calls != 0 {
+		t.Fatalf("factory calls=%d, want 0 for invalid commands", *calls)
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // -h/--help must print usage and exit 0, not read as a generic parse error
 // (exit 1). Doesn't need the model: parsing fails before the embedder or DB
 // are ever touched.
@@ -624,6 +810,7 @@ func TestOldKeyGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Close()
+	injectDocumentDaemonClient(t, directDocumentSearchClient(), nil)
 
 	r, w, err := os.Pipe()
 	if err != nil {

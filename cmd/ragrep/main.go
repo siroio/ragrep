@@ -505,15 +505,22 @@ func cmdSearch(args []string) int {
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: ragrep search <query>"))
 	}
+	if *mode != "text" && *mode != "vector" && *mode != "hybrid" {
+		return fail(fmt.Errorf("unknown mode %q", *mode))
+	}
+	if *k <= 0 {
+		return fail(fmt.Errorf("k must be positive"))
+	}
 	query := fs.Arg(0)
-
-	s, err := openStoreAt(*db)
+	dbPath, err := filepath.Abs(*db)
 	if err != nil {
 		return fail(err)
 	}
-	defer s.Close()
-
-	hits, err := runSearch(s, *mode, query, *k, []string(tags))
+	client, err := documentDaemonClientFactory()
+	if err != nil {
+		return fail(err)
+	}
+	hits, err := client.SearchDocuments(context.Background(), documentSearchRequest{DB: dbPath, Query: query, Mode: *mode, K: *k, Tags: []string(tags)})
 	if err != nil {
 		return fail(err)
 	}
@@ -521,7 +528,7 @@ func cmdSearch(args []string) int {
 		fmt.Fprintln(os.Stderr, "no hits")
 		return 2
 	}
-	if wsRoot, werr := workspaceRoot(*db); werr == nil {
+	if wsRoot, werr := workspaceRoot(dbPath); werr == nil {
 		if n := markStale(hits, wsRoot); n > 0 {
 			fmt.Fprintf(os.Stderr, "warning: %d hit(s) reference files modified since indexing; run 'ragrep index' to refresh\n", n)
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/siroio/ragrep/internal/codestore"
 	"github.com/siroio/ragrep/internal/embed"
+	"github.com/siroio/ragrep/internal/store"
 )
 
 // End-to-end: index a small corpus and search it with the real model.
@@ -30,6 +32,7 @@ func TestSmoke(t *testing.T) {
 	if !embed.ModelCached(dir) {
 		t.Skip("model not cached; run 'ragrep init' to enable this test")
 	}
+	injectDocumentDaemonClient(t, directDocumentSearchClient(), nil)
 
 	tmp := t.TempDir()
 	corpus := filepath.Join(tmp, "docs")
@@ -97,6 +100,23 @@ func TestSmoke(t *testing.T) {
 func TestUnknownFlagExitsOne(t *testing.T) {
 	if code := run([]string{"search", "--bogusflag", "x"}); code != 1 {
 		t.Fatalf("unknown flag exit=%d, want 1", code)
+	}
+}
+
+func TestDaemonSmokeProcessRunningDetectsExitedProcess(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows process lookup regression")
+	}
+	command := exec.Command("cmd", "/c", "exit", "0")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := command.Process.Pid
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if daemonSmokeProcessRunning(pid) {
+		t.Fatalf("exited PID %d is still reported as running", pid)
 	}
 }
 
@@ -233,6 +253,190 @@ func TestSmokeDaemonLiveSearchIsFreshAndIsolated(t *testing.T) {
 	t.Logf("save visibility p95: %v (samples=%v)", durationP95(visibilitySamples), visibilitySamples)
 }
 
+func TestSmokeDaemonDocument(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal("go toolchain is required for daemon smoke test")
+	}
+	packageDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exeName := "ragrep-document-daemon-smoke"
+	if runtime.GOOS == "windows" {
+		exeName += ".exe"
+	}
+	executable := filepath.Join(t.TempDir(), exeName)
+	build := exec.Command(goBin, "build", "-ldflags", "-X=main.daemonBindAddress=127.0.0.1:0", "-o", executable, ".")
+	build.Dir = packageDir
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build daemon: %v\n%s", err, output)
+	}
+
+	environmentRoot := t.TempDir()
+	environment := isolatedDaemonEnvironment(environmentRoot)
+	copyDaemonSmokeEmbedCache(t, filepath.Join(environmentRoot, "cache", "ragrep"))
+	firstRoot, firstDB := daemonDocumentSmokeWorkspace(t, "alpha unique document phrase")
+	secondRoot, secondDB := daemonDocumentSmokeWorkspace(t, "beta isolated document phrase")
+	for _, workspace := range []struct {
+		root string
+		db   string
+	}{
+		{firstRoot, firstDB},
+		{secondRoot, secondDB},
+	} {
+		if _, stderr, err := runBuiltRagrep(executable, workspace.root, environment, "index", "--db", workspace.db, "docs"); err != nil {
+			t.Fatalf("direct index %s: %v: %s", workspace.root, err, stderr)
+		}
+	}
+
+	discoveryPath := daemonSmokeDiscoveryPath(environmentRoot, runtime.GOOS)
+	var daemonPID int
+	var daemonEndpointAddress string
+	stopped := false
+	t.Cleanup(func() {
+		if stopped {
+			return
+		}
+		if discovery, err := readDaemonDiscovery(discoveryPath); err == nil {
+			daemonPID = discovery.PID
+			daemonEndpointAddress = strings.TrimPrefix(discovery.Endpoint, "http://")
+		}
+		_, _, _ = runBuiltRagrep(executable, packageDir, environment, "daemon", "stop")
+		if daemonPID > 0 && daemonEndpointAddress != "" {
+			if err := waitForDaemonSmokeCleanup(daemonPID, daemonEndpointAddress, 3*time.Second); err != nil {
+				t.Errorf("daemon cleanup: %v", err)
+			}
+		}
+	})
+
+	first := daemonDocumentSmokeSearch(t, executable, firstRoot, environment, firstDB, "text", "alpha unique")
+	if !daemonSmokeHasDocument(first, "docs/document.md") {
+		t.Fatalf("first text search=%+v", first)
+	}
+	discovery, err := readDaemonDiscovery(discoveryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemonPID = discovery.PID
+	daemonEndpointAddress = strings.TrimPrefix(discovery.Endpoint, "http://")
+
+	firstHybrid := daemonDocumentSmokeSearch(t, executable, firstRoot, environment, firstDB, "hybrid", "alpha unique document phrase")
+	if !daemonSmokeHasDocument(firstHybrid, "docs/document.md") {
+		t.Fatalf("first hybrid search=%+v", firstHybrid)
+	}
+	secondHybrid := daemonDocumentSmokeSearch(t, executable, secondRoot, environment, secondDB, "hybrid", "beta isolated document phrase")
+	if !daemonSmokeHasDocument(secondHybrid, "docs/document.md") || daemonSmokeHasSnippet(secondHybrid, "alpha unique") {
+		t.Fatalf("second hybrid search=%+v", secondHybrid)
+	}
+
+	if _, stderr, err := runBuiltRagrepInput(executable, firstRoot, environment, "direct add marker", "add", "--db", firstDB, "notes/direct.md"); err != nil {
+		t.Fatalf("direct add: %v: %s", err, stderr)
+	}
+	added := daemonDocumentSmokeSearch(t, executable, firstRoot, environment, firstDB, "text", "direct add marker")
+	if !daemonSmokeHasDocument(added, "notes/direct.md") {
+		t.Fatalf("direct add visibility=%+v", added)
+	}
+	if err := os.WriteFile(filepath.Join(firstRoot, "docs", "later.md"), []byte("direct index marker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, err := runBuiltRagrep(executable, firstRoot, environment, "index", "--db", firstDB, "docs"); err != nil {
+		t.Fatalf("direct reindex: %v: %s", err, stderr)
+	}
+	indexed := daemonDocumentSmokeSearch(t, executable, firstRoot, environment, firstDB, "text", "direct index marker")
+	if !daemonSmokeHasDocument(indexed, "docs/later.md") {
+		t.Fatalf("direct index visibility=%+v", indexed)
+	}
+
+	if _, stderr, err := runBuiltRagrep(executable, packageDir, environment, "daemon", "stop"); err != nil {
+		t.Fatalf("daemon stop: %v: %s", err, stderr)
+	}
+	if err := waitForDaemonSmokeCleanup(daemonPID, daemonEndpointAddress, 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(discoveryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery remains after stop: %v", err)
+	}
+	stopped = true
+}
+
+func daemonDocumentSmokeWorkspace(t *testing.T, content string) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".ragrep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "docs", "document.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root, filepath.Join(root, ".ragrep", "index.db")
+}
+
+func copyDaemonSmokeEmbedCache(t *testing.T, destination string) {
+	t.Helper()
+	source, err := embed.CacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !embed.ModelCached(source) {
+		t.Skip("model not cached; run 'ragrep init' to enable this test")
+	}
+	if err := filepath.WalkDir(source, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o755)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func daemonDocumentSmokeSearch(t *testing.T, executable, root string, environment []string, db, mode, query string) []store.Hit {
+	t.Helper()
+	stdout, stderr, err := runBuiltRagrep(executable, root, environment, "search", "--db", db, "--mode", mode, "--json", query)
+	if err != nil {
+		t.Fatalf("document search %q: %v: %s", query, err, stderr)
+	}
+	var hits []store.Hit
+	if err := json.Unmarshal([]byte(stdout), &hits); err != nil {
+		t.Fatalf("decode document search %q: %v: %s", query, err, stdout)
+	}
+	return hits
+}
+
+func daemonSmokeHasDocument(hits []store.Hit, document string) bool {
+	for _, hit := range hits {
+		if filepath.ToSlash(hit.Doc) == document {
+			return true
+		}
+	}
+	return false
+}
+
+func daemonSmokeHasSnippet(hits []store.Hit, fragment string) bool {
+	for _, hit := range hits {
+		if strings.Contains(hit.Snippet, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 type daemonSmokeSearchResult struct {
 	Hits       []codestore.SymbolHit `json:"hits"`
 	Fresh      bool                  `json:"fresh"`
@@ -306,6 +510,17 @@ func runBuiltRagrep(executable, directory string, environment []string, args ...
 	return stdout.String(), stderr.String(), err
 }
 
+func runBuiltRagrepInput(executable, directory string, environment []string, input string, args ...string) (string, string, error) {
+	command := exec.Command(executable, args...)
+	command.Dir = directory
+	command.Env = environment
+	command.Stdin = strings.NewReader(input)
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	err := command.Run()
+	return stdout.String(), stderr.String(), err
+}
+
 func waitForDaemonSmokeCleanup(pid int, address string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -331,7 +546,8 @@ func daemonSmokeProcessRunning(pid int) bool {
 	}
 	defer process.Release()
 	if runtime.GOOS == "windows" {
-		return true
+		output, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
+		return err == nil && strings.Contains(string(output), fmt.Sprintf("\"%d\"", pid))
 	}
 	err = process.Signal(syscall.Signal(0))
 	return err == nil || !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH)
