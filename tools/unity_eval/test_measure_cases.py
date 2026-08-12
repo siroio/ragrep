@@ -1,9 +1,12 @@
+import contextlib
+import io
 import json
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -177,6 +180,316 @@ class MeasureCasesTests(unittest.TestCase):
                     **files,
                 )
             self.assertFalse(output.exists())
+
+
+class WorkerOutputTests(unittest.TestCase):
+    def valid(self):
+        return {
+            "id": "unity-manual-001",
+            "answerable": True,
+            "answer": "回答",
+            "evidence": [{"doc": "Manual/a.md", "para": 1}],
+            "searches": ["query"],
+            "retrievals": [{
+                "query": "query", "mode": "hybrid",
+                "hits": [{"rank": 1, "doc": "Manual/a.md", "para": 1}],
+            }],
+            "notes": "",
+        }
+
+    def parse(self, value, condition="c2_skill_ragrep"):
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        return measure_cases.parse_worker_output(text, "unity-manual-001", condition)
+
+    def test_parse_worker_output_accepts_exact_schema(self):
+        self.assertEqual(self.parse(self.valid()), self.valid())
+
+    def test_parse_worker_output_rejects_malformed_variants(self):
+        variants = []
+        variants.extend(("```json\n{}\n```", "before {}", "{} after"))
+        for key in self.valid():
+            value = self.valid()
+            del value[key]
+            variants.append(value)
+        extra = self.valid(); extra["extra"] = True; variants.append(extra)
+        wrong_id = self.valid(); wrong_id["id"] = "other"; variants.append(wrong_id)
+        wrong_bool = self.valid(); wrong_bool["answerable"] = 1; variants.append(wrong_bool)
+        for doc in (r"C:\secret.md", "../secret.md", "/secret.md"):
+            value = self.valid(); value["evidence"][0]["doc"] = doc; variants.append(value)
+        negative_para = self.valid(); negative_para["evidence"][0]["para"] = -1; variants.append(negative_para)
+        duplicate_rank = self.valid(); duplicate_rank["retrievals"][0]["hits"].append(
+            {"rank": 1, "doc": "Manual/b.md", "para": 2}
+        ); variants.append(duplicate_rank)
+        invalid_mode = self.valid(); invalid_mode["retrievals"][0]["mode"] = "magic"; variants.append(invalid_mode)
+        answer_without_evidence = self.valid(); answer_without_evidence["evidence"] = []; variants.append(answer_without_evidence)
+        for value in variants:
+            with self.subTest(value=value):
+                with self.assertRaises((ValueError, json.JSONDecodeError)):
+                    self.parse(value)
+
+    def test_parse_worker_output_enforces_condition_rules(self):
+        with self.assertRaisesRegex(ValueError, "C0"):
+            self.parse(self.valid(), "c0_no_skill_no_ragrep")
+        for condition in ("c1_ragrep_no_skill", "c2_skill_ragrep"):
+            for field in ("searches", "retrievals"):
+                value = self.valid(); value[field] = []
+                with self.subTest(condition=condition, field=field):
+                    with self.assertRaises(ValueError):
+                        self.parse(value, condition)
+        c0 = self.valid(); c0["retrievals"] = []
+        self.assertEqual(self.parse(c0, "c0_no_skill_no_ragrep"), c0)
+        unknown = self.valid(); unknown["answerable"] = False; unknown["evidence"] = []
+        self.assertEqual(self.parse(unknown), unknown)
+        errored = self.valid(); errored["evidence"] = []; errored["notes"] = "tool error"
+        self.assertEqual(self.parse(errored), errored)
+
+
+class TranscriptTests(unittest.TestCase):
+    def write_transcript(self, path: Path, thread_id="thread-1", calls=None):
+        rows = [
+            {"timestamp": "2026-08-12T00:00:00Z", "type": "session_meta",
+             "payload": {"id": thread_id}},
+            {"timestamp": "2026-08-12T00:00:01Z", "type": "response_item",
+             "payload": {"type": "message", "role": "user", "content": "ragrep-eval-private in prompt only"}},
+            {"timestamp": "2026-08-12T00:00:02Z", "type": "event_msg",
+             "payload": {"type": "token_count", "info": {"last_token_usage": {
+                 "input_tokens": 1, "output_tokens": 2, "total_tokens": 3}}}},
+        ]
+        for number, (namespace, name, arguments, output) in enumerate(calls or [], start=1):
+            call_id = f"call-{number}"
+            rows.extend([
+                {"timestamp": f"2026-08-12T00:00:{number + 2:02}Z", "type": "response_item",
+                 "payload": {"type": "function_call", "call_id": call_id,
+                             "namespace": namespace, "name": name,
+                             "arguments": json.dumps(arguments)}},
+                {"timestamp": f"2026-08-12T00:00:{number + 3:02}Z", "type": "response_item",
+                 "payload": {"type": "function_call_output", "call_id": call_id,
+                             "status": "completed", "output": output}},
+            ])
+        rows.append(
+            {"timestamp": "2026-08-12T00:01:00Z", "type": "event_msg",
+             "payload": {"type": "token_count", "info": {"last_token_usage": {
+                 "input_tokens": 120, "cached_input_tokens": 80,
+                 "output_tokens": 30, "reasoning_output_tokens": 10,
+                 "total_tokens": 150}}}}
+        )
+        path.write_text(
+            "not-json\n" + "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_find_transcript_requires_one_exact_session_id(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.write_transcript(root / "partial.jsonl", "thread-10")
+            expected = self.write_transcript(root / "exact.jsonl", "thread-1")
+            self.assertEqual(measure_cases.find_transcript(root, "thread-1"), expected)
+            with self.assertRaisesRegex(ValueError, "no transcript"):
+                measure_cases.find_transcript(root, "missing")
+            self.write_transcript(root / "duplicate.jsonl", "thread-1")
+            with self.assertRaisesRegex(ValueError, "multiple"):
+                measure_cases.find_transcript(root, "thread-1")
+
+    def test_parse_transcript_keeps_last_tokens_and_bounded_tool_trace(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = self.write_transcript(
+                Path(raw) / "session.jsonl",
+                calls=[("shell", "shell_command", {"command": "wrapper ragrep search query"}, "x" * 2000)],
+            )
+            parsed = measure_cases.parse_transcript(path)
+            self.assertEqual(parsed["thread_id"], "thread-1")
+            self.assertEqual(parsed["tokens"], {
+                "input_tokens": 120,
+                "cached_input_tokens": 80,
+                "output_tokens": 30,
+                "reasoning_output_tokens": 10,
+                "total_tokens": 150,
+            })
+            self.assertEqual(parsed["tool_counts"], {"shell__shell_command": 1})
+            self.assertEqual(parsed["ragrep_search_count"], 1)
+            self.assertEqual(parsed["rg_count"], 0)
+            self.assertLessEqual(len(parsed["tool_calls"][0]["output_excerpt"]), 512)
+            self.assertEqual(
+                parsed["tool_calls"][0]["output_sha256"],
+                "5c0e0ea421571c300b5df6aec0a118b5c3dc02e0683a546341d5efc689df2f58",
+            )
+            self.assertNotIn("ragrep-eval-private in prompt only", json.dumps(parsed))
+            self.assertEqual(parsed["duration_seconds"], 60.0)
+
+    def test_audit_transcript_enforces_condition_boundaries(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cases = [
+                ("c0_no_skill_no_ragrep", [("shell", "shell_command", {"command": "ragrep search x"}, "ok")]),
+                ("c0_no_skill_no_ragrep", [("shell", "shell_command", {"command": "echo ok"}, "ragrep search x")]),
+                ("c0_no_skill_no_ragrep", [("mcp__docs", "search", {"query": "x"}, "ok")]),
+                ("c1_ragrep_no_skill", [("shell", "shell_command", {"command": "Get-Content skills/search/SKILL.md"}, "ok")]),
+                ("c1_ragrep_no_skill", [("shell", "shell_command", {"command": "ragrep.exe search x"}, "ok")]),
+                ("c2_skill_ragrep", [("shell", "shell_command", {"command": "wrapper ragrep search x"}, "holdout-gold.jsonl")]),
+            ]
+            for number, (condition, calls) in enumerate(cases):
+                path = self.write_transcript(root / f"bad-{number}.jsonl", calls=calls)
+                violations = measure_cases.audit_transcript(
+                    measure_cases.parse_transcript(path), condition,
+                    frozen_skill_path=r"D:\fixed\skills\search\SKILL.md",
+                )
+                self.assertTrue(violations, (condition, calls))
+
+            good_c1 = self.write_transcript(
+                root / "good-c1.jsonl",
+                calls=[("shell", "shell_command", {"command": r"D:\run\wrapper.ps1 ragrep search x"}, "ok")],
+            )
+            good_c1_parsed = measure_cases.parse_transcript(good_c1)
+            self.assertEqual(good_c1_parsed["wrapper_ragrep_search_count"], 1)
+            self.assertEqual(measure_cases.audit_transcript(good_c1_parsed, "c1_ragrep_no_skill"), [])
+            good_c2 = self.write_transcript(
+                root / "good-c2.jsonl",
+                calls=[
+                    ("shell", "shell_command", {"command": r"Get-Content D:\fixed\skills\search\SKILL.md"}, "ok"),
+                    ("shell", "shell_command", {"command": r"D:\run\wrapper.ps1 ragrep search x"}, "ok"),
+                ],
+            )
+            self.assertEqual(measure_cases.audit_transcript(
+                measure_cases.parse_transcript(good_c2), "c2_skill_ragrep",
+                frozen_skill_path=r"D:\fixed\skills\search\SKILL.md",
+            ), [])
+
+
+class ResultLedgerTests(unittest.TestCase):
+    run_key = "c0_no_skill_no_ragrep/r1/q-1"
+
+    def make_run(self, root: Path):
+        root.mkdir()
+        (root / "dispatch.jsonl").write_text(json.dumps({
+            "run_key": self.run_key, "condition": "c0_no_skill_no_ragrep",
+            "repetition": 1, "order": 1, "id": "q-1", "query": "q",
+            "split": "development",
+        }) + "\n", encoding="utf-8")
+        (root / "manifest.json").write_text(json.dumps({
+            "model": "gpt-5.6-sol", "reasoning": "medium", "timeout_seconds": 600,
+            "prompt_hashes": {"c0_no_skill_no_ragrep": "0" * 64},
+            "sha256": {"binary": "1" * 64, "db": "2" * 64, "skill": "3" * 64},
+        }), encoding="utf-8")
+        transcript = root.parent / "transcript.jsonl"
+        TranscriptTests().write_transcript(transcript, calls=[])
+        final = json.dumps({
+            "id": "q-1", "answerable": True, "answer": "a",
+            "evidence": [{"doc": "Manual/a.md", "para": 1}],
+            "searches": [], "retrievals": [], "notes": "",
+        })
+        return transcript, final
+
+    def record(self, root, thread="thread-1", status="completed", transcript=None, final=None):
+        if transcript is None or final is None:
+            transcript, final = self.make_run(root)
+        return measure_cases.record_result(
+            root, self.run_key, thread, status, final, transcript,
+            datetime(2026, 8, 12, 1, tzinfo=timezone.utc),
+        )
+
+    def test_record_result_appends_verified_hash_chain_and_rejects_duplicates(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            record = self.record(root)
+            self.assertTrue(record["archive_ready"])
+            results = [json.loads(line) for line in (root / "results.jsonl").read_text().splitlines()]
+            chain = [json.loads(line) for line in (root / "results.sha256-chain.jsonl").read_text().splitlines()]
+            self.assertEqual(len(results), 1)
+            self.assertEqual(chain[0]["run_key"], self.run_key)
+            self.assertEqual(chain[0]["previous_chain_sha256"], "0" * 64)
+            self.assertEqual(len(chain[0]["record_sha256"]), 64)
+            self.assertEqual(len(chain[0]["chain_sha256"]), 64)
+            verified = measure_cases.verify_results(root)
+            self.assertTrue(verified["valid"])
+            self.assertEqual(verified["unarchived_thread_ids"], ["thread-1"])
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                measure_cases.record_result(
+                    root, self.run_key, "thread-2", "completed", "{}",
+                    root.parent / "transcript.jsonl", datetime.now(timezone.utc),
+                )
+            with self.assertRaisesRegex(ValueError, "unknown"):
+                measure_cases.record_result(
+                    root, "unknown", "thread-2", "timeout", "",
+                    root.parent / "transcript.jsonl", datetime.now(timezone.utc),
+                )
+
+    def test_verify_recovers_only_missing_final_chain_row(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            self.record(root)
+            (root / "results.sha256-chain.jsonl").write_text("", encoding="utf-8")
+            self.assertTrue(measure_cases.verify_results(root)["valid"])
+            self.assertEqual(len((root / "results.sha256-chain.jsonl").read_text().splitlines()), 1)
+            (root / "results.sha256-chain.jsonl").write_text(
+                json.dumps({"run_key": self.run_key, "record_sha256": "f" * 64,
+                            "previous_chain_sha256": "0" * 64, "chain_sha256": "e" * 64}) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "chain"):
+                measure_cases.verify_results(root)
+
+    def test_archive_gate_and_infrastructure_redispatch(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            transcript, final = self.make_run(root)
+            infra = self.record(root, status="infrastructure_invalid", transcript=transcript, final=final)
+            self.assertTrue(infra["archive_ready"])
+            self.assertEqual([row["run_key"] for row in measure_cases.pending_runs(root, 8)], [self.run_key])
+            measure_cases.mark_archived(
+                root, self.run_key, "thread-1", datetime(2026, 8, 12, 2, tzinfo=timezone.utc)
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                measure_cases.mark_archived(
+                    root, self.run_key, "thread-1", datetime.now(timezone.utc)
+                )
+            transcript2 = root.parent / "transcript-2.jsonl"
+            TranscriptTests().write_transcript(transcript2, thread_id="thread-2", calls=[])
+            completed = self.record(root, thread="thread-2", transcript=transcript2, final=final)
+            self.assertTrue(completed["archive_ready"])
+            self.assertEqual(measure_cases.pending_runs(root, 8), [])
+
+    def test_missing_token_event_stays_null_and_status_is_closed_enum(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            transcript, final = self.make_run(root)
+            transcript.write_text(json.dumps({
+                "timestamp": "2026-08-12T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "thread-1"},
+            }) + "\n", encoding="utf-8")
+            record = self.record(root, transcript=transcript, final=final)
+            self.assertEqual(record["tokens"], {key: None for key in measure_cases.TOKEN_KEYS})
+            with tempfile.TemporaryDirectory() as other:
+                other_root = Path(other) / "run"
+                other_transcript, other_final = self.make_run(other_root)
+                with self.assertRaisesRegex(ValueError, "status"):
+                    self.record(other_root, status="retry", transcript=other_transcript, final=other_final)
+
+    def test_result_cli_reads_worker_json_from_stdin(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            transcript, final = self.make_run(root)
+            stdout = io.StringIO()
+            with mock.patch("sys.stdin", io.StringIO(final)), contextlib.redirect_stdout(stdout):
+                self.assertEqual(measure_cases.main([
+                    "record", "--run-dir", str(root), "--run-key", self.run_key,
+                    "--thread-id", "thread-1", "--status", "completed",
+                    "--transcript", str(transcript), "--completed-at", "2026-08-12T01:00:00Z",
+                ]), 0)
+            self.assertTrue(json.loads(stdout.getvalue())["archive_ready"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(measure_cases.main(["verify", "--run-dir", str(root)]), 0)
+            self.assertTrue(json.loads(stdout.getvalue())["valid"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(measure_cases.main(["pending", "--run-dir", str(root), "--limit", "8"]), 0)
+            self.assertEqual(stdout.getvalue(), "")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(measure_cases.main([
+                    "mark-archived", "--run-dir", str(root), "--run-key", self.run_key,
+                    "--thread-id", "thread-1", "--archived-at", "2026-08-12T02:00:00Z",
+                ]), 0)
 
 
 if __name__ == "__main__":
