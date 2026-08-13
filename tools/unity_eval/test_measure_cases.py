@@ -97,6 +97,26 @@ class MeasureCasesTests(unittest.TestCase):
                     row["query"] == f"question {int(row['id'][2:])}" for row in rows
                 ))
 
+    def test_build_dispatch_round_robins_condition_and_repetition_queues(self):
+        questions = [
+            {"id": f"q-{number}", "query": str(number), "split": "development"}
+            for number in range(2)
+        ]
+
+        dispatch = measure_cases.build_dispatch(questions, repetitions=2, seed=42)
+
+        self.assertEqual(
+            [(row["condition"], row["repetition"]) for row in dispatch[:6]],
+            [
+                ("c0_no_skill_no_ragrep", 1),
+                ("c1_ragrep_no_skill", 1),
+                ("c2_skill_ragrep", 1),
+                ("c0_no_skill_no_ragrep", 2),
+                ("c1_ragrep_no_skill", 2),
+                ("c2_skill_ragrep", 2),
+            ],
+        )
+
     def test_prepare_run_publishes_isolated_reproducible_files(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -109,10 +129,15 @@ class MeasureCasesTests(unittest.TestCase):
                 root / "holdout.jsonl", [{"id": "hold", "query": "h"}]
             )
             sources = {}
-            for name in ("frozen_manifest", "holdout_gold", "validator", "skill", "db", "binary"):
+            for name in ("frozen_manifest", "holdout_gold", "validator", "skill", "db", "binary", "wrapper"):
                 sources[name] = root / name
                 sources[name].write_bytes(name.encode())
+            prompts = {}
+            for condition in measure_cases.CONDITIONS:
+                prompts[condition] = root / f"{condition}.prompt"
+                prompts[condition].write_text(condition, encoding="utf-8")
             output = root / "run"
+            controller_inputs = root / "private" / "controller-inputs.json"
 
             manifest = measure_cases.prepare_run(
                 development=development,
@@ -121,11 +146,8 @@ class MeasureCasesTests(unittest.TestCase):
                 pilot_ids=("direct", "complex", "unknown"),
                 seed=7,
                 generated_at=datetime(2026, 8, 12, 10, tzinfo=timezone.utc),
-                prompt_hashes={
-                    "c0_no_skill_no_ragrep": "0" * 64,
-                    "c1_ragrep_no_skill": "1" * 64,
-                    "c2_skill_ragrep": "2" * 64,
-                },
+                prompt_sources=prompts,
+                controller_inputs=controller_inputs,
                 **sources,
             )
 
@@ -141,11 +163,26 @@ class MeasureCasesTests(unittest.TestCase):
             self.assertEqual(
                 manifest["sha256"]["binary"], measure_cases.sha256_file(sources["binary"])
             )
+            self.assertEqual(
+                manifest["prompt_hashes"]["c1_ragrep_no_skill"],
+                measure_cases.sha256_file(prompts["c1_ragrep_no_skill"]),
+            )
+            self.assertEqual(manifest["wrapper_path"], str(sources["wrapper"].resolve()))
+            self.assertTrue(controller_inputs.is_file())
+            self.assertNotIn(str(sources["holdout_gold"].resolve()), json.dumps(manifest))
             public = (output / "questions-only.jsonl").read_text(encoding="utf-8")
             self.assertNotIn("secret", public)
             self.assertTrue(all("question_sha256" in json.loads(line) for line in public.splitlines()))
             self.assertEqual(len((output / "dispatch.jsonl").read_text().splitlines()), 60)
             self.assertEqual(len((output / "pilot-dispatch.jsonl").read_text().splitlines()), 9)
+            pilot_rows = [json.loads(line) for line in (output / "pilot-dispatch.jsonl").read_text().splitlines()]
+            self.assertEqual(
+                [row["condition"] for row in pilot_rows[:6]],
+                [
+                    "c0_no_skill_no_ragrep", "c1_ragrep_no_skill", "c2_skill_ragrep",
+                    "c0_no_skill_no_ragrep", "c1_ragrep_no_skill", "c2_skill_ragrep",
+                ],
+            )
             rendered = (output / "manifest.json").read_text(encoding="utf-8")
             self.assertEqual(rendered, json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
@@ -154,7 +191,7 @@ class MeasureCasesTests(unittest.TestCase):
                     development=development, holdout_questions=holdout, output=output,
                     pilot_ids=("direct", "complex", "unknown"), seed=7,
                     generated_at=datetime.now(timezone.utc),
-                    prompt_hashes=manifest["prompt_hashes"], **sources,
+                    prompt_sources=prompts, controller_inputs=controller_inputs, **sources,
                 )
 
     def test_prepare_run_rejects_naive_timestamp_before_writing(self):
@@ -163,7 +200,7 @@ class MeasureCasesTests(unittest.TestCase):
             files = {}
             for name in (
                 "development", "holdout_questions", "frozen_manifest", "holdout_gold",
-                "validator", "skill", "db", "binary",
+                "validator", "skill", "db", "binary", "wrapper",
             ):
                 files[name] = root / name
                 files[name].write_text('{"id":"q","query":"x"}\n')
@@ -172,11 +209,8 @@ class MeasureCasesTests(unittest.TestCase):
                 measure_cases.prepare_run(
                     output=output, pilot_ids=("q", "q", "q"), seed=1,
                     generated_at=datetime(2026, 8, 12),
-                    prompt_hashes={
-                        "c0_no_skill_no_ragrep": "0" * 64,
-                        "c1_ragrep_no_skill": "1" * 64,
-                        "c2_skill_ragrep": "2" * 64,
-                    },
+                    prompt_sources={condition: files["validator"] for condition in measure_cases.CONDITIONS},
+                    controller_inputs=root / "controller-inputs.json",
                     **files,
                 )
             self.assertFalse(output.exists())
@@ -214,7 +248,10 @@ class WorkerOutputTests(unittest.TestCase):
         extra = self.valid(); extra["extra"] = True; variants.append(extra)
         wrong_id = self.valid(); wrong_id["id"] = "other"; variants.append(wrong_id)
         wrong_bool = self.valid(); wrong_bool["answerable"] = 1; variants.append(wrong_bool)
-        for doc in (r"C:\secret.md", "../secret.md", "/secret.md"):
+        for doc in (
+            r"C:\secret.md", "../secret.md", "/secret.md", r"..\secret.md",
+            r"\secret.md", r"C:secret.md", r"Manual/..\secret.md",
+        ):
             value = self.valid(); value["evidence"][0]["doc"] = doc; variants.append(value)
         negative_para = self.valid(); negative_para["evidence"][0]["para"] = -1; variants.append(negative_para)
         duplicate_rank = self.valid(); duplicate_rank["retrievals"][0]["hits"].append(
@@ -322,7 +359,6 @@ class TranscriptTests(unittest.TestCase):
             root = Path(raw)
             cases = [
                 ("c0_no_skill_no_ragrep", [("shell", "shell_command", {"command": "ragrep search x"}, "ok")]),
-                ("c0_no_skill_no_ragrep", [("shell", "shell_command", {"command": "echo ok"}, "ragrep search x")]),
                 ("c0_no_skill_no_ragrep", [("mcp__docs", "search", {"query": "x"}, "ok")]),
                 ("c1_ragrep_no_skill", [("shell", "shell_command", {"command": "Get-Content skills/search/SKILL.md"}, "ok")]),
                 ("c1_ragrep_no_skill", [("shell", "shell_command", {"command": "ragrep.exe search x"}, "ok")]),
@@ -333,6 +369,7 @@ class TranscriptTests(unittest.TestCase):
                 violations = measure_cases.audit_transcript(
                     measure_cases.parse_transcript(path), condition,
                     frozen_skill_path=r"D:\fixed\skills\search\SKILL.md",
+                    frozen_wrapper_path=r"D:\run\wrapper.ps1",
                 )
                 self.assertTrue(violations, (condition, calls))
 
@@ -342,7 +379,10 @@ class TranscriptTests(unittest.TestCase):
             )
             good_c1_parsed = measure_cases.parse_transcript(good_c1)
             self.assertEqual(good_c1_parsed["wrapper_ragrep_search_count"], 1)
-            self.assertEqual(measure_cases.audit_transcript(good_c1_parsed, "c1_ragrep_no_skill"), [])
+            self.assertEqual(measure_cases.audit_transcript(
+                good_c1_parsed, "c1_ragrep_no_skill",
+                frozen_wrapper_path=r"D:\run\wrapper.ps1",
+            ), [])
             good_c2 = self.write_transcript(
                 root / "good-c2.jsonl",
                 calls=[
@@ -353,7 +393,55 @@ class TranscriptTests(unittest.TestCase):
             self.assertEqual(measure_cases.audit_transcript(
                 measure_cases.parse_transcript(good_c2), "c2_skill_ragrep",
                 frozen_skill_path=r"D:\fixed\skills\search\SKILL.md",
+                frozen_wrapper_path=r"D:\run\wrapper.ps1",
             ), [])
+
+    def test_audit_requires_real_exact_wrapper_and_skill_operations(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            wrapper = r"D:\run\wrapper.ps1"
+            skill = r"D:\fixed\skills\search\SKILL.md"
+            cases = [
+                ("c0_no_skill_no_ragrep", [("shell", "shell_command", {"command": "ragrep get --doc Manual/a.md"}, "ok")]),
+                ("c1_ragrep_no_skill", [("shell", "shell_command", {"command": f"echo {wrapper}; ragrep search x"}, "ok")]),
+                ("c2_skill_ragrep", [
+                    ("shell", "shell_command", {"command": f"echo {skill}"}, "ok"),
+                    ("shell", "shell_command", {"command": f"& '{wrapper}' search x"}, "ok"),
+                ]),
+            ]
+            for number, (condition, calls) in enumerate(cases):
+                path = self.write_transcript(root / f"structured-{number}.jsonl", calls=calls)
+                violations = measure_cases.audit_transcript(
+                    measure_cases.parse_transcript(path), condition,
+                    frozen_skill_path=skill, frozen_wrapper_path=wrapper,
+                )
+                self.assertTrue(violations, (condition, calls))
+
+            bypass = self.write_transcript(
+                root / "bypass.jsonl",
+                calls=[("shell", "shell_command", {"command": "ragrep search x"}, "ok")],
+            )
+            self.assertIn(
+                "forbidden ragrep wrapper bypass",
+                measure_cases.audit_transcript(
+                    measure_cases.parse_transcript(bypass), "c1_ragrep_no_skill",
+                    frozen_wrapper_path=wrapper,
+                ),
+            )
+
+    def test_forbidden_tool_output_is_hashed_but_never_excerpted(self):
+        with tempfile.TemporaryDirectory() as raw:
+            secret = "holdout-gold.jsonl SECRET ANSWER"
+            path = self.write_transcript(
+                Path(raw) / "secret.jsonl",
+                calls=[("shell", "shell_command", {"command": "Get-Content holdout-gold.jsonl"}, secret)],
+            )
+
+            parsed = measure_cases.parse_transcript(path)
+
+            self.assertEqual(len(parsed["tool_calls"][0]["output_sha256"]), 64)
+            self.assertIsNone(parsed["tool_calls"][0]["output_excerpt"])
+            self.assertNotIn("SECRET ANSWER", json.dumps(parsed))
 
 
 class ResultLedgerTests(unittest.TestCase):
@@ -366,10 +454,36 @@ class ResultLedgerTests(unittest.TestCase):
             "repetition": 1, "order": 1, "id": "q-1", "query": "q",
             "split": "development",
         }) + "\n", encoding="utf-8")
+        source_paths = {}
+        for name in (
+            "frozen_manifest", "holdout_questions", "development", "holdout_gold",
+            "validator", "skill", "db", "binary", "wrapper",
+        ):
+            path = root.parent / name
+            path.write_text(name, encoding="utf-8")
+            source_paths[name] = str(path.resolve())
+        prompt_paths = {}
+        for condition in measure_cases.CONDITIONS:
+            path = root.parent / f"{condition}.prompt"
+            path.write_text(condition, encoding="utf-8")
+            prompt_paths[condition] = str(path.resolve())
+        controller_inputs = root.parent / "controller-inputs.json"
+        controller_inputs.write_text(json.dumps({
+            "sources": source_paths, "prompts": prompt_paths,
+        }), encoding="utf-8")
         (root / "manifest.json").write_text(json.dumps({
             "model": "gpt-5.6-sol", "reasoning": "medium", "timeout_seconds": 600,
-            "prompt_hashes": {"c0_no_skill_no_ragrep": "0" * 64},
-            "sha256": {"binary": "1" * 64, "db": "2" * 64, "skill": "3" * 64},
+            "prompt_hashes": {
+                condition: measure_cases.sha256_file(Path(path))
+                for condition, path in prompt_paths.items()
+            },
+            "sha256": {
+                name: measure_cases.sha256_file(Path(path))
+                for name, path in source_paths.items()
+            },
+            "skill_path": source_paths["skill"],
+            "wrapper_path": source_paths["wrapper"],
+            "controller_inputs_sha256": measure_cases.sha256_file(controller_inputs),
         }), encoding="utf-8")
         transcript = root.parent / "transcript.jsonl"
         TranscriptTests().write_transcript(transcript, calls=[])
@@ -378,14 +492,25 @@ class ResultLedgerTests(unittest.TestCase):
             "evidence": [{"doc": "Manual/a.md", "para": 1}],
             "searches": [], "retrievals": [], "notes": "",
         })
-        return transcript, final
+        return transcript, final, controller_inputs
 
     def record(self, root, thread="thread-1", status="completed", transcript=None, final=None):
+        controller_inputs = root.parent / "controller-inputs.json"
         if transcript is None or final is None:
-            transcript, final = self.make_run(root)
+            transcript, final, controller_inputs = self.make_run(root)
+        claimed = measure_cases.claim_runs(
+            root, controller_inputs, 1,
+            datetime(2026, 8, 12, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual([row["run_key"] for row in claimed], [self.run_key])
+        measure_cases.assign_claim(
+            root, self.run_key, thread,
+            datetime(2026, 8, 12, 0, 30, tzinfo=timezone.utc),
+        )
         return measure_cases.record_result(
             root, self.run_key, thread, status, final, transcript,
             datetime(2026, 8, 12, 1, tzinfo=timezone.utc),
+            controller_inputs=controller_inputs,
         )
 
     def test_record_result_appends_verified_hash_chain_and_rejects_duplicates(self):
@@ -407,11 +532,13 @@ class ResultLedgerTests(unittest.TestCase):
                 measure_cases.record_result(
                     root, self.run_key, "thread-2", "completed", "{}",
                     root.parent / "transcript.jsonl", datetime.now(timezone.utc),
+                    controller_inputs=root.parent / "controller-inputs.json",
                 )
             with self.assertRaisesRegex(ValueError, "unknown"):
                 measure_cases.record_result(
                     root, "unknown", "thread-2", "timeout", "",
                     root.parent / "transcript.jsonl", datetime.now(timezone.utc),
+                    controller_inputs=root.parent / "controller-inputs.json",
                 )
 
     def test_verify_recovers_only_missing_final_chain_row(self):
@@ -432,10 +559,12 @@ class ResultLedgerTests(unittest.TestCase):
     def test_archive_gate_and_infrastructure_redispatch(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "run"
-            transcript, final = self.make_run(root)
+            transcript, final, _ = self.make_run(root)
             infra = self.record(root, status="infrastructure_invalid", transcript=transcript, final=final)
             self.assertTrue(infra["archive_ready"])
-            self.assertEqual([row["run_key"] for row in measure_cases.pending_runs(root, 8)], [self.run_key])
+            self.assertEqual([row["run_key"] for row in measure_cases.pending_runs(
+                root, 8, controller_inputs=root.parent / "controller-inputs.json"
+            )], [self.run_key])
             measure_cases.mark_archived(
                 root, self.run_key, "thread-1", datetime(2026, 8, 12, 2, tzinfo=timezone.utc)
             )
@@ -447,12 +576,14 @@ class ResultLedgerTests(unittest.TestCase):
             TranscriptTests().write_transcript(transcript2, thread_id="thread-2", calls=[])
             completed = self.record(root, thread="thread-2", transcript=transcript2, final=final)
             self.assertTrue(completed["archive_ready"])
-            self.assertEqual(measure_cases.pending_runs(root, 8), [])
+            self.assertEqual(measure_cases.pending_runs(
+                root, 8, controller_inputs=root.parent / "controller-inputs.json"
+            ), [])
 
     def test_missing_token_event_stays_null_and_status_is_closed_enum(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "run"
-            transcript, final = self.make_run(root)
+            transcript, final, _ = self.make_run(root)
             transcript.write_text(json.dumps({
                 "timestamp": "2026-08-12T00:00:00Z", "type": "session_meta",
                 "payload": {"id": "thread-1"},
@@ -461,35 +592,166 @@ class ResultLedgerTests(unittest.TestCase):
             self.assertEqual(record["tokens"], {key: None for key in measure_cases.TOKEN_KEYS})
             with tempfile.TemporaryDirectory() as other:
                 other_root = Path(other) / "run"
-                other_transcript, other_final = self.make_run(other_root)
+                other_transcript, other_final, _ = self.make_run(other_root)
                 with self.assertRaisesRegex(ValueError, "status"):
                     self.record(other_root, status="retry", transcript=other_transcript, final=other_final)
 
     def test_result_cli_reads_worker_json_from_stdin(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "run"
-            transcript, final = self.make_run(root)
+            transcript, final, _ = self.make_run(root)
+            measure_cases.claim_runs(
+                root, root.parent / "controller-inputs.json", 1,
+                datetime(2026, 8, 12, 0, tzinfo=timezone.utc),
+            )
+            measure_cases.assign_claim(
+                root, self.run_key, "thread-1",
+                datetime(2026, 8, 12, 0, 30, tzinfo=timezone.utc),
+            )
             stdout = io.StringIO()
             with mock.patch("sys.stdin", io.StringIO(final)), contextlib.redirect_stdout(stdout):
                 self.assertEqual(measure_cases.main([
                     "record", "--run-dir", str(root), "--run-key", self.run_key,
                     "--thread-id", "thread-1", "--status", "completed",
                     "--transcript", str(transcript), "--completed-at", "2026-08-12T01:00:00Z",
+                    "--controller-inputs", str(root.parent / "controller-inputs.json"),
                 ]), 0)
             self.assertTrue(json.loads(stdout.getvalue())["archive_ready"])
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
-                self.assertEqual(measure_cases.main(["verify", "--run-dir", str(root)]), 0)
+                self.assertEqual(measure_cases.main([
+                    "verify", "--run-dir", str(root),
+                    "--controller-inputs", str(root.parent / "controller-inputs.json"),
+                ]), 0)
             self.assertTrue(json.loads(stdout.getvalue())["valid"])
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
-                self.assertEqual(measure_cases.main(["pending", "--run-dir", str(root), "--limit", "8"]), 0)
+                self.assertEqual(measure_cases.main([
+                    "pending", "--run-dir", str(root), "--limit", "8",
+                    "--controller-inputs", str(root.parent / "controller-inputs.json"),
+                ]), 0)
             self.assertEqual(stdout.getvalue(), "")
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(measure_cases.main([
                     "mark-archived", "--run-dir", str(root), "--run-key", self.run_key,
                     "--thread-id", "thread-1", "--archived-at", "2026-08-12T02:00:00Z",
                 ]), 0)
+
+    def test_timeout_private_access_is_invalid_leakage(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            _, final, controller_inputs = self.make_run(root)
+            transcript = root.parent / "leak.jsonl"
+            TranscriptTests().write_transcript(
+                transcript,
+                calls=[("shell", "shell_command", {"command": "Get-Content holdout-gold.jsonl"}, "SECRET")],
+            )
+            measure_cases.claim_runs(
+                root, controller_inputs, 1,
+                datetime(2026, 8, 12, 0, tzinfo=timezone.utc),
+            )
+            measure_cases.assign_claim(
+                root, self.run_key, "thread-1",
+                datetime(2026, 8, 12, 0, 30, tzinfo=timezone.utc),
+            )
+
+            record = measure_cases.record_result(
+                root, self.run_key, "thread-1", "timeout", final, transcript,
+                datetime(2026, 8, 12, 1, tzinfo=timezone.utc),
+                controller_inputs=controller_inputs,
+            )
+
+            self.assertEqual(record["status"], "invalid_leakage")
+            self.assertNotIn("SECRET", json.dumps(record))
+
+    def test_infrastructure_failure_without_forbidden_access_remains_retryable(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            _, final, controller_inputs = self.make_run(root)
+            dispatch = json.loads((root / "dispatch.jsonl").read_text())
+            dispatch["condition"] = "c1_ragrep_no_skill"
+            dispatch["run_key"] = "c1_ragrep_no_skill/r1/q-1"
+            (root / "dispatch.jsonl").write_text(json.dumps(dispatch) + "\n", encoding="utf-8")
+            transcript = root.parent / "infra.jsonl"
+            TranscriptTests().write_transcript(transcript, calls=[])
+            measure_cases.claim_runs(root, controller_inputs, 1, datetime(2026, 8, 12, tzinfo=timezone.utc))
+            measure_cases.assign_claim(
+                root, dispatch["run_key"], "thread-1",
+                datetime(2026, 8, 12, 0, 30, tzinfo=timezone.utc),
+            )
+
+            record = measure_cases.record_result(
+                root, dispatch["run_key"], "thread-1", "infrastructure_invalid",
+                final, transcript, datetime(2026, 8, 12, 1, tzinfo=timezone.utc),
+                controller_inputs=controller_inputs,
+            )
+
+            self.assertEqual(record["status"], "infrastructure_invalid")
+
+    def test_claim_is_durable_assigned_and_recoverable(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            _, _, controller_inputs = self.make_run(root)
+            claimed = measure_cases.claim_runs(
+                root, controller_inputs, 1,
+                datetime(2026, 8, 12, 0, tzinfo=timezone.utc),
+            )
+            self.assertEqual([row["run_key"] for row in claimed], [self.run_key])
+            self.assertEqual(measure_cases.claim_runs(
+                root, controller_inputs, 1,
+                datetime(2026, 8, 12, 0, 1, tzinfo=timezone.utc),
+            ), [])
+            measure_cases.assign_claim(
+                root, self.run_key, "thread-1",
+                datetime(2026, 8, 12, 0, 2, tzinfo=timezone.utc),
+            )
+            with self.assertRaisesRegex(ValueError, "assigned"):
+                measure_cases.recover_claim(
+                    root, self.run_key,
+                    datetime(2026, 8, 12, 0, 3, tzinfo=timezone.utc),
+                )
+
+    def test_resume_rehashes_every_fixed_input_before_pending_or_record(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            transcript, final, controller_inputs = self.make_run(root)
+            self.assertTrue(measure_cases.verify_inputs(root, controller_inputs)["valid"])
+            (root.parent / "db").write_text("drift", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "db"):
+                measure_cases.pending_runs(root, 8, controller_inputs=controller_inputs)
+            with self.assertRaisesRegex(ValueError, "db"):
+                measure_cases.record_result(
+                    root, self.run_key, "thread-1", "completed", final, transcript,
+                    datetime(2026, 8, 12, 1, tzinfo=timezone.utc),
+                    controller_inputs=controller_inputs,
+                )
+
+    def test_verify_rejects_shared_thread_and_mismatched_archive_pairs(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "run"
+            self.record(root)
+            dispatch = json.loads((root / "dispatch.jsonl").read_text())
+            second_dispatch = dict(dispatch, run_key="c0_no_skill_no_ragrep/r1/q-2", id="q-2", order=2)
+            with (root / "dispatch.jsonl").open("a", encoding="utf-8") as destination:
+                destination.write(json.dumps(second_dispatch) + "\n")
+            first = json.loads((root / "results.jsonl").read_text())
+            second = dict(first, run_key=second_dispatch["run_key"], id="q-2", order=2)
+            second["worker_output"] = dict(first["worker_output"], id="q-2")
+            (root / "results.jsonl").write_text(
+                json.dumps(first) + "\n" + json.dumps(second) + "\n", encoding="utf-8",
+            )
+            first_chain = measure_cases._chain_row(first, measure_cases.GENESIS_SHA256)
+            second_chain = measure_cases._chain_row(second, first_chain["chain_sha256"])
+            (root / "results.sha256-chain.jsonl").write_text(
+                json.dumps(first_chain) + "\n" + json.dumps(second_chain) + "\n", encoding="utf-8",
+            )
+            (root / "archive.jsonl").write_text(json.dumps({
+                "run_key": self.run_key, "thread_id": "thread-1",
+                "archived_at": "2026-08-12T02:00:00Z",
+            }) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "thread"):
+                measure_cases.verify_results(root)
 
 
 if __name__ == "__main__":
