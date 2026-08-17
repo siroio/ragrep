@@ -5,10 +5,8 @@ description: Use when answering or working requires exploring, cross-checking, o
 
 # Searching with ragrep
 
-If materials need exploring, first use `ragrep search` with a short query of the main terms. Choose query splitting, search count, text retrieval, and whether/when to switch to other search methods based on the material's structure and unanswered points.
+リポジトリ資料を参照する質問では、最初の検索コマンドとして適切な検索語句で `ragrep search --json -k 5` を1回行う。手早さや `rg` で十分という判断で置き換えない。回答に必要な各論点を支える候補だけを `ragrep get --para N` で取得し、見出し・`status`・限定条件・因果が不足するときだけ `--context` を1段ずつ広げる。`--para N` には検索結果の `para` を使い、`lines` の行番号を渡さない。行範囲は `ragrep get --lines A-B` で取得する。
 
-Support each claim with the material or section that directly confirms it.
+ヒットなし、または未回答の論点が残る場合は、検索語を変えて `ragrep` を1回再検索する。それでも候補がない論点は `rg` で特定する。完全一致の候補探索には `--mode text` を使う。ragrepで候補を絞った後は、見出し・`status`・完全一致の確認に `rg` を使ってよい。本文は `ragrep get` で取得し、検索スニペットから断定しない。
 
-Treat results and `stale: true` as candidates; verify current text before asserting. Reindex or change the DB only when requested or authorized.
-
-Separate what materials explicitly state from what remains unresolved; do not fill gaps without evidence. For unverified points, state the checked scope only when needed. Stop when evidence suffices; mark unconfirmed points as unknown. Prioritize `AGENTS.md` and the material's `status`.
+「未定」「未記述」は、その論点を直接扱う節を確認した場合だけ判断し、別の節に記述がないことを根拠にしない。全論点に根拠が揃ったら停止し、段落境界で判断できない場合だけ全文を読む。終了コード `2` はヒットなしとして扱う。`AGENTS.md` と資料の `status` を優先する。
