@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -64,7 +65,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0(embedding float[768]);
 
 // Open opens (creating if needed) the SQLite index at path and ensures schema.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite3", "file:"+path+"?_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite3", storeDSN(path))
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +95,12 @@ func HashContent(content string) string {
 
 // UpsertDoc indexes content under relPath, keyed by its own content hash.
 func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc) (bool, error) {
-	return s.UpsertDocWithHash(relPath, content, mtime, HashContent(content), embed)
+	return s.UpsertDocContext(context.Background(), relPath, content, mtime, embed)
+}
+
+// UpsertDocContext is UpsertDoc with cancellation propagated through its transaction.
+func (s *Store) UpsertDocContext(ctx context.Context, relPath, content string, mtime int64, embed EmbedFunc) (bool, error) {
+	return s.UpsertDocWithHashContext(ctx, relPath, content, mtime, HashContent(content), embed)
 }
 
 // UpsertDocWithHash is UpsertDoc with a caller-supplied hash: used by the
@@ -102,17 +108,26 @@ func (s *Store) UpsertDoc(relPath, content string, mtime int64, embed EmbedFunc)
 // file bytes so an unchanged source file skips re-running the converter, not
 // just re-embedding.
 func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash string, embed EmbedFunc) (bool, error) {
+	return s.UpsertDocWithHashContext(context.Background(), relPath, content, mtime, hash, embed)
+}
+
+// UpsertDocWithHashContext is UpsertDocWithHash with cancellation propagated through its transaction.
+func (s *Store) UpsertDocWithHashContext(ctx context.Context, relPath, content string, mtime int64, hash string, embed EmbedFunc) (bool, error) {
+	return s.upsertDocWithHashContext(ctx, relPath, content, mtime, hash, embed, nil)
+}
+
+func (s *Store) upsertDocWithHashContext(ctx context.Context, relPath, content string, mtime int64, hash string, embed EmbedFunc, beforeCommit func()) (bool, error) {
 	var docID int64
 	var oldHash string
 	var oldMtime int64
-	err := s.db.QueryRow(`SELECT id, hash, mtime FROM documents WHERE path=?`, relPath).Scan(&docID, &oldHash, &oldMtime)
+	err := s.db.QueryRowContext(ctx, `SELECT id, hash, mtime FROM documents WHERE path=?`, relPath).Scan(&docID, &oldHash, &oldMtime)
 	if err == nil && oldHash == hash {
 		if oldMtime != mtime {
 			// Content is unchanged but the on-disk mtime moved (git checkout,
 			// touch, re-save): refresh it so markStale doesn't flag this doc
 			// forever -- without this, `ragrep index` never sees a "change"
 			// to clear the stale flag.
-			if _, err := s.db.Exec(`UPDATE documents SET mtime=? WHERE id=?`, mtime, docID); err != nil {
+			if _, err := s.db.ExecContext(ctx, `UPDATE documents SET mtime=? WHERE id=?`, mtime, docID); err != nil {
 				return false, err
 			}
 		}
@@ -123,7 +138,7 @@ func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash str
 	}
 	exists := err == nil
 
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
@@ -136,16 +151,16 @@ func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash str
 			`DELETE FROM paragraphs WHERE doc_id=?`,
 			`DELETE FROM doc_tags WHERE doc_id=?`,
 		} {
-			if _, err := tx.Exec(q, docID); err != nil {
+			if _, err := tx.ExecContext(ctx, q, docID); err != nil {
 				return false, err
 			}
 		}
-		if _, err := tx.Exec(`UPDATE documents SET content=?, mtime=?, hash=? WHERE id=?`,
+		if _, err := tx.ExecContext(ctx, `UPDATE documents SET content=?, mtime=?, hash=? WHERE id=?`,
 			content, mtime, hash, docID); err != nil {
 			return false, err
 		}
 	} else {
-		res, err := tx.Exec(`INSERT INTO documents(path, content, mtime, hash) VALUES(?,?,?,?)`,
+		res, err := tx.ExecContext(ctx, `INSERT INTO documents(path, content, mtime, hash) VALUES(?,?,?,?)`,
 			relPath, content, mtime, hash)
 		if err != nil {
 			return false, err
@@ -163,13 +178,13 @@ func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash str
 		paraSrc = blankLines(content, fmLines)
 	}
 	for _, p := range splitParas(paraSrc) {
-		res, err := tx.Exec(`INSERT INTO paragraphs(doc_id, seq, start_line, end_line, text, heading) VALUES(?,?,?,?,?,?)`,
+		res, err := tx.ExecContext(ctx, `INSERT INTO paragraphs(doc_id, seq, start_line, end_line, text, heading) VALUES(?,?,?,?,?,?)`,
 			docID, p.Seq, p.StartLine, p.EndLine, p.Text, p.Heading)
 		if err != nil {
 			return false, err
 		}
 		paraID, _ := res.LastInsertId()
-		if _, err := tx.Exec(`INSERT INTO fts(rowid, text) VALUES(?,?)`, paraID, p.Text); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fts(rowid, text) VALUES(?,?)`, paraID, p.Text); err != nil {
 			return false, err
 		}
 		title := p.Heading
@@ -184,7 +199,7 @@ func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash str
 		if err != nil {
 			return false, err
 		}
-		if _, err := tx.Exec(`INSERT INTO vec(rowid, embedding) VALUES(?,?)`, paraID, blob); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO vec(rowid, embedding) VALUES(?,?)`, paraID, blob); err != nil {
 			return false, err
 		}
 	}
@@ -195,11 +210,17 @@ func (s *Store) UpsertDocWithHash(relPath, content string, mtime int64, hash str
 			continue
 		}
 		seenTags[tag] = true
-		if _, err := tx.Exec(`INSERT INTO doc_tags(doc_id, tag) VALUES(?,?)`, docID, tag); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO doc_tags(doc_id, tag) VALUES(?,?)`, docID, tag); err != nil {
 			return false, err
 		}
 	}
 
+	if beforeCommit != nil {
+		beforeCommit()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	return true, tx.Commit()
 }
 
@@ -513,6 +534,18 @@ func (s *Store) GetDoc(relPath string) (string, error) {
 		return "", ErrNotFound
 	}
 	return content, err
+}
+
+func (s *Store) ParagraphCount(relPath string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(p.id) FROM documents d
+		LEFT JOIN paragraphs p ON p.doc_id = d.id
+		WHERE d.path=? GROUP BY d.id`, relPath).Scan(&count)
+	if err == sql.ErrNoRows {
+		return 0, ErrNotFound
+	}
+	return count, err
 }
 
 func (s *Store) GetParas(relPath string, seq, context int) (string, error) {

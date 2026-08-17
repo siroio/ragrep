@@ -21,7 +21,7 @@ go build -o ragrep.exe ./cmd/ragrep    # unixは .exe 不要
 ```
 
 ビルドにはcgo（Cツールチェーン）が必要（`github.com/yalue/onnxruntime_go`がcgo必須のため）。
-Windowsは mingw-w64 か MSVC を入れて `CGO_ENABLED=1` でビルドする。
+Windowsは MinGW-w64（GCC）を入れて `CGO_ENABLED=1` でビルドする（Go 1.25以降はDWARF 5対応のbinutils 2.37以上が必要）。
 
 ## Setup
 
@@ -85,6 +85,62 @@ PDF/Office等、そのままではテキストとして読めない拡張子は 
   一切行わない（セキュリティ上、明示的な設定が必須）。
   変換コマンドの標準出力がそのまま索引本文になる。
 
+## コード検索 (ragrep code)
+
+`ragrep code` はコードシンボル（関数・メソッド・型）専用の索引・検索で、文書用の
+`index.db` とは別の `code.db` を使う（`--db PATH` か `.ragrep/config.json` の
+`code_db`、デフォルト `.ragrep/code.db`）。検索はハイブリッド（ベクトル+全文）
+による**候補生成**のみを行い、定義・参照・呼び出し元/先などの関係は言語サーバー
+（LSP）が実際に問い合わせて検証する。検索・pack結果は候補であり、LSP・ビルド・
+テストによる検証を経ていない前提で扱うこと。
+
+```
+# .ragrep/config.json に言語ごとの言語サーバーを登録（未登録の言語はエラー）
+{"servers": {"go": "gopls"}}
+
+ragrep code index --language go .                       # シンボルを索引（再帰、edit後は再実行）
+ragrep code search --json -k 5 "parse config"           # 候補検索（本文なし）
+ragrep code get --symbol <key> --body                   # 1シンボルの本文取得
+ragrep code expand --symbol <key> --relation references # LSPで参照関係を検証
+ragrep code pack --query "..." --select <key> --json    # 候補+本文+manifestを一括生成
+ragrep code verify --manifest pack.json --json          # manifestの陳腐化・再解決を確認
+```
+
+- 言語サーバーは `.ragrep/config.json` の `servers` に明示登録した実行コマンドのみ
+  起動される。未登録の言語や存在しないコマンドはエラーになり、自動ダウンロード・
+  インストールは一切行わない（セキュリティ上、明示的な設定が必須）。
+
+## MCP server
+
+ローカルstdio MCPに対応したクライアントでは、次のように設定する。クライアントごとに
+設定名は異なるが、command・args・cwdの意味は同じである。
+
+```json
+{
+  "mcpServers": {
+    "ragrep": {
+      "command": "ragrep",
+      "args": ["mcp", "serve"],
+      "cwd": "/absolute/path/to/workspace"
+    }
+  }
+}
+```
+
+`cwd` が既定のワークスペースになり、各toolの `root` は別ワークスペースを明示するとき
+だけ使う。事前に `ragrep init` と文書・コードの索引を済ませ、共有daemonを起動しておく。
+MCP server自身はポートを開かず、次の9 toolだけをstdioで公開する。
+
+1. `search_documents` → `read_document` で必要な文書だけ読む
+2. 明示的に作成を頼まれた場合だけ `add_document` を使う
+3. 文書を外部編集した後は `reindex_documents` → 再検索する
+4. `search_code` → `read_code_symbol` → 必要なら `inspect_code_relation` と進む
+5. `build_code_context` の結果は、利用直前に `verify_code_context` で検証する
+
+`add_document` は新規作成専用で上書きしない。`reindex_documents` は指定パスを再索引する
+だけで削除済み文書をpruneしない。コード索引の更新はMCPから行わず、従来どおり
+`ragrep code index` を使う。
+
 ## 精度評価 (ragrep eval)
 
 `ragrep eval` はJSONL形式のクエリ→正解ドキュメントのペアを実行し、recall@kを測定する。
@@ -123,11 +179,12 @@ ragrepを使うための手順書。
 | エージェント | コマンド |
 |---|---|
 | Claude Code | `/plugin marketplace add siroio/ragrep` → `/plugin install ragrep@ragrep` |
+| Codex | `codex plugin marketplace add siroio/ragrep` → `codex plugin add ragrep@ragrep` |
 | Gemini CLI | `gemini extensions install https://github.com/siroio/ragrep` |
 | GitHub Copilot CLI | `copilot plugin marketplace add siroio/ragrep` → `copilot plugin install ragrep@ragrep` |
 | Kimi Code | `/plugins install https://github.com/siroio/ragrep` |
 | Factory Droid | `droid plugin marketplace add https://github.com/siroio/ragrep` → `droid plugin install ragrep@ragrep` |
-| Codex / Cursor / その他 | `npx skills add siroio/ragrep`（[skills.sh](https://skills.sh)、対話的に選択） |
+| Cursor / その他 | `npx skills add siroio/ragrep`（[skills.sh](https://skills.sh)、対話的に選択） |
 
 基本ワークフロー（Adaptive Context Expansion）:
 

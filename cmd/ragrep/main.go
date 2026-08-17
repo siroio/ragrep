@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/siroio/ragrep/internal/config"
 	"github.com/siroio/ragrep/internal/embed"
 	"github.com/siroio/ragrep/internal/store"
@@ -28,6 +30,10 @@ Usage:
   ragrep get <path> [--para N] [--context N] [--lines A-B]
   ragrep add [--tag t]... <path>            (reads content from stdin)
   ragrep eval <cases.jsonl>  measure recall@k against a JSONL eval set
+  ragrep code index|search|get|expand|pack|verify ...  code symbol indexing/search (see 'ragrep code -h')
+  ragrep mcp serve                         serve nine MCP tools over stdio
+  ragrep daemon start|stop|status|serve
+  ragrep workspace add|remove|list [path]
 
 Flags common to all commands:
   --db PATH    index database (default $RAGREP_DB, else .ragrep/config.json db, else .ragrep/index.db)
@@ -77,10 +83,45 @@ func run(args []string) int {
 		return cmdAdd(rest)
 	case "eval":
 		return cmdEval(rest)
+	case "code":
+		return cmdCode(rest)
+	case "mcp":
+		return cmdMCP(rest)
+	case "daemon":
+		return cmdDaemon(rest)
+	case "workspace":
+		return cmdWorkspace(rest)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		return 1
 	}
+}
+
+const mcpUsage = `Usage:
+  ragrep mcp serve
+`
+
+func cmdMCP(args []string) int {
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
+		fmt.Fprint(os.Stderr, mcpUsage)
+		return 0
+	}
+	if len(args) != 1 || args[0] != "serve" {
+		fmt.Fprint(os.Stderr, mcpUsage)
+		return 1
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fail(err)
+	}
+	err = serveMCP(context.Background(), cwd, &mcp.StdioTransport{}, mcpBackends{
+		Documents: productionMCPBackend{}, Mutations: productionMCPBackend{},
+		Code: productionMCPBackend{}, Context: productionMCPBackend{},
+	})
+	if err != nil {
+		return fail(err)
+	}
+	return 0
 }
 
 func dbFlag(fs *flag.FlagSet) *string {
@@ -147,6 +188,18 @@ func parseArgs(fs *flag.FlagSet, args []string) (code int, handled bool) {
 	}
 	if err == flag.ErrHelp {
 		fmt.Fprint(os.Stderr, usage)
+		return 0, true
+	}
+	return fail(err), true
+}
+
+func parseArgsUsage(fs *flag.FlagSet, args []string, usageText string) (code int, handled bool) {
+	err := fs.Parse(normalizeInterspersedArgs(fs, args))
+	if err == nil {
+		return 0, false
+	}
+	if err == flag.ErrHelp {
+		fmt.Fprint(os.Stderr, usageText)
 		return 0, true
 	}
 	return fail(err), true
@@ -355,168 +408,27 @@ func cmdIndex(args []string) int {
 	if fset.NArg() == 0 {
 		return fail(fmt.Errorf("usage: ragrep index <path>..."))
 	}
-	wsRoot, err := workspaceRoot(*db)
-	if err != nil {
-		return fail(err)
-	}
-	// Validate every root arg is inside the workspace UP FRONT, before
-	// opening the store or loading the (slow) embedding model. Deferring this
-	// to normPath inside the walk only fires it when the walk reaches an
-	// indexable file -- an outside-root arg that's empty or binary-only would
-	// walk to "0 indexed" and exit 0, and a mix of good/bad args would
-	// partially index before failing on the bad one.
-	normRoots := make([]string, fset.NArg())
-	for i, r := range fset.Args() {
-		nr, err := normPath(r, wsRoot)
-		if err != nil {
-			return fail(err)
-		}
-		normRoots[i] = nr
-	}
-	s, err := openStoreAt(*db)
-	if err != nil {
-		return fail(err)
-	}
-	defer s.Close()
-	dir, err := embed.CacheDir()
-	if err != nil {
-		return fail(err)
-	}
-	e, err := embed.New(dir)
-	if err != nil {
-		return fail(err)
-	}
-	defer e.Close()
-
-	cfg, err := config.Load(wsRoot)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: loading config: %v\n", err)
-		cfg = config.Config{}
-	}
-
-	indexed, skipped, excluded := 0, 0, 0
-	for _, root := range fset.Args() {
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
+	result, err := runDocumentIndex(context.Background(), documentIndexRequest{
+		DB: *db, Paths: fset.Args(), Prune: *prune, IncludeCode: *includeCode,
+	})
+	for _, event := range result.events {
+		if event.stderr {
+			if event.raw {
+				fmt.Fprint(os.Stderr, event.text)
+			} else {
+				fmt.Fprintln(os.Stderr, event.text)
 			}
-			name := d.Name()
-			if d.IsDir() {
-				if strings.HasPrefix(name, ".") && path != root {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if !*includeCode && codeExtensions[strings.ToLower(filepath.Ext(name))] {
-				excluded++
-				return nil
-			}
-			if argv := cfg.ConverterFor(strings.ToLower(filepath.Ext(name))); argv != nil {
-				raw, err := os.ReadFile(path)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "warning: reading %s: %v\n", path, err)
-					skipped++
-					return nil
-				}
-				rel, err := normPath(path, wsRoot)
-				if err != nil {
-					return err
-				}
-				srcHash := store.HashContent(string(raw))
-				if old, _ := s.DocHash(rel); old == srcHash {
-					// unchanged source: skip without running the converter,
-					// but refresh the stored mtime so a touched-but-unchanged
-					// file doesn't stay flagged stale forever.
-					if info, err := d.Info(); err == nil {
-						if err := s.TouchDoc(rel, info.ModTime().Unix()); err != nil {
-							return err
-						}
-					}
-					return nil
-				}
-				text, err := runConverter(argv, path)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "warning: convert %s: %v\n", path, err)
-					skipped++
-					return nil // one bad file must not kill the whole index run
-				}
-				info, err := d.Info()
-				if err != nil {
-					return err
-				}
-				// upsert with the SOURCE hash so unchanged files skip conversion next run
-				changed, err := s.UpsertDocWithHash(rel, text, info.ModTime().Unix(), srcHash, e.Embed)
-				if err != nil {
-					return fmt.Errorf("%s: %w", rel, err)
-				}
-				if changed {
-					fmt.Println("indexed", rel)
-					indexed++
-				}
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil || info.Size() > maxFileSize || !isTextFile(path) {
-				skipped++
-				return nil
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			rel, err := normPath(path, wsRoot)
-			if err != nil {
-				return err
-			}
-			changed, err := s.UpsertDoc(rel, string(data), info.ModTime().Unix(), e.Embed)
-			if err != nil {
-				return fmt.Errorf("%s: %w", rel, err)
-			}
-			if changed {
-				fmt.Println("indexed", rel)
-				indexed++
-			}
-			return nil
-		})
-		if err != nil {
-			return fail(err)
+		} else {
+			fmt.Fprintln(os.Stdout, event.text)
 		}
 	}
-	pruned := 0
+	if err != nil {
+		return fail(err)
+	}
 	if *prune {
-		roots := normRoots
-		paths, err := s.ListPaths()
-		if err != nil {
-			return fail(err)
-		}
-		for _, p := range paths {
-			underRoot := false
-			for _, root := range roots {
-				if root == "." || p == root || strings.HasPrefix(p, root+"/") {
-					underRoot = true
-					break
-				}
-			}
-			if !underRoot {
-				continue
-			}
-			_, statErr := os.Stat(filepath.Join(wsRoot, filepath.FromSlash(p)))
-			doPrune, err := pruneDecision(statErr)
-			if err != nil {
-				return fail(err)
-			}
-			if !doPrune {
-				continue
-			}
-			if err := s.DeleteDoc(p); err != nil {
-				return fail(err)
-			}
-			fmt.Println("pruned", p)
-			pruned++
-		}
-		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code), %d pruned\n", indexed, skipped, excluded, pruned)
+		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code), %d pruned\n", result.Indexed, result.Skipped, result.Excluded, len(result.prunedPaths))
 	} else {
-		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code)\n", indexed, skipped, excluded)
+		fmt.Printf("done: %d indexed, %d skipped, %d excluded (code)\n", result.Indexed, result.Skipped, result.Excluded)
 	}
 	return 0
 }
@@ -548,7 +460,16 @@ func cmdSearch(args []string) int {
 	if fs.NArg() != 1 {
 		return fail(fmt.Errorf("usage: ragrep search <query>"))
 	}
+	if *mode != "text" && *mode != "vector" && *mode != "hybrid" {
+		return fail(fmt.Errorf("unknown mode %q", *mode))
+	}
+	if *k <= 0 {
+		return fail(fmt.Errorf("k must be positive"))
+	}
 	query := fs.Arg(0)
+	if strings.TrimSpace(query) == "" {
+		return fail(fmt.Errorf("query must not be empty"))
+	}
 	if *expandTop < 0 || *expandBudget < 0 {
 		return fail(fmt.Errorf("expand-top and expand-budget must be non-negative"))
 	}
@@ -558,14 +479,15 @@ func cmdSearch(args []string) int {
 	if *expandTop > 0 && !*asJSON {
 		return fail(fmt.Errorf("expanded hit bodies require --json"))
 	}
-
-	s, err := openStoreAt(*db)
+	dbPath, err := filepath.Abs(*db)
 	if err != nil {
 		return fail(err)
 	}
-	defer s.Close()
-
-	hits, err := runSearch(s, *mode, query, *k, []string(tags))
+	client, err := documentDaemonClientFactory()
+	if err != nil {
+		return fail(err)
+	}
+	hits, err := client.SearchDocuments(context.Background(), documentSearchRequest{DB: dbPath, Query: query, Mode: *mode, K: *k, Tags: []string(tags)})
 	if err != nil {
 		return fail(err)
 	}
@@ -573,15 +495,23 @@ func cmdSearch(args []string) int {
 		fmt.Fprintln(os.Stderr, "no hits")
 		return 2
 	}
-	if wsRoot, werr := workspaceRoot(*db); werr == nil {
+	if wsRoot, werr := workspaceRoot(dbPath); werr == nil {
 		if n := markStale(hits, wsRoot); n > 0 {
 			fmt.Fprintf(os.Stderr, "warning: %d hit(s) reference files modified since indexing; run 'ragrep index' to refresh\n", n)
 		}
 	}
 	if *expandTop > 0 {
-		hits, err = s.ExpandHitBodies(hits, *expandTop, *expandBudget)
+		s, err := openStoreAt(dbPath)
 		if err != nil {
 			return fail(err)
+		}
+		hits, err = s.ExpandHitBodies(hits, *expandTop, *expandBudget)
+		closeErr := s.Close()
+		if err != nil {
+			return fail(err)
+		}
+		if closeErr != nil {
+			return fail(closeErr)
 		}
 	}
 	if *asJSON {
@@ -602,6 +532,29 @@ func cmdSearch(args []string) int {
 	return 0
 }
 
+type documentEmbedFunc func(context.Context, string) ([]float32, error)
+
+func runDocumentSearch(ctx context.Context, s *store.Store, mode, query string, k int, tags []string, embed documentEmbedFunc) ([]store.Hit, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch mode {
+	case "text":
+		return s.SearchText(query, k, tags)
+	case "vector", "hybrid":
+		vector, err := embed(ctx, "task: search result | query: "+query)
+		if err != nil {
+			return nil, err
+		}
+		if mode == "vector" {
+			return s.SearchVector(vector, k, tags)
+		}
+		return s.SearchHybrid(query, vector, k, tags)
+	default:
+		return nil, fmt.Errorf("unknown mode %q", mode)
+	}
+}
+
 // runSearch builds hits for query using mode, the same way cmdSearch does --
 // shared with cmdEval so both run the identical text/vector/hybrid calls.
 // vector/hybrid modes construct a fresh embedder per call, same as cmdSearch
@@ -611,7 +564,7 @@ func cmdSearch(args []string) int {
 func runSearch(s *store.Store, mode, query string, k int, tags []string) ([]store.Hit, error) {
 	switch mode {
 	case "text":
-		return s.SearchText(query, k, tags)
+		return runDocumentSearch(context.Background(), s, mode, query, k, tags, nil)
 	case "vector", "hybrid":
 		dir, err := embed.CacheDir()
 		if err != nil {
@@ -622,16 +575,11 @@ func runSearch(s *store.Store, mode, query string, k int, tags []string) ([]stor
 			return nil, err
 		}
 		defer e.Close()
-		qv, err := e.Embed("task: search result | query: " + query)
-		if err != nil {
-			return nil, err
-		}
-		if mode == "vector" {
-			return s.SearchVector(qv, k, tags)
-		}
-		return s.SearchHybrid(query, qv, k, tags)
+		return runDocumentSearch(context.Background(), s, mode, query, k, tags, func(_ context.Context, query string) ([]float32, error) {
+			return e.Embed(query)
+		})
 	default:
-		return nil, fmt.Errorf("unknown mode %q", mode)
+		return runDocumentSearch(context.Background(), s, mode, query, k, tags, nil)
 	}
 }
 
@@ -792,6 +740,9 @@ func cmdAdd(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	if _, _, err = resolveDocumentWritePath(wsRoot, key); err != nil {
+		return fail(err)
+	}
 
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -801,37 +752,12 @@ func cmdAdd(args []string) int {
 		return fail(fmt.Errorf("no content on stdin"))
 	}
 
-	content := withFrontmatter(string(data), []string(tags))
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fail(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return fail(err)
-	}
-
-	info, err := os.Stat(path)
+	result, err := runAddDocument(context.Background(), addDocumentRequest{
+		DB: *db, Root: wsRoot, Path: key, Content: string(data), Tags: []string(tags),
+	}, addDocumentDeps{})
 	if err != nil {
 		return fail(err)
 	}
-
-	s, err := openStoreAt(*db)
-	if err != nil {
-		return fail(err)
-	}
-	defer s.Close()
-	dir, err := embed.CacheDir()
-	if err != nil {
-		return fail(err)
-	}
-	e, err := embed.New(dir)
-	if err != nil {
-		return fail(err)
-	}
-	defer e.Close()
-
-	if _, err := s.UpsertDoc(key, content, info.ModTime().Unix(), e.Embed); err != nil {
-		return fail(err)
-	}
-	fmt.Println("indexed", key)
+	fmt.Println("indexed", result.Path)
 	return 0
 }
