@@ -456,11 +456,10 @@ func cmdCodeSearch(args []string) int {
 	default:
 		return fail(fmt.Errorf("usage: ragrep code search [--json] [--mode auto|text|hybrid] [-k N] <query>"))
 	}
-	query := fs.Arg(0)
-	limit := *k
-	if limit <= 0 || limit > 5 {
-		limit = 5
+	if *k <= 0 {
+		return fail(fmt.Errorf("k must be positive"))
 	}
+	query := fs.Arg(0)
 
 	root, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
@@ -470,7 +469,7 @@ func cmdCodeSearch(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	resp, err := client.Search(context.Background(), searchRequest{Root: root, DB: dbPath, Query: query, Mode: *mode, K: limit})
+	resp, err := client.Search(context.Background(), searchRequest{Root: root, DB: dbPath, Query: query, Mode: *mode, K: *k})
 	if err != nil {
 		return codeDaemonError(err)
 	}
@@ -1053,6 +1052,9 @@ func cmdCodePack(args []string) int {
 	if len(selected) > 3 {
 		return fail(fmt.Errorf("--select accepts at most 3 keys, got %d", len(selected)))
 	}
+	if *k <= 0 {
+		return fail(fmt.Errorf("k must be positive"))
+	}
 
 	root, dbPath, err := codeRequestPaths(*db)
 	if err != nil {
@@ -1061,9 +1063,6 @@ func cmdCodePack(args []string) int {
 	client, err := codeDaemonClientFactory()
 	if err != nil {
 		return fail(err)
-	}
-	if *k <= 0 || *k > 5 {
-		*k = 5
 	}
 	out, err := client.Pack(context.Background(), packRequest{
 		Root: root, DB: dbPath, Query: *query, K: *k, Budget: *budget, SelectedKeys: []string(selected),

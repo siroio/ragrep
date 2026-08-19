@@ -1,119 +1,115 @@
 # ragrep
 
-固定チャンクに依存しないRAG検索・取得CLI。テキストファイルを段落単位でインデックスし、
-ハイブリッド検索（ベクトル + 全文）と Adaptive Context Expansion による取得を提供する。
+固定チャンクに依存せず、テキストを段落単位で索引・検索する RAG 検索 CLI です。文書検索とコードシンボル検索を分け、必要な根拠だけを取得・検証する用途を想定しています。
 
-- 埋め込みモデル: embeddinggemma-300m（quantized ONNX, 768次元）
-- インデックス: SQLite（デフォルトはcwdから親方向に最も近い `.ragrep/index.db` を自動発見。
-  `--db PATH` か環境変数 `RAGREP_DB` で明示指定でき、ワークスペース切り替えに使える。
-  優先順位: `--db` > `RAGREP_DB` > 祖先の `.ragrep/index.db` > cwd の `.ragrep/index.db`）
-  ワークスペースルートはDBパスから決まる（親ディレクトリ名が `.ragrep` ならその親、
-  それ以外はDBファイル自身のあるディレクトリ）ため、`RAGREP_DB` /`--db` で切り替え先の
-  ワークスペース自身の `.ragrep/index.db` を指す分には問題ないが、ワークスペース外の
-  共有場所を指すDBパスを使うと索引対象がルート外と判定され失敗する。
-- 対応プラットフォーム: windows/amd64, windows/arm64, linux/amd64, darwin/arm64
+## Quick Start
 
-## Install / Build
+```powershell
+git clone https://github.com/siroio/ragrep
+cd ragrep
+go -C src build -o ../ragrep.exe ./cmd/ragrep # Unix では .exe を省略
 
-```
-git clone https://github.com/siroio/ragrep && cd ragrep
-go build -o ragrep.exe ./cmd/ragrep    # unixは .exe 不要
+ragrep init                         # DB 作成とモデル・ランタイムの取得（初回のみ）
+ragrep index docs/                  # テキスト文書を再帰的に索引
+ragrep search --json "認証エラー"     # 段落単位で検索
+ragrep get --para 4 --context 2 docs/auth.md
 ```
 
-ビルドにはcgo（Cツールチェーン）が必要（`github.com/yalue/onnxruntime_go`がcgo必須のため）。
-Windowsは MinGW-w64（GCC）を入れて `CGO_ENABLED=1` でビルドする（Go 1.25以降はDWARF 5対応のbinutils 2.37以上が必要）。
+ビルドには cgo と C ツールチェーンが必要です。初回に取得するアセットはユーザーキャッシュに保存されます（Windows: `%LocalAppData%\ragrep`、Linux: `~/.cache/ragrep`、macOS: `~/Library/Caches/ragrep`）。中断した場合も `ragrep init` を再実行すれば不足分だけを取得します。
 
-## Setup
+## 主な機能
 
-```
-ragrep init    # DB作成 + モデル・ランタイムをDL（初回のみ、~310MB）
-```
+- 文書を段落単位で索引し、`hybrid`（ベクトル + 全文）、`vector`、`text` 検索を提供
+- 検索結果から必要な段落・行範囲・文書全体を取得
+- frontmatter のタグ、削除済み文書の prune、明示設定した PDF/Office 変換コマンドに対応
+- 文書 DB とは別の `code.db` でコードシンボルを検索し、LSP で関係を確認
+- ローカル stdio MCP から、文書・コード検索の 9 tools を提供
 
-アセットはリポジトリではなくユーザーキャッシュに入る
-（Windows: `%LocalAppData%\ragrep` / Linux: `~/.cache/ragrep` / macOS: `~/Library/Caches/ragrep`）。
-ダウンロードはファイル単位でアトミックなので、中断しても `ragrep init` を再実行すれば
-足りないファイルだけ再取得される。リポジトリ側では `.ragrep/` を `.gitignore` に追加しておくこと。
+## ワークスペースと DB
 
-## Usage
+文書 DB の解決優先順位は、明示した `--db` > `RAGREP_DB` > cwd から親方向へ最初に見つかった `.ragrep` 内の `config.json` の `db`（未設定なら同じルートの `.ragrep/index.db`）> cwd の `.ragrep/index.db` です。文書キーはワークスペースルートからの相対スラッシュパスで保存されるため、サブディレクトリから実行しても同じ索引を利用できます。
 
-```
-ragrep index docs/                            # テキストファイルをインデックス（再帰）
-ragrep index --prune docs/                    # 削除済みファイルもインデックスから除去
-ragrep search --json "認証エラー"              # ハイブリッド検索（段落単位でヒット）
-ragrep search --mode text -k 5 "ERR_AUTH"     # 全文検索のみ（モデル不要で速い）
-ragrep search --tag design "認証エラー"        # tagで絞り込み（複数指定でAND、全モード対応）
-echo "本文" | ragrep add --tag design --tag api notes/foo.md  # 新規文書をstdinから追加＋即索引
-ragrep get docs/auth.md                       # Document全体
-ragrep get --para 4 --context 2 docs/auth.md  # 段落4±2（Adaptive Expansion）
-ragrep get --lines 12-18 docs/auth.md         # 行範囲
-```
+文書用の `index.db` とコード用の `code.db` は分離されます。旧形式の絶対パスキーを持つ DB は自動移行されないため、DB を削除して再索引してください。SQLite DB は内容マージに向かないため、ブランチ間で競合した場合は一方を採用して再生成します。
 
-- フラグは位置引数より前に置く。`-k N` で件数指定（デフォルト10）。
-- `search --json` は `{doc, para, lines, score, snippet}` のJSON配列を出力。
-- 終了コード: 0=成功 / 1=エラー / 2=ヒットなし・get未検出（2はエラーではない）。
-- インデックスはドットディレクトリ・10MB超・バイナリファイルを自動スキップする。
-- ドキュメントキーはワークスペース（`.ragrep/` を含むディレクトリ、ルート自身は `.`）
-  からの相対スラッシュパスに正規化されるため、相対・`./x`・絶対のどの形で渡しても
-  同じキーに解決され、サブディレクトリからの実行でも動く。ワークスペースごと
-  移動・リネーム・コピーしてもインデックスは有効なまま使え、cwdの最寄り
-  `.ragrep` に自動で切り替わる。ワークスペースルート外のパスは索引・追加できない
-  （エラー、終了コード1）。
-  **破壊的変更**: 旧形式（絶対パスキー）でインデックスしたDBは明示エラーで拒否
-  される。`.ragrep/`（またはindex db）を削除して `ragrep index` を再実行すること
-  （自動移行は行われない）。
-- frontmatterに `---` / `tags: [a, b]`（またはブロックリスト） / `---` を書くとタグが付き、
-  小文字化されて索引される。`ragrep add` は `--tag` 指定時、frontmatterが無い本文にのみ
-  このブロックを自動付与する（既存ファイルへの上書きは拒否、更新はファイル編集＋
-  `ragrep index <path>` の再実行で行う）。
+## 文書の索引・検索・取得
 
-## ドキュメント変換 (converters)
-
-PDF/Office等、そのままではテキストとして読めない拡張子は `.ragrep/config.json` の
-`converters` に登録したコマンドの標準出力を索引本文として使う。
-
-```
-# .ragrep/config.json に拡張子ごとの変換コマンドを登録（{input} は元ファイルパスに置換）
-{"converters": {
-  ".pdf": ["pdftotext", "{input}", "-"],
-  ".docx": ["pandoc", "{input}", "-t", "plain"],
-  ".pptx": ["markitdown", "{input}"]
-}}
+```powershell
+ragrep index docs/
+ragrep index --prune docs/                       # 削除済み文書も除去
+ragrep index --include-code docs/                # 通常除外するソース拡張子も文書として索引
+ragrep search --mode text -k 5 "ERR_AUTH"
+ragrep search --tag design --tag api "認証"       # 複数タグは AND
+ragrep search --json --expand-top 2 --expand-budget 4000 "認証エラー"
+ragrep get docs/auth.md
+ragrep get --para 4 --context 2 docs/auth.md
+ragrep get --lines 12-18 docs/auth.md
 ```
 
-- `converters` に明示登録した拡張子・コマンドのみ実行される（未登録の拡張子は
-  通常のバイナリ/テキスト判定にフォールバック）。自動ダウンロード・インストールは
-  一切行わない（セキュリティ上、明示的な設定が必須）。
-  変換コマンドの標準出力がそのまま索引本文になる。
+`search --json` の基本フィールドは `doc`、`para`、`lines`、`score`、`snippet` です。必要に応じて `heading` と `stale` も出力します。`--expand-top` と `--expand-budget` は両方を正数で指定し、`--json` と組み合わせてください。選択された上位ヒットには `body` が追加され、必要に応じて `body_truncated` が付きます。
 
-## コード検索 (ragrep code)
+`ragrep search` は共有 daemon を必要に応じて透過的に起動します。状態確認や明示的な操作には次を使います。
 
-`ragrep code` はコードシンボル（関数・メソッド・型）専用の索引・検索で、文書用の
-`index.db` とは別の `code.db` を使う（`--db PATH` か `.ragrep/config.json` の
-`code_db`、デフォルト `.ragrep/code.db`）。検索はハイブリッド（ベクトル+全文）
-による**候補生成**のみを行い、定義・参照・呼び出し元/先などの関係は言語サーバー
-（LSP）が実際に問い合わせて検証する。検索・pack結果は候補であり、LSP・ビルド・
-テストによる検証を経ていない前提で扱うこと。
-
+```powershell
+ragrep daemon start
+ragrep daemon status
+ragrep daemon stop
 ```
-# .ragrep/config.json に言語ごとの言語サーバーを登録（未登録の言語はエラー）
+
+1 つの daemon は複数ワークスペースを扱えます。ワークスペースごとに document/code DB の状態は分離されます。明示的に管理する場合は daemon を起動してから使用します。
+
+```powershell
+ragrep workspace add
+ragrep workspace add D:\Works\other-project
+ragrep workspace list
+ragrep workspace remove D:\Works\other-project
+```
+
+終了コードは `0` が成功、`1` がエラー、`2` が非エラーの否定結果（ヒットなし、未検出、ワークスペース一覧が空、検証未通過）です。インデックスはドットディレクトリ、10 MB 超、バイナリファイルをスキップします。位置引数の前後どちらにフラグを書いても受け付けます。
+
+### 追加とタグ
+
+```powershell
+echo "本文" | ragrep add --tag design --tag api notes/foo.md
+ragrep search --tag design "query"
+```
+
+`ragrep add` は stdin の本文から新規文書を作成して即時索引します。既存ファイルは上書きしません。既存文書は編集後に `ragrep index <path>` を実行してください。`---` で囲んだ YAML frontmatter の `tags: [design, api]` またはブロックリストも索引できます。タグは小文字化され、繰り返した `--tag` は AND 条件です。
+
+### 文書変換
+
+PDF/Office などは `.ragrep/config.json` の `converters` に明示登録したコマンドの標準出力を索引します。未登録の変換コマンドを自動で取得・実行することはありません。
+
+```json
+{
+  "converters": {
+    ".pdf": ["pdftotext", "{input}", "-"],
+    ".docx": ["pandoc", "{input}", "-t", "plain"]
+  }
+}
+```
+
+## コード検索
+
+コード検索は文書検索とは別の `code.db` を使います。コード DB の解決優先順位は `--db` > `.ragrep/config.json` の `code_db` > `.ragrep/code.db` です。現在 `code index` が対応する言語は Go のみです。使用する言語サーバーは `.ragrep/config.json` の `servers` に明示設定してください。未設定のサーバーは起動・自動インストールされず、他の言語のサーバーを設定するだけでは `code index` の対応言語になりません。
+
+```json
 {"servers": {"go": "gopls"}}
-
-ragrep code index --language go .                       # シンボルを索引（再帰、edit後は再実行）
-ragrep code search --json -k 5 "parse config"           # 候補検索（本文なし）
-ragrep code get --symbol <key> --body                   # 1シンボルの本文取得
-ragrep code expand --symbol <key> --relation references # LSPで参照関係を検証
-ragrep code pack --query "..." --select <key> --json    # 候補+本文+manifestを一括生成
-ragrep code verify --manifest pack.json --json          # manifestの陳腐化・再解決を確認
 ```
 
-- 言語サーバーは `.ragrep/config.json` の `servers` に明示登録した実行コマンドのみ
-  起動される。未登録の言語や存在しないコマンドはエラーになり、自動ダウンロード・
-  インストールは一切行わない（セキュリティ上、明示的な設定が必須）。
+```powershell
+ragrep code index --language go .
+ragrep code search --mode auto --json -k 5 "parse config"
+ragrep code get --symbol <key> --body
+ragrep code expand --symbol <key> --relation references
+ragrep code pack --query "parse config" --select <key> --json
+ragrep code verify --manifest pack.json --json
+```
+
+`--mode` は `auto`、`text`、`hybrid` を選べます。検索結果は候補です。候補を検索し、必要な本文を `code get --body` で読み、`code expand` で LSP の relation（`definition`、`references`、`callers`、`callees`、`tests`）を確認してから pack を組み立て、利用直前に `code verify` で検証してください。`-k` は正数なら任意に指定でき、省略時は各コマンドの既定値を使います。
 
 ## MCP server
 
-ローカルstdio MCPに対応したクライアントでは、次のように設定する。クライアントごとに
-設定名は異なるが、command・args・cwdの意味は同じである。
+stdio MCP クライアントには次のように設定します。`cwd` を既定ワークスペースとし、`root` は別ワークスペースを明示するときだけ使います。
 
 ```json
 {
@@ -127,54 +123,39 @@ ragrep code verify --manifest pack.json --json          # manifestの陳腐化�
 }
 ```
 
-`cwd` が既定のワークスペースになり、各toolの `root` は別ワークスペースを明示するとき
-だけ使う。事前に `ragrep init` と文書・コードの索引を済ませ、共有daemonを起動しておく。
-MCP server自身はポートを開かず、次の9 toolだけをstdioで公開する。
+`ragrep mcp serve` はポートを開かず、次の 9 tools を公開します。
 
-1. `search_documents` → `read_document` で必要な文書だけ読む
-2. 明示的に作成を頼まれた場合だけ `add_document` を使う
-3. 文書を外部編集した後は `reindex_documents` → 再検索する
-4. `search_code` → `read_code_symbol` → 必要なら `inspect_code_relation` と進む
-5. `build_code_context` の結果は、利用直前に `verify_code_context` で検証する
+- 文書: `search_documents`、`read_document`、`add_document`、`reindex_documents`
+- コード: `search_code`、`read_code_symbol`、`inspect_code_relation`、`build_code_context`、`verify_code_context`
 
-`add_document` は新規作成専用で上書きしない。`reindex_documents` は指定パスを再索引する
-だけで削除済み文書をpruneしない。コード索引の更新はMCPから行わず、従来どおり
-`ragrep code index` を使う。
+`add_document` は新規作成専用で既存文書を上書きしません。`reindex_documents` は指定パスを再索引します。コード索引の更新は `ragrep code index` を使います。
 
-## 精度評価 (ragrep eval)
+## 評価
 
-`ragrep eval` はJSONL形式のクエリ→正解ドキュメントのペアを実行し、recall@kを測定する。
-検索設定（`--mode`・埋め込みモデル・チャンク分割など）を変更したときの精度比較に使う。
+`ragrep eval` は JSONL のクエリと正解ドキュメントの組から recall@k を測定します。
 
+```json
+{"query":"認証エラーの対処法","doc":"docs/auth.md","para":2}
 ```
-# cases.jsonl: 1行1ケース。"doc"は正解ドキュメントのキー、"para"は省略可
-# （省略時はドキュメント単位で正解、0を含む数値を指定すると段落単位で厳密一致）
-{"query": "認証エラーの対処法", "doc": "docs/auth.md", "para": 2}
 
+```powershell
 ragrep eval cases.jsonl --mode hybrid -k 10
 ```
 
-- 出力はミスしたケースを1行ずつ表示した後、`recall@10: 0.667 (2/3)` のようなサマリを出す。
-- 終了コード: 0=ファイルが読めた（recallの値に関わらず）/ 1=ファイルが読めない・壊れている・
-  ケースが0件。
-- 20〜50件程度の厳選したクエリ→ドキュメントのペアがあれば設定の比較に十分。
+`para` を省略すると文書単位、数値を指定すると段落単位で評価します。出力はミスしたケースと `recall@10: 0.667 (2/3)` 形式の要約です。
 
 ## Agent Skills
 
-`skills/` に [Agent Skills](https://agentskills.io) 形式のスキルを同梱。
-エージェント（Claude Code / Codex / Copilot CLI / Gemini CLI等）がRetrieval Plannerとして
-ragrepを使うための手順書。
+`skills/` には [Agent Skills](https://agentskills.io) 形式の手順書を同梱しています。
 
 | スキル | 内容 |
 |---|---|
-| `skills/search/` | 検索→取得→コンテキスト拡張のワークフロー |
-| `skills/setup/` | ビルド・init・インデックス運用・トラブルシュート |
-| `skills/add-docs/` | `ragrep add`によるtag付き新規文書の追加 |
+| `skills/search/` | 文書検索、取得、段階的なコンテキスト拡張 |
+| `skills/code-search/` | コード候補検索、LSP 関係確認、pack 検証 |
+| `skills/setup/` | ビルド、init、索引運用、トラブルシュート |
+| `skills/add-docs/` | `ragrep add` によるタグ付き新規文書の追加 |
 
-### インストール
-
-各エージェントのプラグイン機構で直接インストールできる
-（Claude Codeではスキル名が `ragrep:search` のように参照される）:
+各エージェントのプラグイン機構で直接インストールできます。
 
 | エージェント | コマンド |
 |---|---|
@@ -184,10 +165,4 @@ ragrepを使うための手順書。
 | GitHub Copilot CLI | `copilot plugin marketplace add siroio/ragrep` → `copilot plugin install ragrep@ragrep` |
 | Kimi Code | `/plugins install https://github.com/siroio/ragrep` |
 | Factory Droid | `droid plugin marketplace add https://github.com/siroio/ragrep` → `droid plugin install ragrep@ragrep` |
-| Cursor / その他 | `npx skills add siroio/ragrep`（[skills.sh](https://skills.sh)、対話的に選択） |
-
-基本ワークフロー（Adaptive Context Expansion）:
-
-1. `ragrep search --json "<質問のキーワード>"` で段落単位のヒットを得る
-2. ヒットの `doc`/`para` を見て必要な取得単位を判断する
-3. `ragrep get --para N` → 不足なら `--context` を増やす → それでも不足なら `ragrep get <doc>`
+| Cursor / その他 | `npx skills add siroio/ragrep`（[skills.sh](https://skills.sh) で対話的に選択） |

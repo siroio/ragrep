@@ -678,21 +678,35 @@ func TestCmdCodeSearchDaemonJSONDefaultsToAutoFive(t *testing.T) {
 	}
 }
 
-func TestCmdCodeSearchDaemonKeepsLegacyFiveResultCap(t *testing.T) {
-	for _, k := range []string{"0", "10"} {
+func TestCmdCodeSearchDaemonPassesPositiveK(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".ragrep", "code.db")
+	client := fakeCodeDaemonClient{search: func(_ context.Context, req searchRequest) (searchResponse, error) {
+		if req.K != 10 {
+			t.Fatalf("request K=%d, want 10", req.K)
+		}
+		return searchResponse{Hits: []codestore.SymbolHit{{Key: "key-1"}}, Fresh: true}, nil
+	}}
+	injectCodeDaemonClient(t, client)
+
+	code, _, stderr := captureCodeCommand(t, []string{"code", "search", "-k", "10", "--db", db, "Foo"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestCmdCodeSearchRejectsNonPositiveKBeforeClient(t *testing.T) {
+	for _, k := range []string{"0", "-1"} {
 		t.Run(k, func(t *testing.T) {
 			root := t.TempDir()
 			db := filepath.Join(root, ".ragrep", "code.db")
-			client := fakeCodeDaemonClient{search: func(_ context.Context, req searchRequest) (searchResponse, error) {
-				if req.K != 5 {
-					t.Fatalf("request K=%d, want legacy cap 5", req.K)
-				}
-				return searchResponse{Hits: []codestore.SymbolHit{{Key: "key-1"}}, Fresh: true}, nil
-			}}
-			injectCodeDaemonClient(t, client)
-			code, _, stderr := captureCodeCommand(t, []string{"code", "search", "-k", k, "--db", db, "Foo"})
-			if code != 0 || stderr != "" {
-				t.Fatalf("exit=%d stderr=%q", code, stderr)
+			calls := injectCodeDaemonClient(t, fakeCodeDaemonClient{search: func(context.Context, searchRequest) (searchResponse, error) {
+				return searchResponse{Hits: []codestore.SymbolHit{{Key: "unexpected"}}, Fresh: true}, nil
+			}})
+
+			code, stdout, stderr := captureCodeCommand(t, []string{"code", "search", "-k", k, "--db", db, "Foo"})
+			if code != 1 || *calls != 0 || stdout != "" || stderr != "error: k must be positive\n" {
+				t.Fatalf("exit=%d factory calls=%d stdout=%q stderr=%q", code, *calls, stdout, stderr)
 			}
 		})
 	}
@@ -2129,14 +2143,14 @@ func TestCmdCodePackUsesDaemonAndKeepsFormatter(t *testing.T) {
 	db := filepath.Join(root, ".ragrep", "code.db")
 	want := codePackOutput{Fresh: true, Generation: 7, Pack: coderetrieval.ContextPack{Budget: 1000}}
 	client := fakeCodeDaemonClient{pack: func(_ context.Context, req packRequest) (codePackOutput, error) {
-		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Query != "Foo" || req.K != 5 || req.Budget != 1000 || !reflect.DeepEqual(req.SelectedKeys, []string{"key"}) {
+		if req.Root != filepath.Clean(root) || req.DB != filepath.Clean(db) || req.Query != "Foo" || req.K != 10 || req.Budget != 1000 || !reflect.DeepEqual(req.SelectedKeys, []string{"key"}) {
 			t.Fatalf("request=%+v", req)
 		}
 		return want, nil
 	}}
 	injectCodeDaemonClient(t, client)
 
-	code, stdout, stderr := captureCodeCommand(t, []string{"code", "pack", "--db", db, "--query", "Foo", "--k", "99", "--select", "key", "--budget", "1000", "--json"})
+	code, stdout, stderr := captureCodeCommand(t, []string{"code", "pack", "--db", db, "--query", "Foo", "--k", "10", "--select", "key", "--budget", "1000", "--json"})
 	if code != 0 || stderr != "" {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -2146,6 +2160,23 @@ func TestCmdCodePackUsesDaemonAndKeepsFormatter(t *testing.T) {
 	}
 	if _, err := os.Stat(db); !os.IsNotExist(err) {
 		t.Fatalf("CLI must not create code.db, stat err=%v", err)
+	}
+}
+
+func TestCmdCodePackRejectsNonPositiveKBeforeClient(t *testing.T) {
+	for _, k := range []string{"0", "-1"} {
+		t.Run(k, func(t *testing.T) {
+			root := t.TempDir()
+			db := filepath.Join(root, ".ragrep", "code.db")
+			calls := injectCodeDaemonClient(t, fakeCodeDaemonClient{pack: func(context.Context, packRequest) (codePackOutput, error) {
+				return codePackOutput{}, nil
+			}})
+
+			code, stdout, stderr := captureCodeCommand(t, []string{"code", "pack", "--db", db, "--query", "Foo", "--k", k})
+			if code != 1 || *calls != 0 || stdout != "" || stderr != "error: k must be positive\n" {
+				t.Fatalf("exit=%d factory calls=%d stdout=%q stderr=%q", code, *calls, stdout, stderr)
+			}
+		})
 	}
 }
 
