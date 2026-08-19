@@ -5,7 +5,7 @@ description: Use when installing, building, initializing, or reindexing ragrep, 
 
 # Setting up ragrep
 
-First check the commands with `ragrep help`. If it is not found, run `go build -o ragrep.exe ./cmd/ragrep` in the ragrep source directory and put the resulting binary on `PATH`. Building requires Go, cgo, and a C compiler.
+First check the commands with `ragrep help`. If it is not found, run `go -C src build -o ../ragrep.exe ./cmd/ragrep` from the ragrep repository root and put the resulting binary on `PATH`. Building requires Go, cgo, and a C compiler.
 
 The first `ragrep init` downloads the model and runtime (about 310 MB) to the user cache. Use `.ragrep/index.db` as the shared DB and do not exclude it from Git management. However, hold off on initializing and indexing the shared DB until you have confirmed a version where document paths in the DB are relative to the project root.
 
