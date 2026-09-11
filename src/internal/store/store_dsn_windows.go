@@ -16,6 +16,10 @@ func storeDSN(path string) string {
 	return "file:" + (&url.URL{Path: filepath.ToSlash(stripExtendedLengthLocalDrivePrefix(path))}).EscapedPath() + "?" + query.Encode()
 }
 
+func storeReadOnlyDSN(path string) string {
+	return storeDSN(path) + "&mode=ro"
+}
+
 func stripExtendedLengthLocalDrivePrefix(path string) string {
 	const extendedPrefix = `\\?\`
 	if !strings.HasPrefix(path, extendedPrefix) {

@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,8 @@ const usage = `ragrep - adaptive retrieval unit search CLI
 
 Usage:
   ragrep init                              create DB, download model assets
+  ragrep version                           show build identity
+  ragrep doctor [--db PATH] [--json]       inspect local workspace dependencies
   ragrep index <path>... [--prune] [--include-code]   index text files (recursive)
   ragrep search <query> [--mode hybrid|vector|text] [-k 10] [--json] [--expand-top N --expand-budget N] [--tag t]...
   ragrep get <path> [--para N] [--context N] [--lines A-B]
@@ -42,7 +45,9 @@ Exit codes: 0 success, 1 error, 2 no hits / not found
 `
 
 func main() {
-	os.Exit(protect(func() int { return run(os.Args[1:]) }))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	os.Exit(protect(func() int { return runContext(ctx, os.Args[1:]) }))
 }
 
 // protect recovers a panic escaping f and converts it to exit code 1 (this
@@ -65,6 +70,10 @@ func fail(err error) int {
 }
 
 func run(args []string) int {
+	return runContext(context.Background(), args)
+}
+
+func runContext(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usage)
 		return 1
@@ -72,7 +81,11 @@ func run(args []string) int {
 	cmd, rest := args[0], args[1:]
 	switch cmd {
 	case "init":
-		return cmdInit(rest)
+		return cmdInitContext(ctx, rest)
+	case "version":
+		return cmdVersion(rest)
+	case "doctor":
+		return cmdDoctor(ctx, rest)
 	case "index":
 		return cmdIndex(rest)
 	case "search":
@@ -312,12 +325,16 @@ func openStoreAt(dbPath string) (*store.Store, error) {
 	}
 	if looksAbsKey(first) {
 		s.Close()
-		return nil, fmt.Errorf("old absolute-path key format; delete .ragrep/ (or the index db) and re-run ragrep index")
+		return nil, fmt.Errorf("old absolute-path key format; create a fresh database with --db <new-index.db>, run ragrep index against the original documents, verify it, then switch configuration")
 	}
 	return s, nil
 }
 
 func cmdInit(args []string) int {
+	return cmdInitContext(context.Background(), args)
+}
+
+func cmdInitContext(ctx context.Context, args []string) int {
 	fs := newFlagSet("init")
 	db := dbFlag(fs)
 	if code, handled := parseArgs(fs, args); handled {
@@ -327,7 +344,7 @@ func cmdInit(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	if err := embed.EnsureAssets(dir); err != nil {
+	if err := embed.EnsureAssetsContext(ctx, dir); err != nil {
 		return fail(err)
 	}
 	s, err := openStoreAt(*db)

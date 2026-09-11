@@ -127,6 +127,9 @@ func listenDaemon(address string) (net.Listener, error) {
 
 func validatedDaemonListenAddress() (string, error) {
 	address := daemonBindAddress
+	if configured := os.Getenv("RAGREP_DAEMON_ADDR"); configured != "" {
+		address = configured
+	}
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", err

@@ -1,11 +1,253 @@
 package embed
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
+
+func fixtureZip(t *testing.T, name string, body []byte) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	zw := zip.NewWriter(&b)
+	f, err := zw.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+func TestExtractOrtLibRepairsCorruptCachedLibrary(t *testing.T) {
+	body := []byte("valid runtime")
+	archive := fixtureZip(t, "inner.dll", body)
+	hArchive := sha256.Sum256(archive)
+	hLib := sha256.Sum256(body)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(archive) }))
+	defer srv.Close()
+	dir := t.TempDir()
+	lib := filepath.Join(libDir(dir), "runtime.dll")
+	if err := os.MkdirAll(filepath.Dir(lib), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lib, []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	asset := ortAsset{url: srv.URL + "/runtime.zip", inner: "inner.dll", lib: "runtime.dll", sha256: hex.EncodeToString(hLib[:]), archiveSHA256: hex.EncodeToString(hArchive[:])}
+	if err := extractOrtLib(context.Background(), dir, asset); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("library=%q, want %q", got, body)
+	}
+}
+
+func TestExtractOrtLibHonorsCanceledContextBeforeHash(t *testing.T) {
+	dir := t.TempDir()
+	lib := filepath.Join(libDir(dir), "runtime.dll")
+	if err := os.MkdirAll(filepath.Dir(lib), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lib, bytes.Repeat([]byte("x"), 1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := extractOrtLib(ctx, dir, ortAsset{url: "http://invalid", lib: "runtime.dll", sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	if err == nil {
+		t.Fatal("expected canceled extraction")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("context was not canceled")
+	}
+}
+
+func TestContextReaderStopsCanceledExtractionRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := contextReader{ctx: ctx, r: bytes.NewReader([]byte("fixture"))}
+	cancel()
+	if _, err := r.Read(make([]byte, 8)); err != context.Canceled {
+		t.Fatalf("read error=%v, want %v", err, context.Canceled)
+	}
+}
+
+func TestAssetHelperProcess(t *testing.T) {
+	if os.Getenv("RAGREP_ASSET_HELPER") != "1" {
+		return
+	}
+	asset := ortAsset{url: os.Getenv("RAGREP_ASSET_URL"), inner: "inner.dll", lib: "runtime.dll", sha256: os.Getenv("RAGREP_ASSET_LIB_HASH"), archiveSHA256: os.Getenv("RAGREP_ASSET_ARCHIVE_HASH")}
+	if err := extractOrtLib(context.Background(), os.Getenv("RAGREP_ASSET_DIR"), asset); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExtractOrtLibConcurrentProcessesRetainValidCache(t *testing.T) {
+	body := []byte("valid runtime")
+	archive := fixtureZip(t, "inner.dll", body)
+	hArchive := sha256.Sum256(archive)
+	hLib := sha256.Sum256(body)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(archive) }))
+	defer srv.Close()
+	dir := t.TempDir()
+	if err := os.MkdirAll(libDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(libDir(dir), "runtime.dll"), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "runtime.zip"), []byte("corrupt archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-test.run=TestAssetHelperProcess"}
+	procs := make([]*exec.Cmd, 2)
+	for i := range procs {
+		procs[i] = exec.Command(os.Args[0], args...)
+		procs[i].Env = append(os.Environ(), "RAGREP_ASSET_HELPER=1", "RAGREP_ASSET_URL="+srv.URL+"/runtime.zip", "RAGREP_ASSET_DIR="+dir, "RAGREP_ASSET_LIB_HASH="+hex.EncodeToString(hLib[:]), "RAGREP_ASSET_ARCHIVE_HASH="+hex.EncodeToString(hArchive[:]))
+		if err := procs[i].Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range procs {
+		if err := p.Wait(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(libDir(dir), "runtime.dll"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("library=%q, want %q", got, body)
+	}
+}
+
+func TestDownloadContextVerifiesChecksumAndPublishesAtomically(t *testing.T) {
+	want := []byte("trusted asset")
+	h := sha256.Sum256(want)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(want) }))
+	defer srv.Close()
+	dest := filepath.Join(t.TempDir(), "asset.bin")
+	if err := downloadContext(context.Background(), srv.URL, dest, hex.EncodeToString(h[:]), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("asset=%q, want %q", got, want)
+	}
+}
+
+func TestDownloadContextRejectsCorruptResponseWithoutCache(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = fmt.Fprint(w, "corrupt") }))
+	defer srv.Close()
+	dest := filepath.Join(t.TempDir(), "asset.bin")
+	err := downloadContext(context.Background(), srv.URL, dest, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", time.Second)
+	if err == nil {
+		t.Fatal("expected checksum error")
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("cache exists after failed verification: %v", statErr)
+	}
+}
+
+func TestDownloadContextHonorsCancellationDuringBody(t *testing.T) {
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- downloadContext(ctx, srv.URL, filepath.Join(t.TempDir(), "asset.bin"), "", time.Second)
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || ctx.Err() == nil {
+			t.Fatalf("download error=%v, context=%v", err, ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download did not stop after cancellation")
+	}
+}
+
+func TestDownloadContextRetriesInterruptedDownload(t *testing.T) {
+	var calls int
+	want := []byte("complete")
+	h := sha256.Sum256(want)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			_, _ = fmt.Fprint(w, "partial")
+			return
+		}
+		_, _ = w.Write(want)
+	}))
+	defer srv.Close()
+	dest := filepath.Join(t.TempDir(), "asset.bin")
+	checksum := hex.EncodeToString(h[:])
+	if err := downloadContext(context.Background(), srv.URL, dest, checksum, time.Second); err == nil {
+		t.Fatal("expected first attempt to fail")
+	}
+	if err := downloadContext(context.Background(), srv.URL, dest, checksum, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("requests=%d, want 2", calls)
+	}
+}
+
+func TestDownloadContextConcurrentAcquisitionPublishesOneValidFile(t *testing.T) {
+	want := []byte("shared")
+	h := sha256.Sum256(want)
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		time.Sleep(20 * time.Millisecond)
+		_, _ = w.Write(want)
+	}))
+	defer srv.Close()
+	dest := filepath.Join(t.TempDir(), "asset.bin")
+	checksum := hex.EncodeToString(h[:])
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- downloadContext(context.Background(), srv.URL, dest, checksum, time.Second) }()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls < 1 {
+		t.Fatalf("requests=%d, want at least 1", calls)
+	}
+}
 
 // Requires cached assets; run `ragrep init` (or ensureAssets) once beforehand.
 func testEmbedder(t *testing.T) *Embedder {

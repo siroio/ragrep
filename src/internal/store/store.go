@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -17,7 +19,36 @@ import (
 // ErrNotFound is returned when a requested document or paragraph doesn't exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrReindexRequired means this database was created by an incompatible or
+// older document indexer. The caller must build a fresh database and reindex.
+var ErrReindexRequired = errors.New("document database requires re-indexing")
+
+// ErrNotDocumentDatabase means path contains a database belonging to another
+// store or application.
+var ErrNotDocumentDatabase = errors.New("not a document database")
+
 const embedDim = 768
+const schemaVersion = 1
+
+const modelRevision = "5090578d9565bb06545b4552f76e6bc2c93e4a66"
+
+func embeddingIdentity() string {
+	model := "model_quantized.onnx"
+	if runtime.GOOS == "windows" {
+		model = "model.onnx"
+	}
+	return "embeddinggemma-300m-ONNX@" + modelRevision + "/" + model
+}
+
+// EmbeddingIdentity returns the pinned graph identity used by document
+// indexes on this platform.
+func EmbeddingIdentity() string { return embeddingIdentity() }
+
+// EmbeddingDimension returns the vector width required by the document index.
+func EmbeddingDimension() int { return embedDim }
+
+// SchemaVersion returns the document index schema version.
+func SchemaVersion() int { return schemaVersion }
 
 type EmbedFunc func(text string) ([]float32, error)
 
@@ -37,6 +68,10 @@ type Hit struct {
 type Store struct{ db *sql.DB }
 
 const schema = `
+CREATE TABLE ragrep_meta(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS documents(
   id INTEGER PRIMARY KEY,
   path TEXT UNIQUE NOT NULL,
@@ -69,15 +104,207 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(schema); err != nil {
+	version, err := readUserVersion(db)
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
-	// Migration for DBs created before the heading column existed; fails
-	// with "duplicate column" on already-migrated/fresh DBs (ignored), any
-	// real breakage surfaces on the next query.
-	db.Exec(`ALTER TABLE paragraphs ADD COLUMN heading TEXT NOT NULL DEFAULT ''`)
+	if version == 0 {
+		empty, err := isEmpty(db)
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+		if !empty {
+			legacy, err := hasTable(db, "documents")
+			if err != nil {
+				db.Close()
+				return nil, err
+			}
+			if legacy {
+				db.Close()
+				return nil, fmt.Errorf("%w: unversioned document index at %s", ErrReindexRequired, path)
+			}
+			db.Close()
+			return nil, fmt.Errorf("%w: %s already has tables", ErrNotDocumentDatabase, path)
+		}
+		if err := createSchema(db); err != nil {
+			db.Close()
+			return nil, err
+		}
+	} else if version != schemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("%w: schema version %d, want %d", ErrReindexRequired, version, schemaVersion)
+	} else if err := validateMeta(db); err != nil {
+		db.Close()
+		return nil, err
+	} else if err := validateSchema(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// Check validates an existing document index without creating or modifying it.
+func Check(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return ErrNotDocumentDatabase
+	}
+	db, err := sql.Open("sqlite3", storeReadOnlyDSN(path))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	version, err := readUserVersion(db)
+	if err != nil {
+		return err
+	}
+	if version == 0 {
+		empty, err := isEmpty(db)
+		if err != nil {
+			return err
+		}
+		if empty {
+			return ErrReindexRequired
+		}
+		legacy, err := hasTable(db, "documents")
+		if err != nil {
+			return err
+		}
+		if legacy {
+			return ErrReindexRequired
+		}
+		return ErrNotDocumentDatabase
+	}
+	if version != schemaVersion {
+		return ErrReindexRequired
+	}
+	if err := validateMeta(db); err != nil {
+		return err
+	}
+	return validateSchema(db)
+}
+
+func readUserVersion(db *sql.DB) (int, error) {
+	var version int
+	err := db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	return version, err
+}
+
+func isEmpty(db *sql.DB) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table'`).Scan(&count)
+	return count == 0, err
+}
+
+func hasTable(db *sql.DB, name string) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&count)
+	return count != 0, err
+}
+
+func createSchema(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(schema); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO ragrep_meta(key, value) VALUES ('embedding_identity', ?), ('embedding_dim', ?)`, embeddingIdentity(), fmt.Sprint(embedDim)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func validateMeta(db *sql.DB) error {
+	present, err := hasTable(db, "ragrep_meta")
+	if err != nil {
+		return err
+	}
+	if !present {
+		return fmt.Errorf("%w: metadata table is missing", ErrNotDocumentDatabase)
+	}
+	rows, err := db.Query(`SELECT key, value FROM ragrep_meta`)
+	if err != nil {
+		return err
+	}
+	meta := map[string]string{}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			rows.Close()
+			return err
+		}
+		meta[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	wantDim := fmt.Sprint(embedDim)
+	if meta["embedding_identity"] != embeddingIdentity() || meta["embedding_dim"] != wantDim {
+		return fmt.Errorf("%w: db has embedding_identity=%q embedding_dim=%q, want embedding_identity=%q embedding_dim=%q", ErrReindexRequired, meta["embedding_identity"], meta["embedding_dim"], embeddingIdentity(), wantDim)
+	}
+	return nil
+}
+
+func validateSchema(db *sql.DB) error {
+	required := map[string][]string{
+		"documents":  {"id", "path", "content", "mtime", "hash"},
+		"paragraphs": {"id", "doc_id", "seq", "start_line", "end_line", "text", "heading"},
+		"doc_tags":   {"doc_id", "tag"},
+		"fts":        {"text"},
+		"vec":        {"embedding"},
+	}
+	for table, want := range required {
+		columns, err := tableColumns(db, table)
+		if err != nil {
+			return fmt.Errorf("%w: inspect %s schema: %w", ErrReindexRequired, table, err)
+		}
+		for _, column := range want {
+			if !columns[column] {
+				return fmt.Errorf("%w: %s is missing required column %s", ErrReindexRequired, table, column)
+			}
+		}
+	}
+	var createSQL string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='vec'`).Scan(&createSQL); err != nil {
+		return fmt.Errorf("%w: inspect vec definition: %w", ErrReindexRequired, err)
+	}
+	if !strings.Contains(strings.ToLower(createSQL), "embedding float["+fmt.Sprint(embedDim)+"]") {
+		return fmt.Errorf("%w: vec embedding dimension is not %d", ErrReindexRequired, embedDim)
+	}
+	return nil
+}
+
+func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -334,7 +561,7 @@ const (
 	rrfVecWeight  = 1.0
 )
 
-// rrfMerge combines rankings with Reciprocal Rank Fusion (k=60), weighting
+// rrfMerge combines rankings with weighted reciprocal rank (1/r), weighting
 // the text list (lists[0]) and vector list (lists[1]) per rrfTextWeight and
 // rrfVecWeight. Returns ids sorted by descending score (ties: ascending id)
 // and the score map.
@@ -343,7 +570,7 @@ func rrfMerge(lists [][]int64) ([]int64, map[int64]float64) {
 	scores := map[int64]float64{}
 	for i, l := range lists {
 		for r, id := range l {
-			scores[id] += weights[i] / float64(60+r+1)
+			scores[id] += weights[i] / float64(r+1)
 		}
 	}
 	ids := make([]int64, 0, len(scores))

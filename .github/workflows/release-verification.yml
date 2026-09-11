@@ -1,0 +1,68 @@
+name: Release verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      RAG_DOWNLOAD: '1'
+      XDG_CACHE_HOME: ${{ runner.temp }}/ragrep-cache
+      XDG_CONFIG_HOME: ${{ runner.temp }}/ragrep-config
+      RAGREP_DAEMON_ADDR: 127.0.0.1:0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+          cache: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install pinned gopls
+        run: go install golang.org/x/tools/gopls@v0.19.1
+      - name: Required real tests
+        run: |
+          mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
+          go -C src test -count=1 ./internal/embed -run '^TestEnsureAssets$'
+          go -C src test -json -count=1 ./internal/embed ./cmd/ragrep \
+            -run '^(TestEnsureAssets|TestEmbedProperties|TestSmoke|TestSmokeMCP|TestSmokeDaemonDocument)$' | tee "$RUNNER_TEMP/go-required.json"
+          python tools/ci/verify_go_tests.py --input "$RUNNER_TEMP/go-required.json" \
+            --required TestEnsureAssets --required TestEmbedProperties --required TestSmoke \
+            --required TestSmokeMCP --required TestSmokeDaemonDocument
+          go -C src test -json -tags gopls -count=1 ./cmd/ragrep -run '^TestGoplsIntegration$' | tee "$RUNNER_TEMP/go-gopls.json"
+          python tools/ci/verify_go_tests.py --input "$RUNNER_TEMP/go-gopls.json" --required TestGoplsIntegration
+      - name: Build and evaluate fresh release
+        run: |
+          mkdir -p "$RUNNER_TEMP/eval-root"
+          cp tools/product_eval/corpus/*.md "$RUNNER_TEMP/eval-root/"
+          mkdir -p "$RUNNER_TEMP/extracted"
+          python tools/release/release.py build --source . --output "$RUNNER_TEMP/release.zip" \
+            --target linux-amd64 --version "${GITHUB_SHA:0:12}" \
+            --asset-pin embeddinggemma@5090578d9565bb06545b4552f76e6bc2c93e4a66 \
+            --asset-pin onnxruntime@1.24.4
+          unzip -q "$RUNNER_TEMP/release.zip" -d "$RUNNER_TEMP/extracted"
+          "$RUNNER_TEMP/extracted/ragrep" index --db "$RUNNER_TEMP/eval-root/.ragrep/index.db" "$RUNNER_TEMP/eval-root"
+          python tools/product_eval/evaluate.py --ragrep "$RUNNER_TEMP/extracted/ragrep" --root "$RUNNER_TEMP/eval-root" \
+            --db "$RUNNER_TEMP/eval-root/.ragrep/index.db" --cases tools/product_eval/cases.jsonl \
+            --output "$RUNNER_TEMP/evaluation.json" --k 5 --repeats 3
+          python tools/release/test_release.py
+          python tools/ci/staged_smoke.py --binary "$RUNNER_TEMP/extracted/ragrep" \
+            --asset-cache "$XDG_CACHE_HOME" \
+            --mcp-response "$RUNNER_TEMP/mcp-response.json" --mcp-tools-response "$RUNNER_TEMP/mcp-tools.json"
+      - name: Enforce release quality gate
+        run: |
+          python tools/ci/release_verify.py --binary "$RUNNER_TEMP/extracted/ragrep" --go-json "$RUNNER_TEMP/go-required.json" \
+            --eval-report "$RUNNER_TEMP/evaluation.json" --mcp-response "$RUNNER_TEMP/mcp-response.json" \
+            --mcp-tools-response "$RUNNER_TEMP/mcp-tools.json" --required TestEnsureAssets --required TestEmbedProperties \
+            --required TestSmoke --required TestSmokeMCP --required TestSmokeDaemonDocument
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: release-verification-reports
+          path: ${{ runner.temp }}/*.json

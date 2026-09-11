@@ -32,6 +32,8 @@ type daemonStatus struct {
 	PID    int    `json:"pid"`
 }
 
+const maxDaemonRequestBytes = 1 << 20
+
 type daemonSearchRequest struct {
 	Root  string `json:"root"`
 	DB    string `json:"db"`
@@ -216,6 +218,7 @@ func (h *daemonHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnauthorized, &apiError{Code: "unauthorized", Message: "unauthorized"})
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxDaemonRequestBytes)
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
 		writeJSON(w, http.StatusOK, daemonStatus{Status: "running", PID: os.Getpid()})

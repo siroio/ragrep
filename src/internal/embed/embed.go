@@ -4,6 +4,9 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -11,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/eliben/go-sentencepiece"
 	ort "github.com/yalue/onnxruntime_go"
@@ -23,9 +27,12 @@ const (
 	dmlVersion = "1.15.4" // Microsoft.AI.DirectML version the ORT DirectML nuspec pins
 	// Pinned to a commit sha (not "main") so the download can't silently
 	// change contents out from under a cached, unverified file.
-	repoBase = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/5090578d9565bb06545b4552f76e6bc2c93e4a66/"
-	spmURL   = repoBase + "tokenizer.model"
-	spmFile  = "tokenizer.model"
+	repoBase        = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/5090578d9565bb06545b4552f76e6bc2c93e4a66/"
+	spmURL          = repoBase + "tokenizer.model"
+	spmFile         = "tokenizer.model"
+	modelSHA256     = "172efde319fe1542dc41f31be6154910b05b78f7a861c265c4600eec906bd6d8"
+	modelDataSHA256 = "705626e28e4c23c82ade34566b4197d97f534c12275fa406dfb71e9937d388c0"
+	spmSHA256       = "1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c"
 
 	maxTokens = 1022 // ponytail: truncate long paragraphs (context 2048); FTS still covers the tail
 
@@ -58,6 +65,14 @@ func ModelCached(dir string) bool {
 	return missingAsset(dir, assets) == ""
 }
 
+// RuntimeIdentity returns the pinned inference runtime used by the asset set.
+func RuntimeIdentity() string {
+	if runtime.GOOS == "windows" {
+		return "onnxruntime@" + ortVersion + "+directml@" + dmlVersion
+	}
+	return "onnxruntime@" + ortVersion
+}
+
 var (
 	modelFile     = modelName()
 	modelDataFile = modelFile + "_data" // external weights; name is baked into modelFile's graph, must not be renamed
@@ -65,12 +80,14 @@ var (
 	modelDataURL  = repoBase + "onnx/" + modelDataFile
 )
 
+var assetHTTPClient = &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, ResponseHeaderTimeout: 30 * time.Second}}
+
 // embedDim is the embeddinggemma-300m output dimension (matches the
 // sentence_embedding graph output; store's vec0 schema is pinned to the same
 // value independently since the two packages don't import each other).
 const embedDim = 768
 
-type ortAsset struct{ url, inner, lib string }
+type ortAsset struct{ url, inner, lib, sha256, archiveSHA256 string }
 
 func nupkgURL(pkg, ver string) string {
 	return "https://api.nuget.org/v3-flatcontainer/" + pkg + "/" + ver + "/" + pkg + "." + ver + ".nupkg"
@@ -86,18 +103,18 @@ func ortAssetsFor(goos, goarch string) ([]ortAsset, error) {
 	dmlAssets := func(rid, dmlArch string) []ortAsset {
 		return []ortAsset{
 			{nupkgURL("microsoft.ml.onnxruntime.directml", ortVersion),
-				"runtimes/" + rid + "/native/onnxruntime.dll", "onnxruntime.dll"},
+				"runtimes/" + rid + "/native/onnxruntime.dll", "onnxruntime.dll", map[string]string{"win-x64": "e7eedec6a6f26dc39dc948276a75ef6d2bee3fff944d874ceed0bbd3b97bff40", "win-arm64": "939fa0be435d253eadd9e394ee94ad6b6ac1878c83b64118bb4bda669eb0e28c"}[rid], "57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681"},
 			{nupkgURL("microsoft.ai.directml", dmlVersion),
-				"bin/" + dmlArch + "-win/DirectML.dll", "DirectML.dll"},
+				"bin/" + dmlArch + "-win/DirectML.dll", "DirectML.dll", map[string]string{"x64": "9c9e6d822561c6c41b90e6994b3e8857cf1d66dbfb1e0c4c799c7c89b4e92da1", "arm64": "77b0db83ff903f2323f5caf538499d75af6038bbea23b7959f7d232d9a4ab9d4"}[dmlArch], "4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9"},
 		}
 	}
 	m := map[string][]ortAsset{
 		"windows/amd64": dmlAssets("win-x64", "x64"),
 		"windows/arm64": dmlAssets("win-arm64", "arm64"),
 		"linux/amd64": {{base + "onnxruntime-linux-x64-" + ortVersion + ".tgz",
-			"onnxruntime-linux-x64-" + ortVersion + "/lib/libonnxruntime.so." + ortVersion, "libonnxruntime.so"}},
+			"onnxruntime-linux-x64-" + ortVersion + "/lib/libonnxruntime.so." + ortVersion, "libonnxruntime.so", "d132535d051344ff5c64c9c200004150559049a81ed330eb4422c1962fb6b7e4", "3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747"}},
 		"darwin/arm64": {{base + "onnxruntime-osx-arm64-" + ortVersion + ".tgz",
-			"onnxruntime-osx-arm64-" + ortVersion + "/lib/libonnxruntime." + ortVersion + ".dylib", "libonnxruntime.dylib"}},
+			"onnxruntime-osx-arm64-" + ortVersion + "/lib/libonnxruntime." + ortVersion + ".dylib", "libonnxruntime.dylib", "872533f130f1839a5bc01788ddb4f75c83a189763441ba1178788ed965449289", "93787795f47e1eee369182e43ed51b9e5da0878ab0346aecf4258979b8bba989"}},
 	}
 	a, ok := m[goos+"/"+goarch]
 	if !ok {
@@ -118,11 +135,33 @@ func CacheDir() (string, error) {
 }
 
 func download(url, dest string) error {
-	if _, err := os.Stat(dest); err == nil {
+	return downloadContext(context.Background(), url, dest, "", 2*time.Minute)
+}
+
+func downloadContext(ctx context.Context, url, dest, wantSHA256 string, timeout time.Duration) error {
+	if ok, err := verifiedFileContext(ctx, dest, wantSHA256); err != nil {
+		return err
+	} else if ok {
 		return nil
 	}
+	if wantSHA256 != "" {
+		_ = os.Remove(dest)
+	}
 	fmt.Fprintf(os.Stderr, "downloading %s\n", url)
-	resp, err := http.Get(url)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	requestCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		requestCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := assetHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -130,18 +169,107 @@ func download(url, dest string) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-	tmp := dest + ".tmp"
-	f, err := os.Create(tmp)
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(dest), filepath.Base(dest)+"-*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
 	if _, err := io.Copy(f, resp.Body); err != nil {
 		f.Close()
-		os.Remove(tmp)
 		return err
 	}
-	f.Close()
-	return os.Rename(tmp, dest)
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if ok, err := verifiedFileContext(ctx, tmp, wantSHA256); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("checksum mismatch for %s", filepath.Base(dest))
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		if ok, verifyErr := verifiedFile(dest, wantSHA256); verifyErr == nil && ok {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func verifiedFile(path, wantSHA256 string) (bool, error) {
+	return verifiedFileContext(context.Background(), path, wantSHA256)
+}
+
+func verifiedFileContext(ctx context.Context, path, wantSHA256 string) (bool, error) {
+	if wantSHA256 == "" {
+		_, err := os.Stat(path)
+		return err == nil, nil
+	}
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	buf := make([]byte, 128*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			_, _ = h.Write(buf[:n])
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return false, readErr
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)) == wantSHA256, nil
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	select {
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	default:
+		return r.r.Read(p)
+	}
+}
+
+func expectedAssetHash(name string) string {
+	switch name {
+	case modelFile:
+		if modelFile == "model.onnx" {
+			return "ea91fd315a7c152d427d231746f0f811a1ac93beaba656abfdf2b24e091265e4"
+		}
+		return modelSHA256
+	case modelDataFile:
+		if modelFile == "model.onnx" {
+			return "ef835ae565d8695236652475903078e8ed794c7c35faf1164d78ec3238e8a88d"
+		}
+		return modelDataSHA256
+	case spmFile:
+		return spmSHA256
+	default:
+		return ""
+	}
 }
 
 // libDir returns the versioned subdirectory holding the extracted runtime
@@ -155,33 +283,50 @@ func libDir(dir string) string {
 
 // extractOrtLib downloads the onnxruntime release archive and extracts the
 // shared library named by asset.inner into libDir(dir) as asset.lib.
-func extractOrtLib(dir string, asset ortAsset) error {
+func extractOrtLib(ctx context.Context, dir string, asset ortAsset) error {
 	if err := os.MkdirAll(libDir(dir), 0o755); err != nil {
 		return err
 	}
 	dest := filepath.Join(libDir(dir), asset.lib)
-	if _, err := os.Stat(dest); err == nil {
+	if ok, err := verifiedFileContext(ctx, dest, asset.sha256); err != nil {
+		return err
+	} else if ok {
 		return nil
 	}
 	archive := filepath.Join(dir, filepath.Base(asset.url))
-	if err := download(asset.url, archive); err != nil {
+	if err := downloadContext(ctx, asset.url, archive, asset.archiveSHA256, 2*time.Minute); err != nil {
 		return err
 	}
-	defer os.Remove(archive)
-
 	writeLib := func(r io.Reader) error {
-		tmp := dest + ".tmp"
-		f, err := os.Create(tmp)
+		f, err := os.CreateTemp(filepath.Dir(dest), filepath.Base(dest)+"-*.tmp")
 		if err != nil {
 			return err
 		}
-		if _, err := io.Copy(f, r); err != nil {
+		tmp := f.Name()
+		defer os.Remove(tmp)
+		if _, err := io.Copy(f, contextReader{ctx, r}); err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err
 		}
-		f.Close()
-		return os.Rename(tmp, dest)
+		if err := f.Close(); err != nil {
+			return err
+		}
+		if ok, err := verifiedFileContext(ctx, tmp, asset.sha256); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("checksum mismatch for %s", asset.lib)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, dest); err != nil {
+			if ok, verifyErr := verifiedFile(dest, asset.sha256); verifyErr == nil && ok {
+				return nil
+			}
+			return err
+		}
+		return nil
 	}
 
 	if ext := filepath.Ext(archive); ext == ".zip" || ext == ".nupkg" {
@@ -230,22 +375,26 @@ func extractOrtLib(dir string, asset ortAsset) error {
 // EnsureAssets downloads (if not already cached in dir) the ONNX runtime
 // shared library, the embedding model, and the tokenizer.
 func EnsureAssets(dir string) error {
+	return EnsureAssetsContext(context.Background(), dir)
+}
+
+func EnsureAssetsContext(ctx context.Context, dir string) error {
 	assets, err := ortAssetsFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return err
 	}
 	for _, asset := range assets {
-		if err := extractOrtLib(dir, asset); err != nil {
+		if err := extractOrtLib(ctx, dir, asset); err != nil {
 			return err
 		}
 	}
-	if err := download(modelURL, filepath.Join(dir, modelFile)); err != nil {
+	if err := downloadContext(ctx, modelURL, filepath.Join(dir, modelFile), expectedAssetHash(modelFile), 2*time.Minute); err != nil {
 		return err
 	}
-	if err := download(modelDataURL, filepath.Join(dir, modelDataFile)); err != nil {
+	if err := downloadContext(ctx, modelDataURL, filepath.Join(dir, modelDataFile), expectedAssetHash(modelDataFile), 30*time.Minute); err != nil {
 		return err
 	}
-	return download(spmURL, filepath.Join(dir, spmFile))
+	return downloadContext(ctx, spmURL, filepath.Join(dir, spmFile), expectedAssetHash(spmFile), 2*time.Minute)
 }
 
 type Embedder struct {
@@ -258,12 +407,14 @@ type Embedder struct {
 // tests (to decide skip vs. run) so the two checks can't drift apart.
 func missingAsset(dir string, assets []ortAsset) string {
 	for _, f := range []string{modelFile, modelDataFile, spmFile} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+		ok, err := verifiedFile(filepath.Join(dir, f), expectedAssetHash(f))
+		if err != nil || !ok {
 			return f
 		}
 	}
 	for _, a := range assets {
-		if _, err := os.Stat(filepath.Join(libDir(dir), a.lib)); err != nil {
+		ok, err := verifiedFileContext(context.Background(), filepath.Join(libDir(dir), a.lib), a.sha256)
+		if err != nil || !ok {
 			return a.lib
 		}
 	}

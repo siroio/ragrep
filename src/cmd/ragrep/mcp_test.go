@@ -203,6 +203,9 @@ func TestMCPCommandTransportListsToolsAndCallsTextSearch(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".ragrep", "index.db"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	environmentRoot := t.TempDir()
+	environment := isolatedDaemonEnvironment(environmentRoot)
+	discoveryPath := daemonSmokeDiscoveryPath(environmentRoot, runtime.GOOS)
 	packageDir, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +214,7 @@ func TestMCPCommandTransportListsToolsAndCallsTextSearch(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		exe += ".exe"
 	}
-	build := exec.Command("go", "build", "-o", exe, ".")
+	build := exec.Command("go", "build", "-ldflags", "-X=main.daemonBindAddress=127.0.0.1:0", "-o", exe, ".")
 	build.Dir = packageDir
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, output)
@@ -219,15 +222,41 @@ func TestMCPCommandTransportListsToolsAndCallsTextSearch(t *testing.T) {
 	var stderr bytes.Buffer
 	command := exec.Command(exe, "mcp", "serve")
 	command.Dir = root
-	command.Env = isolatedDaemonEnvironment(t.TempDir())
+	command.Env = environment
 	command.Stderr = &stderr
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client := mcp.NewClient(&mcp.Implementation{Name: "smoke", Version: "1"}, nil)
+	var closeSession func() error
+	t.Cleanup(func() {
+		if closeSession != nil {
+			_ = closeSession()
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for command.ProcessState == nil && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if command.ProcessState == nil && command.Process != nil {
+			_ = command.Process.Kill()
+		}
+		if discovery, err := readDaemonDiscovery(discoveryPath); err == nil {
+			_, stopStderr, stopErr := runBuiltRagrep(exe, root, environment, "daemon", "stop")
+			if stopErr != nil {
+				if process, findErr := os.FindProcess(discovery.PID); findErr == nil {
+					_ = process.Kill()
+				}
+				t.Errorf("stop daemon: %v: %s", stopErr, stopStderr)
+			}
+			if err := waitForDaemonSmokeCleanup(discovery.PID, strings.TrimPrefix(discovery.Endpoint, "http://"), 3*time.Second); err != nil {
+				t.Errorf("daemon cleanup: %v", err)
+			}
+		}
+	})
 	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: command, TerminateDuration: time.Second}, nil)
 	if err != nil {
 		t.Fatalf("connect: %v; stderr=%s", err, stderr.String())
 	}
+	closeSession = session.Close
 	tools, err := session.ListTools(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -241,19 +270,13 @@ func TestMCPCommandTransportListsToolsAndCallsTextSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.IsError {
-		t.Fatal("text search without daemon unexpectedly succeeded")
+	if result.IsError {
+		t.Fatal("text search with auto-started daemon failed")
 	}
-	if err := session.Close(); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for command.ProcessState == nil && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if command.ProcessState == nil {
-		_ = command.Process.Kill()
-		t.Fatal("MCP process did not exit after client disconnect")
+	var output mcpToolOutput[searchDocumentsData]
+	decodeMCPStructured(t, result, &output)
+	if output.Data == nil || len(output.Data.Hits) != 0 {
+		t.Fatalf("text search output=%+v, want empty successful result", output)
 	}
 	if strings.Contains(stderr.String(), "initialized") || strings.Contains(stderr.String(), "indexed") {
 		t.Fatalf("MCP startup emitted CLI summary: %q", stderr.String())

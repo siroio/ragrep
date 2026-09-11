@@ -234,7 +234,7 @@ type mcpBackends struct {
 
 func newRagrepMCPServer(defaultRoot string, backends mcpBackends) (*mcp.Server, error) {
 	server := mcp.NewServer(
-		&mcp.Implementation{Name: "ragrep", Version: "0.1.0"},
+		&mcp.Implementation{Name: "ragrep", Version: version},
 		&mcp.ServerOptions{Instructions: mcpServerInstructions},
 	)
 	registerDocumentQueryTools(server, documentQueryTools{defaultRoot: defaultRoot, backend: backends.Documents})

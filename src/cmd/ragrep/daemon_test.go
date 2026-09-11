@@ -349,6 +349,18 @@ func TestDaemonListenAddressDefaultsAndAllowsOnlyLoopback(t *testing.T) {
 	}
 }
 
+func TestDaemonListenAddressUsesEnvironmentOverride(t *testing.T) {
+	t.Setenv("RAGREP_DAEMON_ADDR", "127.0.0.1:0")
+	got, err := validatedDaemonListenAddress()
+	if err != nil || got != "127.0.0.1:0" {
+		t.Fatalf("address=%q err=%v, want 127.0.0.1:0", got, err)
+	}
+	t.Setenv("RAGREP_DAEMON_ADDR", "0.0.0.0:0")
+	if _, err := validatedDaemonListenAddress(); err == nil {
+		t.Fatal("non-loopback environment address unexpectedly accepted")
+	}
+}
+
 func TestDaemonListenerIsSingleton(t *testing.T) {
 	first, err := listenDaemon("127.0.0.1:0")
 	if err != nil {

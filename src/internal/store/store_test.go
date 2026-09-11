@@ -96,7 +96,7 @@ func TestRRFMerge(t *testing.T) {
 		{3, 1},    // vector ranking
 	})
 	// Weighted (text=0.5, vector=1.0):
-	// id1: 0.5/61 + 1/62 ≈ 0.024326, id3: 0.5/63 + 1/61 ≈ 0.024330, id2: 0.5/62 ≈ 0.008065
+	// id1: 0.5/1 + 1/2 = 1.0, id3: 0.5/3 + 1/1 ≈ 1.166667, id2: 0.5/2 = 0.25
 	// id3 edges out id1 because its top vector rank (weight 1.0) outweighs id1's
 	// top text rank (weight 0.5) — this is the intended vector-favoring behavior.
 	want := []int64{3, 1, 2}
@@ -110,13 +110,9 @@ func TestRRFMerge(t *testing.T) {
 	}
 }
 
-// TestRRFMergeWeighted encodes the dilution scenario weighted RRF must fix:
-// under equal weights, several mediocre text-side ranks (or even one great
-// text-side rank) can outscore a solid vector-side rank, even though vector
-// recall is far more trustworthy for natural-language queries. With text
-// weight 0.5 and vector weight 1.0, a vector-only hit must beat both a
-// text-only hit at its best possible rank, and a text+vector combo that
-// would have won under equal weighting.
+// TestRRFMergeWeighted keeps the modality weights explicit: a best text rank
+// beats a vector rank five, a best vector rank beats a best text rank, and a
+// weak consensus candidate loses to the vector rank five.
 func TestRRFMergeWeighted(t *testing.T) {
 	const (
 		vecOnlyID     int64 = 10 // vector rank 4 (index), absent from text
@@ -144,19 +140,40 @@ func TestRRFMergeWeighted(t *testing.T) {
 
 	_, scores := rrfMerge([][]int64{textList, vecList})
 
-	// Arithmetic (weighted): vecOnlyID = 1.0/65 ≈ 0.015385
-	//   textOnlyID (best possible text-only score) = 0.5/61 ≈ 0.008197
-	//   comboID = 1.0/106 + 0.5/96 ≈ 0.009434 + 0.005208 ≈ 0.014642
-	// Under equal weights (old code) textOnlyID ≈ 0.016393 and comboID ≈
-	// 0.019851 would BOTH outrank vecOnlyID ≈ 0.015385 — that's the dilution
-	// bug. Weighting flips both comparisons.
-	if scores[vecOnlyID] <= scores[textOnlyID] {
-		t.Fatalf("vector rank %d (score=%v) should outrank text-only rank %d (score=%v)",
-			vecOnlyRank, scores[vecOnlyID], textOnlyRank, scores[textOnlyID])
+	// Arithmetic with offset zero: vecOnlyID = 1.0/5 = 0.2,
+	// textOnlyID = 0.5/1 = 0.5, comboID = 1.0/46 + 0.5/36 ≈ 0.0356.
+	if scores[textOnlyID] <= scores[vecOnlyID] {
+		t.Fatalf("text rank %d (score=%v) should beat vector rank %d (score=%v)",
+			textOnlyRank, scores[textOnlyID], vecOnlyRank, scores[vecOnlyID])
 	}
 	if scores[vecOnlyID] <= scores[comboID] {
-		t.Fatalf("vector rank %d (score=%v) should outrank combo vec=%d/text=%d (score=%v)",
+		t.Fatalf("vector rank %d (score=%v) should beat combo vec=%d/text=%d (score=%v)",
 			vecOnlyRank, scores[vecOnlyID], comboVecRank, comboTextRank, scores[comboID])
+	}
+	_, topScores := rrfMerge([][]int64{{textOnlyID}, {vecOnlyID}})
+	if topScores[vecOnlyID] <= topScores[textOnlyID] {
+		t.Fatalf("vector rank 1 (score=%v) should beat text rank 1 (score=%v)", topScores[vecOnlyID], topScores[textOnlyID])
+	}
+}
+
+func TestRRFMergeRankDilution(t *testing.T) {
+	const (
+		vectorOnlyID int64 = 1
+		comboID      int64 = 2
+	)
+	textList := make([]int64, 15)
+	vecList := make([]int64, 15)
+	for i := range textList {
+		textList[i] = int64(100 + i)
+		vecList[i] = int64(200 + i)
+	}
+	textList[14] = comboID
+	vecList[2] = vectorOnlyID
+	vecList[14] = comboID
+
+	ids, scores := rrfMerge([][]int64{textList, vecList})
+	if scores[vectorOnlyID] <= scores[comboID] {
+		t.Fatalf("vector rank 3 should outrank text+vector rank 15: order=%v scores=%v", ids, scores)
 	}
 }
 

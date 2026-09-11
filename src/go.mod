@@ -1,6 +1,6 @@
 module github.com/siroio/ragrep
 
-go 1.26.1
+go 1.26.8
 
 require (
 	github.com/asg017/sqlite-vec-go-bindings v0.1.6
